@@ -526,6 +526,16 @@ enough rows, each row stays in one program. The span is a multiple of the
 tile and a runtime argument, so batch-size changes do not recompile the
 scorer. Only the first program of a KPool row writes its `row_ends_out`.
 
+### GFX950 selected-slot sparse attention
+
+For dense E4M3 query and KV rows with 512 latent values and no RoPE, the
+Gluon kernel keeps matrix operands in FP8 and computes score and value
+products in four 128-column phases. It stages selected indices once per tile
+in shared memory for the KV gather. The configured selected-slot width fixes
+the launch and compile shape; device-resident selected lengths mask live rows
+across graph replays. Other dtypes, RoPE shapes, and packed KV layouts retain
+their existing paths.
+
 ### DeepSeek V4 attention
 
 The gfx950 and gfx1250 packages provide MXFP4 index selection. Gfx950 also

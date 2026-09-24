@@ -46,6 +46,19 @@ def _value_layout(
     return gl.BlockedLayout([1, 1], [1, 64], [NUM_WARPS, 1], [1, 0])
 
 
+@gluon.constexpr_function
+def _e4m3_value_output_layout(BLOCK_H: gl.constexpr):
+    """Return TileLang FullCol's ordinary-register output ownership."""
+
+    return gl.DistributedLinearLayout(
+        reg_bases=[[0, 1], [0, 2], [0, 16]],
+        lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 4], [0, 8]],
+        warp_bases=[[0, 32], [0, 64]],
+        block_bases=[],
+        shape=[BLOCK_H, 128],
+    )
+
+
 @gluon.jit
 def _dense_score(
     q,
@@ -131,6 +144,89 @@ def _packed_score(
 
 
 @gluon.jit
+def _dsa_e4m3_score_4x128(
+    q_smem: gl.shared_memory_descriptor,
+    kv_smem: gl.shared_memory_descriptor,
+    q_layout: gl.constexpr,
+    k_layout: gl.constexpr,
+    score_layout: gl.constexpr,
+    BLOCK_H: gl.constexpr,
+    TILE_K: gl.constexpr,
+):
+    """Compute the 512-wide score product as four phase-local products."""
+
+    phase: gl.constexpr = 128
+    q0 = q_smem.slice(0, phase, 1).load(q_layout)
+    k0 = kv_smem.slice(0, phase, 0).load(k_layout)
+    scores = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=score_layout)
+    scores = gl.amd.cdna4.mfma(q0, k0, scores)
+
+    q1 = q_smem.slice(phase, phase, 1).load(q_layout)
+    k1 = kv_smem.slice(phase, phase, 0).load(k_layout)
+    score_tile = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=score_layout)
+    score_tile = gl.amd.cdna4.mfma(q1, k1, score_tile)
+    scores += score_tile
+
+    q2 = q_smem.slice(2 * phase, phase, 1).load(q_layout)
+    k2 = kv_smem.slice(2 * phase, phase, 0).load(k_layout)
+    score_tile = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=score_layout)
+    score_tile = gl.amd.cdna4.mfma(q2, k2, score_tile)
+    scores += score_tile
+
+    q3 = q_smem.slice(3 * phase, phase, 1).load(q_layout)
+    k3 = kv_smem.slice(3 * phase, phase, 0).load(k_layout)
+    score_tile = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=score_layout)
+    score_tile = gl.amd.cdna4.mfma(q3, k3, score_tile)
+    return scores + score_tile
+
+
+@gluon.jit
+def _dsa_e4m3_value_4x128(
+    probs_smem: gl.shared_memory_descriptor,
+    kv_smem: gl.shared_memory_descriptor,
+    acc0,
+    acc1,
+    acc2,
+    acc3,
+    p_layout: gl.constexpr,
+    v_layout: gl.constexpr,
+    acc_layout: gl.constexpr,
+    output_layout: gl.constexpr,
+    BLOCK_H: gl.constexpr,
+):
+    """Update blocked outputs through one phase-local MFMA accumulator."""
+
+    phase: gl.constexpr = 128
+    fp8_max: gl.constexpr = 448.0
+    probs_dot = probs_smem.load(p_layout)
+
+    v0 = kv_smem.slice(0, phase, 0).permute([1, 0]).load(v_layout)
+    value_tile = gl.zeros([BLOCK_H, phase], dtype=gl.float32, layout=acc_layout)
+    value_tile = gl.amd.cdna4.mfma(probs_dot, v0, value_tile)
+    value_tile = gl.convert_layout(value_tile, output_layout, assert_trivial=True)
+    acc0 += value_tile * (1.0 / fp8_max)
+
+    v1 = kv_smem.slice(phase, phase, 0).permute([1, 0]).load(v_layout)
+    value_tile = gl.zeros([BLOCK_H, phase], dtype=gl.float32, layout=acc_layout)
+    value_tile = gl.amd.cdna4.mfma(probs_dot, v1, value_tile)
+    value_tile = gl.convert_layout(value_tile, output_layout, assert_trivial=True)
+    acc1 += value_tile * (1.0 / fp8_max)
+
+    v2 = kv_smem.slice(2 * phase, phase, 0).permute([1, 0]).load(v_layout)
+    value_tile = gl.zeros([BLOCK_H, phase], dtype=gl.float32, layout=acc_layout)
+    value_tile = gl.amd.cdna4.mfma(probs_dot, v2, value_tile)
+    value_tile = gl.convert_layout(value_tile, output_layout, assert_trivial=True)
+    acc2 += value_tile * (1.0 / fp8_max)
+
+    v3 = kv_smem.slice(3 * phase, phase, 0).permute([1, 0]).load(v_layout)
+    value_tile = gl.zeros([BLOCK_H, phase], dtype=gl.float32, layout=acc_layout)
+    value_tile = gl.amd.cdna4.mfma(probs_dot, v3, value_tile)
+    value_tile = gl.convert_layout(value_tile, output_layout, assert_trivial=True)
+    acc3 += value_tile * (1.0 / fp8_max)
+    return acc0, acc1, acc2, acc3
+
+
+@gluon.jit
 def _dsa_dense_mfma_kv_kernel(
     q,
     kv,
@@ -159,6 +255,8 @@ def _dsa_dense_mfma_kv_kernel(
     FP8_INPUTS: gl.constexpr,
     NATIVE_FP8: gl.constexpr,
     NATIVE_E5M2: gl.constexpr,
+    PHASED_E4M3: gl.constexpr,
+    KV_STAGES: gl.constexpr,
     COLUMN_PARALLEL: gl.constexpr,
     TRIM_EMPTY_TILES: gl.constexpr,
     NUM_KV_SPLITS: gl.constexpr,
@@ -186,11 +284,20 @@ def _dsa_dense_mfma_kv_kernel(
         transposed=True,
         warps_per_cta=[4, 1],
     )
+    # The phased E4M3 score product already partitions the 64 selected keys
+    # across the four waves. Reduce that representation directly and preserve
+    # the ownership through the probability store instead of redistributing
+    # the complete 16x64 score tile through shared memory.
+    softmax_layout: gl.constexpr = mfma_qk if PHASED_E4M3 else mfma_s
+    softmax_scalar_layout: gl.constexpr = gl.SliceLayout(1, softmax_layout)
     mfma_acc: gl.constexpr = gl.amd.cdna4.AMDMFMALayout(
         version=4,
         instr_shape=[16, 16, instr_k],
         transposed=True,
         warps_per_cta=([1, 4] if COLUMN_PARALLEL else [4, 1]),
+        # TileLang's FullCol value product assigns two adjacent 16-column
+        # matrix tiles to each wave. Keep every other path's tile shape intact.
+        tiles_per_warp=([1, 2] if PHASED_E4M3 else [1, 1]),
     )
 
     _qlora_tpw_k: gl.constexpr = min(64, D_V // INPUT_VEC)
@@ -209,6 +316,12 @@ def _dsa_dense_mfma_kv_kernel(
         warps_per_cta=[4, 1],
         order=[1, 0],
     )
+    # This ordinary-register layout is linearly identical to the [1, 4]
+    # value-product MFMA layout above. Lane[0:4] select the 16 heads,
+    # lane[4:6] select four-column fragments, and each wave owns one disjoint
+    # 32-column partition. Keeping this as a non-MFMA encoding makes the four
+    # persistent output fragments ordinary VGPR values across the key loop.
+    blk_out_phase: gl.constexpr = _e4m3_value_output_layout(BLOCK_H)
     _qrope_tpw_k: gl.constexpr = min(64, D_ROPE // INPUT_VEC)
     _qrope_tpw_m: gl.constexpr = 64 // _qrope_tpw_k
     blk_qrope: gl.constexpr = gl.BlockedLayout(
@@ -248,6 +361,17 @@ def _dsa_dense_mfma_kv_kernel(
         [[SHARED_INTERVAL, SHARED_PADDING]],
         [D_V, TILE_K],
         [0, 1],
+    )
+    sh_probs: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[SHARED_INTERVAL, SHARED_PADDING]],
+        [BLOCK_H, TILE_K],
+        [1, 0],
+    )
+    sh_topk: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=1,
+        per_phase=1,
+        max_phase=1,
+        order=[0],
     )
     sh_krope: gl.constexpr = gl.SwizzledSharedLayout(
         vec=INPUT_VEC,
@@ -392,7 +516,7 @@ def _dsa_dense_mfma_kv_kernel(
     first_tile_base = tile_start * TILE_K
     local_offs_klora = gl.arange(0, TILE_K, layout=gl.SliceLayout(0, blk_klora))
     local_offs_krope = gl.arange(0, TILE_K, layout=gl.SliceLayout(0, blk_krope))
-    local_offs_mma = gl.arange(0, TILE_K, layout=gl.SliceLayout(0, mfma_s))
+    local_offs_mma = gl.arange(0, TILE_K, layout=gl.SliceLayout(0, softmax_layout))
     offs_tile_klora = first_tile_base + local_offs_klora
     offs_tile_krope = first_tile_base + local_offs_krope
     offs_tile_mma = first_tile_base + local_offs_mma
@@ -400,12 +524,13 @@ def _dsa_dense_mfma_kv_kernel(
     offs_v_klora = gl.arange(0, D_V, layout=gl.SliceLayout(1, blk_klora))
     offs_r_krope = gl.arange(0, D_ROPE, layout=gl.SliceLayout(1, blk_krope))
 
-    topk_pos_klora = gl.amd.cdna4.buffer_load(
-        ptr=topk_indices,
-        offsets=topk_base.to(tl.int32) + offs_tile_klora,
-        mask=split_has_tiles & (offs_tile_klora < TOPK),
-        other=-1,
-    )
+    if not PHASED_E4M3:
+        topk_pos_klora = gl.amd.cdna4.buffer_load(
+            ptr=topk_indices,
+            offsets=topk_base.to(tl.int32) + offs_tile_klora,
+            mask=split_has_tiles & (offs_tile_klora < TOPK),
+            other=-1,
+        )
     topk_pos_krope = gl.amd.cdna4.buffer_load(
         ptr=topk_indices,
         offsets=topk_base.to(tl.int32) + offs_tile_krope,
@@ -418,7 +543,14 @@ def _dsa_dense_mfma_kv_kernel(
         mask=split_has_tiles & (offs_tile_mma < TOPK),
         other=-1,
     )
-
+    valid_mma = split_has_tiles & (offs_tile_mma < valid_len) & (topk_pos_mma >= 0)
+    if PHASED_E4M3:
+        # Reuse the score-column index load for the KV gather. The barrier
+        # makes these indices visible before the gather reads shared memory.
+        smem_topk = gl.allocate_shared_memory(gl.int32, [TILE_K], layout=sh_topk)
+        smem_topk.store(topk_pos_mma)
+        gl.barrier()
+        topk_pos_klora = smem_topk.load(gl.SliceLayout(0, blk_klora))
     valid_klora = (
         split_has_tiles & (offs_tile_klora < valid_len) & (topk_pos_klora >= 0)
     )
@@ -428,21 +560,26 @@ def _dsa_dense_mfma_kv_kernel(
         & (topk_pos_krope >= 0)
         & HAS_ROPE
     )
-    valid_mma = split_has_tiles & (offs_tile_mma < valid_len) & (topk_pos_mma >= 0)
     safe_klora = gl.where(valid_klora, topk_pos_klora, 0)
     safe_krope = gl.where(valid_krope, topk_pos_krope, 0)
 
     if HAS_ROPE:
         smem_krope = gl.allocate_shared_memory(
             smem_dtype,
-            [2, D_ROPE, TILE_K],
+            [KV_STAGES, D_ROPE, TILE_K],
             layout=sh_krope,
         )
     smem_klora = gl.allocate_shared_memory(
         smem_dtype,
-        [2, D_V, TILE_K],
+        [KV_STAGES, D_V, TILE_K],
         layout=sh_klora,
     )
+    if PHASED_E4M3:
+        smem_probs = gl.allocate_shared_memory(
+            smem_dtype,
+            [BLOCK_H, TILE_K],
+            layout=sh_probs,
+        )
 
     klora_offs = safe_klora[None, :].to(tl.int64) * stride_kv_t + offs_v_klora[
         :, None
@@ -464,6 +601,8 @@ def _dsa_dense_mfma_kv_kernel(
                 other=0.0,
             ).to(smem_dtype)
             smem_krope.index(0).store(k_rope)
+        if PHASED_E4M3:
+            gl.barrier()
     else:
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             dest=smem_klora.index(0),
@@ -480,7 +619,8 @@ def _dsa_dense_mfma_kv_kernel(
             )
         gl.amd.cdna4.async_copy.commit_group()
         gl.amd.cdna4.async_copy.wait_group(1)
-    q_lora_dot = smem_qlora.load(dot_qlora_a)
+    if not PHASED_E4M3:
+        q_lora_dot = smem_qlora.load(dot_qlora_a)
     if HAS_ROPE:
         q_rope_dot = smem_qrope.load(dot_qrope_a)
 
@@ -488,72 +628,65 @@ def _dsa_dense_mfma_kv_kernel(
         [BLOCK_H],
         float("-inf"),
         dtype=gl.float32,
-        layout=gl.SliceLayout(1, mfma_s),
+        layout=softmax_scalar_layout,
     )
     l_i = gl.full(
         [BLOCK_H],
         0.0,
         dtype=gl.float32,
-        layout=gl.SliceLayout(1, mfma_s),
+        layout=softmax_scalar_layout,
     )
-    acc = gl.zeros([BLOCK_H, D_V], dtype=gl.float32, layout=mfma_acc)
+    if PHASED_E4M3:
+        # Keep persistent outputs in ordinary VGPRs. Only the short-lived PV
+        # scratch in _dsa_e4m3_value_4x128 uses the MFMA accumulator layout.
+        acc0 = gl.zeros([BLOCK_H, 128], dtype=gl.float32, layout=blk_out_phase)
+        acc1 = gl.zeros([BLOCK_H, 128], dtype=gl.float32, layout=blk_out_phase)
+        acc2 = gl.zeros([BLOCK_H, 128], dtype=gl.float32, layout=blk_out_phase)
+        acc3 = gl.zeros([BLOCK_H, 128], dtype=gl.float32, layout=blk_out_phase)
+    else:
+        acc = gl.zeros([BLOCK_H, D_V], dtype=gl.float32, layout=mfma_acc)
 
     cur_buf = 0
     for tile_idx in range(num_tiles - 1):
-        next_base = (tile_start + tile_idx + 1) * TILE_K
-        next_offs_klora = next_base + local_offs_klora
-        next_offs_krope = next_base + local_offs_krope
-        next_offs_mma = next_base + local_offs_mma
-
-        topk_pos_klora_next = gl.amd.cdna4.buffer_load(
-            ptr=topk_indices,
-            offsets=topk_base.to(tl.int32) + next_offs_klora,
-            mask=next_offs_klora < TOPK,
-            other=-1,
-        )
-        topk_pos_krope_next = gl.amd.cdna4.buffer_load(
-            ptr=topk_indices,
-            offsets=topk_base.to(tl.int32) + next_offs_krope,
-            mask=next_offs_krope < TOPK,
-            other=-1,
-        )
-        topk_pos_mma_next = gl.amd.cdna4.buffer_load(
-            ptr=topk_indices,
-            offsets=topk_base.to(tl.int32) + next_offs_mma,
-            mask=next_offs_mma < TOPK,
-            other=-1,
-        )
-
-        valid_klora_next = (next_offs_klora < valid_len) & (topk_pos_klora_next >= 0)
-        valid_krope_next = (
-            (next_offs_krope < valid_len) & (topk_pos_krope_next >= 0) & HAS_ROPE
-        )
-        valid_mma_next = (next_offs_mma < valid_len) & (topk_pos_mma_next >= 0)
-        safe_klora_next = gl.where(valid_klora_next, topk_pos_klora_next, 0)
-        safe_krope_next = gl.where(valid_krope_next, topk_pos_krope_next, 0)
-        next_buf = 1 - cur_buf
-
-        klora_offs_next = safe_klora_next[None, :].to(
-            tl.int64
-        ) * stride_kv_t + offs_v_klora[:, None].to(tl.int64)
-        krope_offs_next = safe_krope_next[None, :].to(tl.int64) * stride_kv_t + (
-            D_V + offs_r_krope[:, None]
-        ).to(tl.int64)
-        if FP8_INPUTS:
-            k_lora_next = gl.load(
-                kv + klora_offs_next,
-                mask=valid_klora_next[None, :],
-                other=0.0,
-            ).to(smem_dtype)
-            smem_klora.index(next_buf).store(k_lora_next)
-            if HAS_ROPE:
-                k_rope_next = gl.load(
-                    kv + krope_offs_next,
-                    mask=valid_krope_next[None, :],
-                    other=0.0,
-                ).to(smem_dtype)
-                smem_krope.index(next_buf).store(k_rope_next)
-        else:
+        if not FP8_INPUTS:
+            next_base = (tile_start + tile_idx + 1) * TILE_K
+            next_offs_klora = next_base + local_offs_klora
+            next_offs_krope = next_base + local_offs_krope
+            next_offs_mma = next_base + local_offs_mma
+            next_buf = 1 - cur_buf
+            topk_pos_klora_next = gl.amd.cdna4.buffer_load(
+                ptr=topk_indices,
+                offsets=topk_base.to(tl.int32) + next_offs_klora,
+                mask=next_offs_klora < TOPK,
+                other=-1,
+            )
+            topk_pos_krope_next = gl.amd.cdna4.buffer_load(
+                ptr=topk_indices,
+                offsets=topk_base.to(tl.int32) + next_offs_krope,
+                mask=next_offs_krope < TOPK,
+                other=-1,
+            )
+            topk_pos_mma_next = gl.amd.cdna4.buffer_load(
+                ptr=topk_indices,
+                offsets=topk_base.to(tl.int32) + next_offs_mma,
+                mask=next_offs_mma < TOPK,
+                other=-1,
+            )
+            valid_klora_next = (next_offs_klora < valid_len) & (
+                topk_pos_klora_next >= 0
+            )
+            valid_krope_next = (
+                (next_offs_krope < valid_len) & (topk_pos_krope_next >= 0) & HAS_ROPE
+            )
+            valid_mma_next = (next_offs_mma < valid_len) & (topk_pos_mma_next >= 0)
+            safe_klora_next = gl.where(valid_klora_next, topk_pos_klora_next, 0)
+            safe_krope_next = gl.where(valid_krope_next, topk_pos_krope_next, 0)
+            klora_offs_next = safe_klora_next[None, :].to(
+                tl.int64
+            ) * stride_kv_t + offs_v_klora[:, None].to(tl.int64)
+            krope_offs_next = safe_krope_next[None, :].to(tl.int64) * stride_kv_t + (
+                D_V + offs_r_krope[:, None]
+            ).to(tl.int64)
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
                 dest=smem_klora.index(next_buf),
                 ptr=kv,
@@ -571,22 +704,36 @@ def _dsa_dense_mfma_kv_kernel(
             gl.amd.cdna4.async_copy.wait_group(1)
 
         klora_smem_cur = smem_klora.index(cur_buf)
-        k_lora_t_dot = klora_smem_cur.load(dot_klora_b)
-        v_lora_dot = klora_smem_cur.permute([1, 0]).load(dot_v_b)
+        if not PHASED_E4M3:
+            k_lora_t_dot = klora_smem_cur.load(dot_klora_b)
+        if not FP8_INPUTS and not PHASED_E4M3:
+            v_lora_dot = klora_smem_cur.permute([1, 0]).load(dot_v_b)
         if HAS_ROPE:
             k_rope_t_dot = smem_krope.index(cur_buf).load(dot_krope_b)
 
-        scores = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=mfma_qk)
-        scores = gl.amd.cdna4.mfma(q_lora_dot, k_lora_t_dot, scores)
+        if PHASED_E4M3:
+            scores = _dsa_e4m3_score_4x128(
+                smem_qlora,
+                klora_smem_cur,
+                dot_qlora_a,
+                dot_klora_b,
+                mfma_qk,
+                BLOCK_H,
+                TILE_K,
+            )
+        else:
+            scores = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=mfma_qk)
+            scores = gl.amd.cdna4.mfma(q_lora_dot, k_lora_t_dot, scores)
         if HAS_ROPE:
             scores = gl.amd.cdna4.mfma(q_rope_dot, k_rope_t_dot, scores)
-        scores = gl.convert_layout(scores, mfma_s)
+        if not PHASED_E4M3:
+            scores = gl.convert_layout(scores, mfma_s)
         scores = scores * scale
 
         offs_h_mma = hg_offset + gl.arange(
             0,
             BLOCK_H,
-            layout=gl.SliceLayout(1, mfma_s),
+            layout=softmax_scalar_layout,
         )
         mask_h_mma = offs_h_mma < num_heads
         scores = gl.where(
@@ -600,36 +747,145 @@ def _dsa_dense_mfma_kv_kernel(
         probs = gl.exp(scores - safe_m_new[:, None])
         l_new = alpha * l_i + gl.sum(probs, axis=1)
 
-        alpha_acc = gl.convert_layout(alpha, gl.SliceLayout(1, mfma_acc))
-        acc = acc * alpha_acc[:, None]
-        probs_dot = gl.convert_layout(probs.to(smem_dtype), dot_p_a)
-        acc = gl.amd.cdna4.mfma(probs_dot, v_lora_dot, acc)
+        if PHASED_E4M3:
+            alpha_out = gl.convert_layout(alpha, gl.SliceLayout(1, blk_out_phase))
+            acc0 *= alpha_out[:, None]
+            acc1 *= alpha_out[:, None]
+            acc2 *= alpha_out[:, None]
+            acc3 *= alpha_out[:, None]
+            # Match TileLang's 16x64 probability handoff. The first store has
+            # no predecessor, while every later store follows the KV-refill
+            # barrier below, which already closes the preceding PV reads.
+            smem_probs.store((probs * 448.0).to(smem_dtype))
+            acc0, acc1, acc2, acc3 = _dsa_e4m3_value_4x128(
+                smem_probs,
+                klora_smem_cur,
+                acc0,
+                acc1,
+                acc2,
+                acc3,
+                dot_p_a,
+                dot_v_b,
+                mfma_acc,
+                blk_out_phase,
+                BLOCK_H,
+            )
+        else:
+            alpha_acc = gl.convert_layout(alpha, gl.SliceLayout(1, mfma_acc))
+            acc = acc * alpha_acc[:, None]
+            probs_dot = gl.convert_layout(probs.to(smem_dtype), dot_p_a)
+            if FP8_INPUTS:
+                # Do not keep both K and V dot operands live across score calculation
+                # and softmax. TileLang consumes those matrix phases separately;
+                # loading V here gives native E4M3 the same short operand lifetime.
+                v_lora_dot = klora_smem_cur.permute([1, 0]).load(dot_v_b)
+            acc = gl.amd.cdna4.mfma(probs_dot, v_lora_dot, acc)
 
         m_i = m_new
         l_i = l_new
-        cur_buf = next_buf
+        if FP8_INPUTS:
+            # The E4M3-FP8 copy is blocking, so loading into an alternate
+            # buffer before this tile's matrix work cannot overlap anything.
+            # Refill the consumed tile instead, matching SGLang's single-stage
+            # TileLang schedule and keeping the load operands out of the live
+            # range of the score/value accumulators.
+            next_base = (tile_start + tile_idx + 1) * TILE_K
+            next_offs_klora = next_base + local_offs_klora
+            next_offs_krope = next_base + local_offs_krope
+            next_offs_mma = next_base + local_offs_mma
+            if not PHASED_E4M3:
+                topk_pos_klora_next = gl.amd.cdna4.buffer_load(
+                    ptr=topk_indices,
+                    offsets=topk_base.to(tl.int32) + next_offs_klora,
+                    mask=next_offs_klora < TOPK,
+                    other=-1,
+                )
+            topk_pos_krope_next = gl.amd.cdna4.buffer_load(
+                ptr=topk_indices,
+                offsets=topk_base.to(tl.int32) + next_offs_krope,
+                mask=next_offs_krope < TOPK,
+                other=-1,
+            )
+            topk_pos_mma_next = gl.amd.cdna4.buffer_load(
+                ptr=topk_indices,
+                offsets=topk_base.to(tl.int32) + next_offs_mma,
+                mask=next_offs_mma < TOPK,
+                other=-1,
+            )
+            valid_mma_next = (next_offs_mma < valid_len) & (topk_pos_mma_next >= 0)
+            if PHASED_E4M3:
+                smem_topk.store(topk_pos_mma_next)
+                gl.barrier()
+                topk_pos_klora_next = smem_topk.load(gl.SliceLayout(0, blk_klora))
+            valid_klora_next = (next_offs_klora < valid_len) & (
+                topk_pos_klora_next >= 0
+            )
+            valid_krope_next = (
+                (next_offs_krope < valid_len) & (topk_pos_krope_next >= 0) & HAS_ROPE
+            )
+            safe_klora_next = gl.where(valid_klora_next, topk_pos_klora_next, 0)
+            safe_krope_next = gl.where(valid_krope_next, topk_pos_krope_next, 0)
+            klora_offs_next = safe_klora_next[None, :].to(
+                tl.int64
+            ) * stride_kv_t + offs_v_klora[:, None].to(tl.int64)
+            krope_offs_next = safe_krope_next[None, :].to(tl.int64) * stride_kv_t + (
+                D_V + offs_r_krope[:, None]
+            ).to(tl.int64)
+
+            if not PHASED_E4M3:
+                gl.barrier()
+            k_lora_next = gl.load(
+                kv + klora_offs_next,
+                mask=valid_klora_next[None, :],
+                other=0.0,
+            ).to(smem_dtype)
+            smem_klora.index(0).store(k_lora_next)
+            if HAS_ROPE:
+                k_rope_next = gl.load(
+                    kv + krope_offs_next,
+                    mask=valid_krope_next[None, :],
+                    other=0.0,
+                ).to(smem_dtype)
+                smem_krope.index(0).store(k_rope_next)
+            gl.barrier()
+        if not FP8_INPUTS:
+            cur_buf = next_buf
         valid_mma = valid_mma_next
 
     if not FP8_INPUTS:
         gl.amd.cdna4.async_copy.wait_group(0)
 
     klora_smem_cur = smem_klora.index(cur_buf)
-    k_lora_t_dot = klora_smem_cur.load(dot_klora_b)
-    v_lora_dot = klora_smem_cur.permute([1, 0]).load(dot_v_b)
+    if not PHASED_E4M3:
+        k_lora_t_dot = klora_smem_cur.load(dot_klora_b)
+    if not FP8_INPUTS and not PHASED_E4M3:
+        v_lora_dot = klora_smem_cur.permute([1, 0]).load(dot_v_b)
     if HAS_ROPE:
         k_rope_t_dot = smem_krope.index(cur_buf).load(dot_krope_b)
 
-    scores = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=mfma_qk)
-    scores = gl.amd.cdna4.mfma(q_lora_dot, k_lora_t_dot, scores)
+    if PHASED_E4M3:
+        scores = _dsa_e4m3_score_4x128(
+            smem_qlora,
+            klora_smem_cur,
+            dot_qlora_a,
+            dot_klora_b,
+            mfma_qk,
+            BLOCK_H,
+            TILE_K,
+        )
+    else:
+        scores = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=mfma_qk)
+        scores = gl.amd.cdna4.mfma(q_lora_dot, k_lora_t_dot, scores)
     if HAS_ROPE:
         scores = gl.amd.cdna4.mfma(q_rope_dot, k_rope_t_dot, scores)
-    scores = gl.convert_layout(scores, mfma_s)
+    if not PHASED_E4M3:
+        scores = gl.convert_layout(scores, mfma_s)
     scores = scores * scale
 
     offs_h_mma = hg_offset + gl.arange(
         0,
         BLOCK_H,
-        layout=gl.SliceLayout(1, mfma_s),
+        layout=softmax_scalar_layout,
     )
     mask_h_mma = offs_h_mma < num_heads
     scores = gl.where(valid_mma[None, :] & mask_h_mma[:, None], scores, -float("inf"))
@@ -641,50 +897,130 @@ def _dsa_dense_mfma_kv_kernel(
     probs = gl.exp(scores - safe_m_new[:, None])
     l_new = alpha * l_i + gl.sum(probs, axis=1)
 
-    alpha_acc = gl.convert_layout(alpha, gl.SliceLayout(1, mfma_acc))
-    acc = acc * alpha_acc[:, None]
-    probs_dot = gl.convert_layout(probs.to(smem_dtype), dot_p_a)
-    acc = gl.amd.cdna4.mfma(probs_dot, v_lora_dot, acc)
+    if PHASED_E4M3:
+        alpha_out = gl.convert_layout(alpha, gl.SliceLayout(1, blk_out_phase))
+        acc0 *= alpha_out[:, None]
+        acc1 *= alpha_out[:, None]
+        acc2 *= alpha_out[:, None]
+        acc3 *= alpha_out[:, None]
+        # The first probability store has no predecessor; later stores follow
+        # the prior iteration's KV-refill barrier, which closes its PV reads.
+        smem_probs.store((probs * 448.0).to(smem_dtype))
+        gl.barrier()
+        acc0, acc1, acc2, acc3 = _dsa_e4m3_value_4x128(
+            smem_probs,
+            klora_smem_cur,
+            acc0,
+            acc1,
+            acc2,
+            acc3,
+            dot_p_a,
+            dot_v_b,
+            mfma_acc,
+            blk_out_phase,
+            BLOCK_H,
+        )
+    else:
+        alpha_acc = gl.convert_layout(alpha, gl.SliceLayout(1, mfma_acc))
+        acc = acc * alpha_acc[:, None]
+        probs_dot = gl.convert_layout(probs.to(smem_dtype), dot_p_a)
+        if FP8_INPUTS:
+            v_lora_dot = klora_smem_cur.permute([1, 0]).load(dot_v_b)
+        acc = gl.amd.cdna4.mfma(probs_dot, v_lora_dot, acc)
 
-    l_i_acc = gl.convert_layout(l_new, gl.SliceLayout(1, mfma_acc))
-    safe_l_i = gl.where(l_i_acc > 0.0, l_i_acc, 1.0)
-    acc = acc / safe_l_i[:, None]
-    acc = gl.where(l_i_acc[:, None] > 0.0, acc, 0.0)
-
-    offs_h_o = hg_offset + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blk_out))
-    offs_v_o = gl.arange(0, D_V, layout=gl.SliceLayout(0, blk_out))
-    mask_h_o = offs_h_o < num_heads
     if NUM_KV_SPLITS > 1:
         o_base = (
             token_idx.to(tl.int64) * stride_o_t + split_idx.to(tl.int64) * stride_o_s
         )
     else:
         o_base = token_idx.to(tl.int64) * stride_o_t
-    o_offs = (
-        o_base
-        + offs_h_o[:, None].to(tl.int64) * stride_o_h
-        + offs_v_o[None, :].to(tl.int64)
-    )
-    out_vals = gl.convert_layout(acc.to(out.dtype.element_ty), blk_out)
-    gl.amd.cdna4.buffer_store(
-        stored_value=out_vals,
-        ptr=out,
-        offsets=o_offs.to(tl.int32),
-        mask=mask_h_o[:, None],
-    )
+    if PHASED_E4M3:
+        l_i_out = gl.convert_layout(l_new, gl.SliceLayout(1, blk_out_phase))
+        safe_l_i_out = gl.where(l_i_out > 0.0, l_i_out, 1.0)
+        output_valid = l_i_out[:, None] > 0.0
+        acc0 = gl.where(output_valid, acc0 / safe_l_i_out[:, None], 0.0)
+        acc1 = gl.where(output_valid, acc1 / safe_l_i_out[:, None], 0.0)
+        acc2 = gl.where(output_valid, acc2 / safe_l_i_out[:, None], 0.0)
+        acc3 = gl.where(output_valid, acc3 / safe_l_i_out[:, None], 0.0)
+
+        offs_h_o = hg_offset + gl.arange(
+            0, BLOCK_H, layout=gl.SliceLayout(1, blk_out_phase)
+        )
+        offs_v_o = gl.arange(0, 128, layout=gl.SliceLayout(0, blk_out_phase))
+        mask_h_o = offs_h_o < num_heads
+        o_row = o_base + offs_h_o[:, None].to(tl.int64) * stride_o_h
+
+        out0 = acc0.to(out.dtype.element_ty)
+        gl.amd.cdna4.buffer_store(
+            stored_value=out0,
+            ptr=out,
+            offsets=(o_row + offs_v_o[None, :].to(tl.int64)).to(tl.int32),
+            mask=mask_h_o[:, None],
+        )
+        out1 = acc1.to(out.dtype.element_ty)
+        gl.amd.cdna4.buffer_store(
+            stored_value=out1,
+            ptr=out,
+            offsets=(o_row + (128 + offs_v_o[None, :]).to(tl.int64)).to(tl.int32),
+            mask=mask_h_o[:, None],
+        )
+        out2 = acc2.to(out.dtype.element_ty)
+        gl.amd.cdna4.buffer_store(
+            stored_value=out2,
+            ptr=out,
+            offsets=(o_row + (256 + offs_v_o[None, :]).to(tl.int64)).to(tl.int32),
+            mask=mask_h_o[:, None],
+        )
+        out3 = acc3.to(out.dtype.element_ty)
+        gl.amd.cdna4.buffer_store(
+            stored_value=out3,
+            ptr=out,
+            offsets=(o_row + (384 + offs_v_o[None, :]).to(tl.int64)).to(tl.int32),
+            mask=mask_h_o[:, None],
+        )
+    else:
+        l_i_acc = gl.convert_layout(l_new, gl.SliceLayout(1, mfma_acc))
+        safe_l_i = gl.where(l_i_acc > 0.0, l_i_acc, 1.0)
+        acc = acc / safe_l_i[:, None]
+        acc = gl.where(l_i_acc[:, None] > 0.0, acc, 0.0)
+
+        offs_h_o = hg_offset + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blk_out))
+        offs_v_o = gl.arange(0, D_V, layout=gl.SliceLayout(0, blk_out))
+        mask_h_o = offs_h_o < num_heads
+        o_offs = (
+            o_base
+            + offs_h_o[:, None].to(tl.int64) * stride_o_h
+            + offs_v_o[None, :].to(tl.int64)
+        )
+        out_vals = gl.convert_layout(acc.to(out.dtype.element_ty), blk_out)
+        gl.amd.cdna4.buffer_store(
+            stored_value=out_vals,
+            ptr=out,
+            offsets=o_offs.to(tl.int32),
+            mask=mask_h_o[:, None],
+        )
 
     if NUM_KV_SPLITS > 1:
         lse = gl.where(l_new > 0.0, m_new + gl.log(l_new), -float("inf"))
+        if PHASED_E4M3:
+            lse = gl.convert_layout(lse, gl.SliceLayout(1, mfma_s))
+            offs_h_lse = hg_offset + gl.arange(
+                0, BLOCK_H, layout=gl.SliceLayout(1, mfma_s)
+            )
+            mask_h_lse = offs_h_lse < num_heads
+        else:
+            offs_h_lse = offs_h_mma
+            mask_h_lse = mask_h_mma
         lse_offsets = (
             token_idx.to(tl.int64) * stride_lse_t
-            + offs_h_mma.to(tl.int64) * stride_lse_h
+            + offs_h_lse.to(tl.int64) * stride_lse_h
             + split_idx.to(tl.int64) * stride_lse_s
         )
         gl.amd.cdna4.buffer_store(
             stored_value=lse,
             ptr=partial_lse,
             offsets=lse_offsets.to(tl.int32),
-            mask=mask_h_mma,
+            mask=mask_h_lse,
         )
 
 
@@ -1094,6 +1430,23 @@ def _trim_topk_slots_for_context(
     return topk_slots
 
 
+def _use_native_e4m3_core(
+    *,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> bool:
+    """Select the GLM-5.3 native-E4M3 matrix path."""
+
+    return (
+        q_dtype == torch.float8_e4m3fn
+        and kv_dtype == torch.float8_e4m3fn
+        and int(kv_lora_rank) == 512
+        and int(qk_rope_head_dim) == 0
+    )
+
+
 def _run_dense_kv(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -1113,13 +1466,28 @@ def _run_dense_kv(
             dtype=_output_dtype(q),
             device=q.device,
         )
+    native_e4m3 = _use_native_e4m3_core(
+        q_dtype=q.dtype,
+        kv_dtype=kv_cache.dtype,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+    )
+    fp8_inputs = q.dtype == torch.float8_e4m3fn or kv_cache.dtype == torch.float8_e4m3fn
+    native_fp8 = q.dtype == kv_cache.dtype and q.dtype in _FP8_DTYPES
+    # Native E4M3 uses the configured selected-key capacity for scheduling.
+    # Per-row live/causal lengths stay in topk_lens and are loaded by the
+    # kernel. This keeps graph replay on one compiled object when those
+    # runtime lengths change.
+    schedule_max_seqlen_k = (
+        int(topk_slots.shape[1]) if native_e4m3 else int(max_seqlen_k)
+    )
     num_kv_splits = _select_num_kv_splits(
         num_tokens=q.shape[0],
         num_heads=q.shape[1],
         topk_width=topk_slots.shape[1],
-        max_seqlen_k=max_seqlen_k,
+        max_seqlen_k=schedule_max_seqlen_k,
         is_fp8=q.dtype in _FP8_DTYPES,
-        native_fp8=q.dtype == kv_cache.dtype and q.dtype in _FP8_DTYPES,
+        native_fp8=native_fp8,
         qk_rope_head_dim=qk_rope_head_dim,
         is_prefill=is_prefill,
     )
@@ -1175,19 +1543,32 @@ def _run_dense_kv(
         # HAS_ROPE removes its storage, loads, and score term.
         D_ROPE=max(qk_rope_head_dim, 64),
         HAS_ROPE=qk_rope_head_dim > 0,
-        FP8_INPUTS=(
-            q.dtype == torch.float8_e4m3fn or kv_cache.dtype == torch.float8_e4m3fn
-        ),
-        NATIVE_FP8=(q.dtype == kv_cache.dtype and q.dtype in _FP8_DTYPES),
+        FP8_INPUTS=fp8_inputs,
+        NATIVE_FP8=native_fp8,
         NATIVE_E5M2=(
             q.dtype == torch.float8_e5m2 and kv_cache.dtype == torch.float8_e5m2
         ),
+        # Match SGLang's TileLang E4M3 path: each QK and PV matrix phase owns
+        # only 128 latent columns instead of materializing 512-wide operands.
+        PHASED_E4M3=native_e4m3,
+        # The E4M3-FP8 path uses blocking global-to-shared copies. A second KV tile
+        # cannot overlap those copies with matrix work, so keep only one tile
+        # resident and refill it after the current tile has been consumed.
+        KV_STAGES=1 if fp8_inputs else 2,
         COLUMN_PARALLEL=(
-            q.dtype == torch.bfloat16
-            and kv_cache.dtype == torch.bfloat16
-            and qk_rope_head_dim == 0
+            (
+                q.dtype == torch.bfloat16
+                and kv_cache.dtype == torch.bfloat16
+                and qk_rope_head_dim == 0
+            )
+            or native_e4m3
         ),
-        TRIM_EMPTY_TILES=int(max_seqlen_k) < int(topk_slots.shape[1]),
+        # The native E4M3 object always iterates its static selected-key
+        # capacity and masks each row with the runtime topk_lens load. Do not
+        # specialize this loop mode on a live sequence-length scalar.
+        TRIM_EMPTY_TILES=(
+            False if native_e4m3 else int(max_seqlen_k) < int(topk_slots.shape[1])
+        ),
         NUM_KV_SPLITS=num_kv_splits,
         BLOCK_H=16,
         TILE_K=64 if qk_rope_head_dim == 0 else 32,
@@ -1324,7 +1705,18 @@ def _run_dsa(
     q = _flatten_query(q).contiguous()
     topk_slots = topk_slots.contiguous()
     topk_lens = topk_lens.contiguous()
-    topk_slots = _trim_topk_slots_for_context(topk_slots, max_seqlen_k)
+    length_stable_native_e4m3 = (
+        kv_cache is not None
+        and sparse_kv_cache is None
+        and _use_native_e4m3_core(
+            q_dtype=q.dtype,
+            kv_dtype=kv_cache.dtype,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+        )
+    )
+    if not length_stable_native_e4m3:
+        topk_slots = _trim_topk_slots_for_context(topk_slots, max_seqlen_k)
     softmax_scale = float(softmax_scale) * float(k_scale)
     out_view = None
     if (

@@ -1730,8 +1730,10 @@ def test_dsa_decode_glm53_flash_bf16_split_matrix(tokens: int) -> None:
     reason="GLM-5.3-Flash graph replay requires AMD CDNA4 or CDNA5",
 )
 @pytest.mark.parametrize("tokens", (16, 64))
-def test_dsa_decode_glm53_flash_bf16_split_graph_tracks_live_lengths(
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float8_e4m3fn))
+def test_dsa_decode_glm53_flash_graph_tracks_live_lengths(
     tokens: int,
+    dtype: torch.dtype,
 ) -> None:
     device = "cuda"
     num_heads = 16
@@ -1742,10 +1744,10 @@ def test_dsa_decode_glm53_flash_bf16_split_graph_tracks_live_lengths(
     generator = _generator(device, 1220 + tokens)
     q = _randn_bf16(
         (tokens, num_heads, kv_lora_rank), device=device, generator=generator
-    )
+    ).to(dtype)
     kv_cache = _randn_bf16(
         (num_slots, kv_lora_rank), device=device, generator=generator
-    )
+    ).to(dtype)
     topk_slots = torch.full((tokens, topk), -1, device=device, dtype=torch.int32)
     topk_lens = torch.empty(tokens, device=device, dtype=torch.int32)
     graph_out = torch.empty(
