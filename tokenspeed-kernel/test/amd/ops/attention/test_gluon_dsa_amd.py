@@ -1932,7 +1932,8 @@ def test_dsa_prefill_glm53_flash_dense_mfma(
     not (is_cdna4() or is_cdna5()),
     reason="GLM-5.3-Flash padded prefill requires AMD CDNA4 or CDNA5",
 )
-def test_dsa_prefill_glm53_flash_zero_length_rows_are_zero() -> None:
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float8_e4m3fn))
+def test_dsa_prefill_glm53_flash_zero_length_rows_are_zero(dtype: torch.dtype) -> None:
     device = "cuda"
     tokens = 4
     num_heads = 16
@@ -1952,6 +1953,8 @@ def test_dsa_prefill_glm53_flash_zero_length_rows_are_zero() -> None:
         generator=generator,
     )
     kv_cache[0].fill_(float("nan"))
+    q = q.to(dtype)
+    kv_cache = kv_cache.to(dtype)
     topk_slots = torch.full(
         (tokens, topk),
         -1,

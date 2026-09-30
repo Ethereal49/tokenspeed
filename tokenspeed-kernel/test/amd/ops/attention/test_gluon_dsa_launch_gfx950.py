@@ -96,8 +96,7 @@ def test_native_fp8_launch_parameters_ignore_live_length(
     assert grid[0] == tokens
     assert grid[2] == constants["NUM_KV_SPLITS"]
     assert constants["PHASED_E4M3"] is True
-    assert constants["TRIM_EMPTY_TILES"] is False
-    assert constants["KV_STAGES"] == 1
+    assert constants["TRIM_EMPTY_TILES"] is True
 
 
 def test_bf16_fallback_still_trims_selected_width(

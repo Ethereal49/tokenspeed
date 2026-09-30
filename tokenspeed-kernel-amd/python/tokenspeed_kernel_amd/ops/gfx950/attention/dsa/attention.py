@@ -161,23 +161,13 @@ def _dsa_e4m3_score_4x128(
     scores = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=score_layout)
     scores = gl.amd.cdna4.mfma(q0, k0, scores)
 
-    q1 = q_smem.slice(phase, phase, 1).load(q_layout)
-    k1 = kv_smem.slice(phase, phase, 0).load(k_layout)
-    score_tile = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=score_layout)
-    score_tile = gl.amd.cdna4.mfma(q1, k1, score_tile)
-    scores += score_tile
-
-    q2 = q_smem.slice(2 * phase, phase, 1).load(q_layout)
-    k2 = kv_smem.slice(2 * phase, phase, 0).load(k_layout)
-    score_tile = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=score_layout)
-    score_tile = gl.amd.cdna4.mfma(q2, k2, score_tile)
-    scores += score_tile
-
-    q3 = q_smem.slice(3 * phase, phase, 1).load(q_layout)
-    k3 = kv_smem.slice(3 * phase, phase, 0).load(k_layout)
-    score_tile = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=score_layout)
-    score_tile = gl.amd.cdna4.mfma(q3, k3, score_tile)
-    return scores + score_tile
+    for phase_idx in gl.static_range(1, 4):
+        q_phase = q_smem.slice(phase_idx * phase, phase, 1).load(q_layout)
+        k_phase = kv_smem.slice(phase_idx * phase, phase, 0).load(k_layout)
+        score_tile = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=score_layout)
+        score_tile = gl.amd.cdna4.mfma(q_phase, k_phase, score_tile)
+        scores += score_tile
+    return scores
 
 
 @gluon.jit
@@ -256,7 +246,6 @@ def _dsa_dense_mfma_kv_kernel(
     NATIVE_FP8: gl.constexpr,
     NATIVE_E5M2: gl.constexpr,
     PHASED_E4M3: gl.constexpr,
-    KV_STAGES: gl.constexpr,
     COLUMN_PARALLEL: gl.constexpr,
     TRIM_EMPTY_TILES: gl.constexpr,
     NUM_KV_SPLITS: gl.constexpr,
@@ -270,6 +259,7 @@ def _dsa_dense_mfma_kv_kernel(
     ROPE_LOAD_VEC: gl.constexpr = 4 if NATIVE_FP8 else 2
     SHARED_INTERVAL: gl.constexpr = 1024 if NATIVE_FP8 else 512
     SHARED_PADDING: gl.constexpr = 32 if NATIVE_FP8 else 16
+    KV_STAGES: gl.constexpr = 1 if FP8_INPUTS else 2
     # The BF16 no-RoPE tile owns one MFMA row. Split its columns across the
     # four waves, then restore the original score layout before softmax.
     mfma_qk: gl.constexpr = gl.amd.cdna4.AMDMFMALayout(
@@ -1551,10 +1541,6 @@ def _run_dense_kv(
         # Match SGLang's TileLang E4M3 path: each QK and PV matrix phase owns
         # only 128 latent columns instead of materializing 512-wide operands.
         PHASED_E4M3=native_e4m3,
-        # The E4M3-FP8 path uses blocking global-to-shared copies. A second KV tile
-        # cannot overlap those copies with matrix work, so keep only one tile
-        # resident and refill it after the current tile has been consumed.
-        KV_STAGES=1 if fp8_inputs else 2,
         COLUMN_PARALLEL=(
             (
                 q.dtype == torch.bfloat16
@@ -1563,12 +1549,9 @@ def _run_dense_kv(
             )
             or native_e4m3
         ),
-        # The native E4M3 object always iterates its static selected-key
-        # capacity and masks each row with the runtime topk_lens load. Do not
-        # specialize this loop mode on a live sequence-length scalar.
-        TRIM_EMPTY_TILES=(
-            False if native_e4m3 else int(max_seqlen_k) < int(topk_slots.shape[1])
-        ),
+        # A fixed launch shape still lets the device skip tiles beyond each
+        # row's live selected length during graph replay.
+        TRIM_EMPTY_TILES=(native_e4m3 or int(max_seqlen_k) < int(topk_slots.shape[1])),
         NUM_KV_SPLITS=num_kv_splits,
         BLOCK_H=16,
         TILE_K=64 if qk_rope_head_dim == 0 else 32,
