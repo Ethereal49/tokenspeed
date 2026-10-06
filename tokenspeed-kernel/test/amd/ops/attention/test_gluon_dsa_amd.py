@@ -1294,11 +1294,13 @@ def test_dsa_with_sparse_kvcache(mode: str, api, q_dtype: torch.dtype) -> None:
     ],
 )
 @pytest.mark.parametrize(
-    "q_dtype",
+    ("q_dtype", "kv_dtype"),
     [
-        pytest.param(torch.bfloat16, id="q_bf16"),
-        pytest.param(torch.float8_e4m3fn, id="q_e4m3"),
-        pytest.param(torch.float8_e5m2, id="q_e5m2"),
+        pytest.param(torch.bfloat16, torch.bfloat16, id="bf16"),
+        pytest.param(torch.float8_e4m3fn, torch.float8_e4m3fn, id="e4m3"),
+        pytest.param(torch.float8_e5m2, torch.float8_e5m2, id="e5m2"),
+        pytest.param(torch.bfloat16, torch.float8_e4m3fn, id="bf16-q-e4m3-kv"),
+        pytest.param(torch.float8_e4m3fn, torch.bfloat16, id="e4m3-q-bf16-kv"),
     ],
 )
 @pytest.mark.parametrize(
@@ -1312,12 +1314,13 @@ def test_dsa_dense_kvcache(
     mode: str,
     api,
     q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
     kv_lora_rank: int,
 ) -> None:
     device = "cuda"
     tokens = 3
     num_heads = 2
-    num_slots = 16
+    num_slots = 144
     topk = 512
     qk_rope_head_dim = 64
     qk_nope_head_dim = 192 if kv_lora_rank == 512 else 128
@@ -1332,11 +1335,11 @@ def test_dsa_dense_kvcache(
     q = q_bf16.to(q_dtype)
     latent = torch.randn(num_slots, kv_lora_rank, device=device, dtype=torch.bfloat16)
     rope = torch.randn(num_slots, qk_rope_head_dim, device=device, dtype=torch.bfloat16)
-    kv_cache = torch.cat([latent, rope], dim=-1).to(q_dtype)
+    kv_cache = torch.cat([latent, rope], dim=-1).to(kv_dtype)
     dequant_latent = kv_cache[:, :kv_lora_rank].float().to(torch.bfloat16)
     dequant_rope = kv_cache[:, kv_lora_rank:].float().to(torch.bfloat16)
     topk_slots = torch.full((tokens, topk), -1, device=device, dtype=torch.int32)
-    topk_lens = torch.tensor([5, 7, 4], device=device, dtype=torch.int32)
+    topk_lens = torch.tensor([5, 65, 129], device=device, dtype=torch.int32)
     for token in range(tokens):
         count = int(topk_lens[token].item())
         topk_slots[token, :count] = torch.randperm(num_slots, device=device)[:count]
