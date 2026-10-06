@@ -73,7 +73,15 @@ def test_native_fp8_launch_parameters_ignore_live_length(
     lengths = torch.empty((tokens,), dtype=torch.int32)
     launch = getattr(attention, entrypoint)
 
-    for live_length, max_seqlen_k in ((13, 13), (2048, 50_000)):
+    for live_length, max_seqlen_k in (
+        (0, 0),
+        (13, 13),
+        (63, 63),
+        (64, 64),
+        (65, 65),
+        (2048, 50_000),
+        (2051, 50_000),
+    ):
         lengths.fill_(live_length)
         launch(
             q=q,
@@ -89,8 +97,8 @@ def test_native_fp8_launch_parameters_ignore_live_length(
             page_size=64,
         )
 
-    assert len(launches) == 2
-    assert launches[0] == launches[1]
+    assert len(launches) == 7
+    assert all(launch == launches[0] for launch in launches[1:])
     width, grid, constants = launches[0]
     assert width == torch.Size((tokens, 2051))
     assert grid[0] == tokens

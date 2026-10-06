@@ -1783,7 +1783,7 @@ def test_dsa_decode_glm53_flash_graph_tracks_live_lengths(
     with torch.cuda.graph(graph):
         invoke(graph_out)
 
-    for visible in (13, 449, 526, 1961):
+    for visible in (0, 1, 13, 63, 64, 65, 449, 526, 1961, 2048, 2051):
         topk_slots.fill_(-1)
         topk_lens.fill_(visible)
         selected = torch.arange(visible, device=device, dtype=torch.int32)
