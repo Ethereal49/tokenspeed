@@ -128,13 +128,12 @@ RequestProgress advanceRequestProgress(const Request& request, fsm::CacheProgres
     }
     RequestProgress progress{.num_computed_tokens = num_computed_tokens};
     if (first_new_prefix_page < static_cast<std::int32_t>(cache_progress.prefix_hashes.size())) {
-        const fsm::CompletedBoundary boundary = cache_progress.ConsumeCompletedBoundary(
+        const std::int32_t retained_prefix_pages = cache_progress.ConsumeRetainedPrefixPages(
             first_new_prefix_page, num_computed_tokens, resume_tokens, prefix_granularity);
         progress.completed_pages = CompletedPages{
             .prefix_hashes = cache_progress.prefix_hashes,
             .first_new_prefix_page = first_new_prefix_page,
-            .boundary_kind = boundary.kind,
-            .retained_prefix_pages = boundary.retained_prefix_pages,
+            .retained_prefix_pages = retained_prefix_pages,
             .stream_completed_to_host = stream_completed_to_host,
             .materialized_state_boundaries = cache_progress.materialized_state_boundaries,
         };
@@ -387,8 +386,7 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         const std::int32_t first_extension_slot = admission->device_prefix_tokens / prefix_granularity;
         for (std::size_t i = 0; i < match.extension_hashes.size(); ++i) {
             coordinator_.CacheFullBlocks(tables, std::span<const std::string>(match.extension_hashes).subspan(i, 1),
-                                         admission->access_epoch, first_extension_slot + static_cast<std::int32_t>(i),
-                                         CacheBoundaryKind::kChunk);
+                                         admission->access_epoch, first_extension_slot + static_cast<std::int32_t>(i));
         }
     }
     fsm::CacheProgress cache_progress{

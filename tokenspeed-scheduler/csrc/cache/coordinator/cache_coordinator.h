@@ -307,7 +307,7 @@ public:
     // Registers an exact range, used for transferred prefix blocks and tests.
     // Runtime publication during Admit follows each group's boundary contract.
     void CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
-                         std::uint64_t access_epoch, std::int32_t first_slot, CacheBoundaryKind boundary_kind);
+                         std::uint64_t access_epoch, std::int32_t first_slot);
     // Publication without admission, for finish, retraction and remote
     // completion. progress.completed_pages must be present.
     void CacheCompletedBlocks(std::span<BlockTable> tables, const RequestProgress& progress,
@@ -365,10 +365,9 @@ public:
     void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key);
     // Publishes a Device block a restore filled from Host L2
     // (CompleteSnapshotRestore): the entry comes back with the logical block
-    // index and boundary kind it was published under before the retraction,
-    // so eviction ranks it as it did the original.
-    void CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey& key, std::int32_t logical_block_index,
-                          CacheBoundaryKind boundary_kind);
+    // index it was published under before the retraction, so eviction ranks
+    // it as it did the original.
+    void CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey& key, std::int32_t logical_block_index);
 
     // L3 storage sits below Host: a bounded shadow of keys known to exist in
     // the remote store, with no local Host block. ProbePrefix reports them as
@@ -436,13 +435,11 @@ private:
     template <CacheTier Tier>
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
                                  std::int32_t first_cache_block, std::uint64_t access_epoch,
-                                 CacheBoundaryKind boundary_kind, bool stream_completed_to_host);
-    // One run of cache blocks a publication registers in a group, and the
-    // boundary kind it registers them under.
+                                 bool stream_completed_to_host);
+    // One run of cache blocks a publication registers in a group.
     struct PublishedRange {
         std::int32_t first_cache_block{0};
         std::int32_t num_blocks{0};
-        CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
     };
     // What publishing `completed` covers in one group -- every newly hashed
     // page of a prefix-closed group, the lookback behind the retained

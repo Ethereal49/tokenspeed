@@ -234,10 +234,10 @@ and working-state retention use the exact `Request::NumComputedTokens()`
 frontier under every verify width
 ([Scheduler §5](scheduler.md#5-invariants-a-change-must-preserve)).
 
-Host restores still use `CacheFullBlocks` and may register `kChunk` entries.
+Host restores still use `CacheFullBlocks`.
 All cached checkpoints remain subject to ordinary capacity eviction; Endpoint
 does not pin storage. Allocation, reservations and transfer fences are unchanged.
-Finish queues existing prefill checkpoints for L2 without upgrading their kind.
+Finish queues existing prefill checkpoints for L2.
 Retraction publishes like finish (a mid-prefill victim may publish a computed
 Endpoint at its completed window) and then images every block its tables
 hold, working state included; the restore copies the image back and claims
@@ -708,8 +708,8 @@ Its responsibilities:
   `RequestProgress` per
   request says what the request has done since the coordinator's previous
   transaction for it: the prefix pages it completed (`CompletedPages`, present
-  only when the newly hashed range is non-empty, so "new hashes without a
-  boundary kind" cannot be expressed) and its computed-token count for
+  only when the newly hashed range is non-empty, with the resumable boundary
+  it retains, if any) and its computed-token count for
   retention. Publication fields are request-scoped and therefore live on the
   progress, not replicated onto every group's demand.
 
@@ -767,8 +767,8 @@ Its responsibilities:
   issues pins its Device sources until the ACK. A retraction does not use the
   queue: the scheduler publishes the victim's computed prefix the same way,
   `CacheCoordinator::PublishedDataSlots` names the data slots that are
-  published entries (with the key, logical index and boundary kind each was
-  published under), `TierTransferManager::StartRetractionStores` gives those
+  published entries (with the key and logical index each was published
+  under), `TierTransferManager::StartRetractionStores` gives those
   their Host blocks — keys already Host-cached, or carried by a store in
   flight, are pinned; the rest become one stream-ordered write-back whose
   Host entries the image pins — and `CacheCoordinator::TakeImage` places only
@@ -1006,8 +1006,8 @@ once; each cache group loads and sorts one epoch of eligible candidates at a
 time, skipping epochs whose entries are all protected or already listed for
 request reclaim. Selection compares the next candidate from each group with
 the next request-reclaimable candidate using one policy: LRU access epoch,
-then tier (uncached request-only block → probationary boundary → established
-boundary → suffix of a closed prefix). Finally, walk the selected blocks in
+then tier (uncached request-only block → resumable boundary of a group that
+is not prefix-closed → suffix of a closed prefix). Finally, walk the selected blocks in
 reverse and restore every block that is not strictly required, yielding a
 minimal eviction set in `victims`.
 

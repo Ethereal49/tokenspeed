@@ -36,10 +36,6 @@
 
 namespace tokenspeed {
 
-// Why a resumable cache boundary was retained. The declaration order is its
-// monotonic promotion order.
-enum class CacheBoundaryKind { kChunk, kEndpoint, kPromoted };
-
 using CacheNamespaceId = std::uint32_t;
 using ContentHash = std::string;
 
@@ -135,8 +131,6 @@ struct GroupDemand {
 struct CompletedPages {
     std::span<const std::string> prefix_hashes{};
     std::int32_t first_new_prefix_page{0};
-    // Which kind of resumable boundary the newly completed range holds.
-    CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
     // Prefix pages up to the range's Endpoint or Promoted boundary, the only
     // boundary groups that are not prefix-closed keep; 0 when the range holds
     // neither.
@@ -187,15 +181,14 @@ struct GroupPrefixProbe {
 
 // Pinned source/destination blocks for one asynchronous cache transfer. A
 // keyed transfer (a restore's Host L2 row) republishes its destination at the
-// ACK under `key`, with the logical block index and boundary kind the entry
-// had before the retraction; an unkeyed one publishes nothing.
+// ACK under `key`, with the logical block index the entry had before the
+// retraction; an unkeyed one publishes nothing.
 struct BlockTransfer {
     std::uint32_t group_id{0};
     CacheBlockRef source;
     CacheBlockRef destination;
     CacheKey key{};
     std::int32_t logical_block_index{-1};
-    CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
 };
 
 // A Host L2 entry a store's ACK published: the key and the block that is now
@@ -224,7 +217,6 @@ struct ImageSlot {
     // slot only): the restore republishes its destination the same way, so
     // eviction ranks it as it did the original.
     std::int32_t logical_block_index{-1};
-    CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
 
     bool InHostCache() const noexcept { return !key.content_hash.empty(); }
 };
