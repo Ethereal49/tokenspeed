@@ -135,7 +135,7 @@ RequestProgress advanceRequestProgress(const Request& request, fsm::CacheProgres
             .first_new_prefix_page = first_new_prefix_page,
             .retained_prefix_pages = retained_prefix_pages,
             .stream_completed_to_host = stream_completed_to_host,
-            .materialized_state_boundaries = cache_progress.materialized_state_boundaries,
+            .materialized_state_boundary = cache_progress.materialized_state_boundary,
         };
     }
     return progress;
@@ -445,7 +445,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         return std::nullopt;
     }
 
-    cache_progress.DiscardHashedStateBoundaries(coordinator_.PrefixGranularity());
+    cache_progress.DiscardHashedStateBoundary(coordinator_.PrefixGranularity());
     recordPrefillStateCheckpoint(cache_progress, fsm::PrefillSource::kLocal, after_tokens,
                                  coordinator_.PrefixGranularity());
     request->CacheProgressRef() = std::move(cache_progress);
@@ -485,7 +485,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
         }
     }
 
-    cache_progress.DiscardHashedStateBoundaries(coordinator_.PrefixGranularity());
+    cache_progress.DiscardHashedStateBoundary(coordinator_.PrefixGranularity());
     request->CacheProgressRef() = std::move(cache_progress);
     return fsm::ScheduleDecodeEvent{config_.decode_input_tokens};
 }
@@ -639,7 +639,7 @@ void Scheduler::publishCompletedPrefix(Request& victim) {
                                    progress.completed_pages->first_new_prefix_page);
         coordinator_.CacheCompletedBlocks(victim.BlockTablesRef(), progress, cache_progress.access_epoch);
     }
-    cache_progress.DiscardHashedStateBoundaries(coordinator_.PrefixGranularity());
+    cache_progress.DiscardHashedStateBoundary(coordinator_.PrefixGranularity());
     victim.CacheProgressRef() = std::move(cache_progress);
 }
 

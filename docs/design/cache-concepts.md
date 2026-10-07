@@ -735,9 +735,9 @@ Its responsibilities:
   only drops the op's pins. L3 objects become Host entries at the prefetch's
   ACK (`CompletePrefetch` -> `CacheHostBlock`), before any admission sees
   them, so there is no mixed Host/L3 hash to special-case.
-  For Mamba-state groups, `CacheCompletedBlocks` publishes only explicitly
-  listed materialized boundaries inside the newly hashed range; an empty list
-  publishes no state snapshots (see
+  For Mamba-state groups, `CacheCompletedBlocks` publishes the retained
+  boundary only when it is the recorded materialized checkpoint; without one
+  it publishes no state snapshot (see
   [Scheduler §1.2](scheduler.md#12-state-checkpoints-one-forward)).
   Ordinary sliding-window groups publish only the window behind an Endpoint
   (the prompt's last aligned boundary, or the computed frontier of a

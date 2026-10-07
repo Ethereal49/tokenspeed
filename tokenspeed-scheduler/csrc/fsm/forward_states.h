@@ -24,6 +24,7 @@
 #include <concepts>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -47,18 +48,20 @@ struct CacheProgress {
     std::uint64_t access_epoch{0};
     // Pending closed-prefix boundary; zero once published or when absent.
     std::int32_t promotion_boundary_tokens{0};
-    // Aligned prefill checkpoints written but not yet hashed, in token order.
-    // Scheduled prefill windows record their materialized checkpoint;
-    // decode results keep working state only and add no reusable boundary.
-    std::vector<std::int32_t> materialized_state_boundaries;
+    // The aligned prefill checkpoint written but not yet hashed. Scheduled
+    // prefill windows record their materialized checkpoint; decode results
+    // keep working state only and add no reusable boundary. Each admission
+    // hashes the previous window before the next window records, so at most
+    // one checkpoint is pending; a later one supersedes it.
+    std::optional<std::int32_t> materialized_state_boundary;
 
     void RecordMaterializedStateBoundary(std::int32_t boundary, std::int32_t prefix_granularity) {
         if (boundary <= 0 || boundary % prefix_granularity != 0 ||
             boundary / prefix_granularity <= static_cast<std::int32_t>(prefix_hashes.size())) {
             return;
         }
-        if (materialized_state_boundaries.empty() || materialized_state_boundaries.back() < boundary) {
-            materialized_state_boundaries.push_back(boundary);
+        if (!materialized_state_boundary || *materialized_state_boundary < boundary) {
+            materialized_state_boundary = boundary;
         }
     }
 
@@ -85,12 +88,13 @@ struct CacheProgress {
         return 0;
     }
 
-    // Only after the admission that hashed them succeeded: a failed attempt
-    // retries their publication with the same hashes.
-    void DiscardHashedStateBoundaries(std::int32_t prefix_granularity) {
-        std::erase_if(materialized_state_boundaries, [&](std::int32_t boundary) {
-            return boundary / prefix_granularity <= static_cast<std::int32_t>(prefix_hashes.size());
-        });
+    // Only after the admission that hashed it succeeded: a failed attempt
+    // retries its publication with the same hashes.
+    void DiscardHashedStateBoundary(std::int32_t prefix_granularity) {
+        if (materialized_state_boundary &&
+            *materialized_state_boundary / prefix_granularity <= static_cast<std::int32_t>(prefix_hashes.size())) {
+            materialized_state_boundary.reset();
+        }
     }
 };
 

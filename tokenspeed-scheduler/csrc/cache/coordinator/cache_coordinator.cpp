@@ -947,8 +947,7 @@ std::optional<CacheCoordinator::PublishedRange> CacheCoordinator::completedBlock
     _assert(boundary_prefix_pages > completed.first_new_prefix_page && boundary_prefix_pages <= hashed_prefix_pages,
             "the retained boundary must lie in the newly hashed range");
     if (groups_[group_index].Spec().kind == AttnKind::kMambaState &&
-        std::ranges::find(completed.materialized_state_boundaries, boundary_prefix_pages * prefix_granularity_) ==
-            completed.materialized_state_boundaries.end()) {
+        completed.materialized_state_boundary != boundary_prefix_pages * prefix_granularity_) {
         return std::nullopt;
     }
     const std::int32_t boundary_cache_block = boundary_prefix_pages * pages_per_prefix_hash;
