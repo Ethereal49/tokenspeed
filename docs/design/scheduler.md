@@ -941,9 +941,11 @@ lands in the same change as the pin, never a release apart.
   inside the forward's input, not beyond it (1.3). A restore grants exactly
   the imaged shape plus the same reserve a first chunk of its resume shape
   would (4).
-- Full-history groups publish every completed page, because every hit needs
-  their whole prefix; groups that are not prefix-closed publish only Endpoint
-  (the prompt's last aligned boundary) and Promoted boundaries.
+- Full-history groups publish every completed page a hit can reach, because
+  every hit needs their whole prefix; groups that are not prefix-closed publish
+  only Endpoint (the prompt's last aligned boundary) and Promoted boundaries.
+  When such a group takes part in matching, no hit reaches past the resume
+  point, so prefix hashing stops there and decode pages stay unpublished.
 - A replayable group is never matched, published or streamed (1.3); its
   re-fed rows are forward input that debits the token budget but never
   advances `num_computed_tokens`; only a hit's first chunk re-feeds, and no
