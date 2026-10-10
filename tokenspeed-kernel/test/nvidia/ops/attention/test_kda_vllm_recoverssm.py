@@ -546,6 +546,12 @@ def test_recoverssm_matches_main_producers_over_rounds(
         torch.testing.assert_close(
             out.reshape_as(expected_out), expected_out, atol=2e-2, rtol=2e-2
         )
+        if batch < 4:
+            # The four-warp projection used to change near-zero BF16 outputs
+            # despite exact convolution, gates and accepted recurrent state.
+            torch.testing.assert_close(
+                out.reshape_as(expected_out), expected_out, atol=0, rtol=0
+            )
         torch.testing.assert_close(candidate_state, main_state, atol=0, rtol=0)
         squared_state_error += (candidate_state - main_state).square().sum().item()
         state_elements += main_state.numel()

@@ -456,6 +456,13 @@ The deterministic serving gate tests whether rounding changes affect decoding.
 If a gate fails, investigate and revise the implementation. A change to the
 numerical contract requires a separate design decision.
 
+The small-batch verify reduction also requires explicit local FMA operand
+order. A loop transformation can change that order even when normalization,
+gates and accepted-state records are identical. The four-warp verify tile
+preserves main's contraction for each value row and keeps its token loop.
+This is an arithmetic constraint within the existing producer, not another
+execution path or a weaker serving gate.
+
 The record producer and recovery must use the same normalization, gate transform, update
 order and FP32 rounding rules. K/U/D are stored after the required FP32
 operations. Do not cast them to BF16 or preweight one field by cumulative decay.

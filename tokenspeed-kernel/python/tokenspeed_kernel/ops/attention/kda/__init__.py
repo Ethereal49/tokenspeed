@@ -119,7 +119,8 @@ class KdaReplayRecords:
     Position i maps to i % capacity. PR1 allocates one slot per batch row
     and assigns a new generation on each metadata refresh.
     query_start_loc maps packed tokens to request rows. replay_inputs are
-    normalized K, convolved V and multiplicative decay in [1, tokens, heads, dim] order.
+    normalized K, pre-SiLU convolution V and multiplicative decay in
+    [1, tokens, heads, dim] order.
     verify_decay preserves the gate transform after main's BF16 rounding.
     verify_qk contains normalized/scaled Q and normalized K, also computed
     after the original BF16 convolution rounding. All prepared values are FP32.

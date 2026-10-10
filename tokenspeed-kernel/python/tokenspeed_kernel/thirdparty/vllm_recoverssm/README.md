@@ -33,8 +33,11 @@ correction with a fused SiLU multiplication and subtraction. The convolution
 producer passes pre-SiLU FP32 V to avoid an extra rounding boundary. The BF16
 verify gate uses main's linear projection. Replay gate tiling includes the
 full recurrent-layer count. Token updates remain ordered FP32 CUDA-core
-operations. Compositional tests require exact accepted state. Verify output and
-independent scalar-reference tolerances remain unchanged. Full-model equality
+operations. Four-warp verify tiles also preserve main's local projection
+FMA operands for both value rows per warp, and keep the token loop intact.
+One-warp tiles retain their existing expansion. Compositional tests require
+exact accepted state and exact verify output below batch four. The existing
+verify limits for other batches and scalar-reference limits remain unchanged. Full-model equality
 and performance are separate acceptance gates.
 
 The launch uses four warps below batch four and one warp otherwise, with
