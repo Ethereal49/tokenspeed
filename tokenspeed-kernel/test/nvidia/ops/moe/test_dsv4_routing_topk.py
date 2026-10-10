@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel import dsv4_linear_fp32, moe_topk
+from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32
+from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.thirdparty.cuda.routing import softplus_sqrt_topk_flash
 

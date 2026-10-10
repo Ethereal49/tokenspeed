@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel import dsv4_linear_fp32
+from tokenspeed_kernel import compile_monitor
+from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32
+from tokenspeed_kernel.ops.gemm.ll_bf16 import ll_bf16_router_supported
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import ll_bf16_router
 
@@ -94,3 +96,34 @@ def test_missing_cute_dependency_keeps_cuda_fallback(monkeypatch):
     )
     actual = dsv4_linear_fp32(x, w, override=None, solution=None)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_serving_fallback_preserves_captured_router(monkeypatch):
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("requires SM90 or newer")
+    if not ll_bf16_router.is_available():
+        pytest.skip("requires CuTe DSL")
+    monkeypatch.setattr(compile_monitor, "_hooks", None)
+    monkeypatch.setattr(compile_monitor, "_serving", False)
+    torch.manual_seed(41)
+    x = torch.randn(3, 5120, device="cuda", dtype=torch.bfloat16)
+    w = (torch.randn(384, 5120, device="cuda") / 5120**0.5).bfloat16()
+    dsv4_linear_fp32(x, w)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = dsv4_linear_fp32(x, w)
+    compiled = set(ll_bf16_router._dotprod)
+
+    compile_monitor.mark_serving()
+    assert not ll_bf16_router_supported(x[:2], w, 2)
+    # A new eager row count must use the serving-safe CUDA fallback, without
+    # compiling another exact-M CuTe kernel. Startup graphs keep their kernel.
+    actual = dsv4_linear_fp32(x[:2], w)
+    expected = dsv4_linear_fp32(x[:2], w, override="cuda_dsv3_dsv4_linear_fp32")
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert set(ll_bf16_router._dotprod) == compiled
+
+    x.normal_()
+    graph.replay()
+    reference = (x.double() @ w.double().T).float()
+    torch.testing.assert_close(captured, reference, rtol=3e-5, atol=3e-5)

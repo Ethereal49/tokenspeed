@@ -342,18 +342,13 @@ _ROUTE_GL_DTYPE = {
 
 
 @gluon.jit
-def _route_add(a, b):
-    return a + b
-
-
-@gluon.jit
 def _fused_topk(
     Logits,  # [M, E]   X_DTYPE   (raw routing logits)
     stride_lm,  # logits row stride
     gmask,  # [GP]   bool     g < G
     tok,  # [GP]      int32    g // TOPK
     slot,  # [GP]     int32    g %  TOPK
-    M: gl.constexpr,
+    M,
     E: gl.constexpr,
     TOPK: gl.constexpr,
     MP: gl.constexpr,  # next_pow2(M)
@@ -446,7 +441,7 @@ def _fused_biased_grouped_topk(
     gmask,  # [GP]     bool      g < G
     tok,  # [GP]     int32     g // TOPK
     slot,  # [GP]     int32     g % TOPK
-    M: gl.constexpr,
+    M,
     E: gl.constexpr,
     TOPK: gl.constexpr,
     N_GROUP: gl.constexpr,
@@ -568,20 +563,22 @@ def _fused_route_small_m(
     ScatterIndx,  # [G]         int32
     GateScal,  # [G]           dtype
     stride_lm,  # logits row stride
-    M: gl.constexpr,
+    # The token count and the block counts derived from it follow the batch;
+    # runtime so every batch shape shares one binary.
+    M,
     E: gl.constexpr,
     TOPK: gl.constexpr,
     MP: gl.constexpr,  # next_pow2(M)
     GP: gl.constexpr,  # next_pow2(M*topk)
     EP: gl.constexpr,  # next_pow2(E)
     TKP: gl.constexpr,  # next_pow2(topk)
-    MAXBLK: gl.constexpr,  # == M*topk
+    MAXBLK,  # == M*topk
     MAXBLKP: gl.constexpr,  # next_pow2(MAXBLK)
     NB_C: gl.constexpr,  # number of block-size rows (NB)
     X_DTYPE: gl.constexpr,  # gate element type (logits dtype)
     NW_C: gl.constexpr,  # num_warps (1 for the M<=2 decode hot path, else 4)
     bo_stride: gl.constexpr,  # block_offs row stride  == E+1
-    bs_stride: gl.constexpr,  # block_sched row stride == MAXBLK
+    bs_stride,  # block_sched row stride == MAXBLK
 ):
     G: gl.constexpr = M * TOPK
     # Layouts are parametric in NW_C. At M<=2 a single warp (NW_C=1) removes the
@@ -628,7 +625,7 @@ def _fused_route_small_m(
     # Store exclusive prefixes at 0..E-1; index E (the total) is the only entry
     # the inclusive scan uniquely supplies, so write just that one element
     # rather than re-writing 1..E-1 with identical values.
-    incl = gl.associative_scan(hist, 0, _route_add)
+    incl = gl.cumsum(hist, 0)
     col_offs = incl - hist
     last = e == (E - 1)
     gl.store(SliceOffs + e, col_offs, mask=emask)
@@ -639,7 +636,7 @@ def _fused_route_small_m(
     # block, while the separate G=M*TOPK bound keeps the rank tile small. All
     # NB rows are identical, and the packed block value is just the expert id.
     n_blk = (hist > 0).to(gl.int32)
-    blk_incl = gl.associative_scan(n_blk, 0, _route_add)
+    blk_incl = gl.cumsum(n_blk, 0)
     blk_excl = blk_incl - n_blk
     n_total = gl.sum(n_blk, 0)
     jb = gl.arange(0, MAXBLKP, layout=LB)
@@ -692,7 +689,9 @@ def _fused_biased_grouped_route_small_m(
     ScatterIndx,  # [G]         int32
     GateScal,  # [G]           dtype
     stride_lm,  # logits row stride
-    M: gl.constexpr,
+    # The token count and the block counts derived from it follow the batch;
+    # runtime so every batch shape shares one binary.
+    M,
     E: gl.constexpr,
     TOPK: gl.constexpr,
     N_GROUP: gl.constexpr,
@@ -705,13 +704,13 @@ def _fused_biased_grouped_route_small_m(
     EP: gl.constexpr,
     TKP: gl.constexpr,
     NGP: gl.constexpr,
-    MAXBLK: gl.constexpr,
+    MAXBLK,
     MAXBLKP: gl.constexpr,
     NB_C: gl.constexpr,
     X_DTYPE: gl.constexpr,
     NW_C: gl.constexpr,
     bo_stride: gl.constexpr,
-    bs_stride: gl.constexpr,
+    bs_stride,
 ):
     G: gl.constexpr = M * TOPK
     LE: gl.constexpr = gl.BlockedLayout([1], [64], [NW_C], [0])
@@ -753,14 +752,14 @@ def _fused_biased_grouped_route_small_m(
     hist = gl.histogram(idx, EP, mask=gmask, layout=LE)
     gl.store(SliceSizes + e, hist, mask=emask)
 
-    incl = gl.associative_scan(hist, 0, _route_add)
+    incl = gl.cumsum(hist, 0)
     col_offs = incl - hist
     last = e == (E - 1)
     gl.store(SliceOffs + e, col_offs, mask=emask)
     gl.store(SliceOffs + e + 1, incl, mask=emask & last)
 
     n_blk = (hist > 0).to(gl.int32)
-    blk_incl = gl.associative_scan(n_blk, 0, _route_add)
+    blk_incl = gl.cumsum(n_blk, 0)
     blk_excl = blk_incl - n_blk
     n_total = gl.sum(n_blk, 0)
     jb = gl.arange(0, MAXBLKP, layout=LB)
@@ -1069,16 +1068,18 @@ def _fused_precomputed_topk_route_small_m(
     GateScal,  # [G] dtype
     stride_wm,
     stride_im,
-    M: gl.constexpr,
+    # The token count and the block counts derived from it follow the batch;
+    # runtime so every batch shape shares one binary.
+    M,
     E: gl.constexpr,
     TOPK: gl.constexpr,
     GP: gl.constexpr,
     EP: gl.constexpr,
-    MAXBLK: gl.constexpr,
+    MAXBLK,
     MAXBLKP: gl.constexpr,
     NB_C: gl.constexpr,
     bo_stride: gl.constexpr,
-    bs_stride: gl.constexpr,
+    bs_stride,
 ):
     G: gl.constexpr = M * TOPK
     LE: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
@@ -1101,14 +1102,14 @@ def _fused_precomputed_topk_route_small_m(
     hist = gl.histogram(safe_idx, EP, mask=valid, layout=LE)
     gl.store(SliceSizes + e, hist, mask=emask)
 
-    incl = gl.associative_scan(hist, 0, _route_add)
+    incl = gl.cumsum(hist, 0)
     col_offs = incl - hist
     last = e == (E - 1)
     gl.store(SliceOffs + e, col_offs, mask=emask)
     gl.store(SliceOffs + e + 1, incl, mask=emask & last)
 
     n_blk = (hist > 0).to(gl.int32)
-    blk_incl = gl.associative_scan(n_blk, 0, _route_add)
+    blk_incl = gl.cumsum(n_blk, 0)
     blk_excl = blk_incl - n_blk
     n_total = gl.sum(n_blk, 0)
     jb = gl.arange(0, MAXBLKP, layout=LB)
