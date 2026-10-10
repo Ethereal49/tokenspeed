@@ -450,7 +450,7 @@ def _commit_ngram(
     count = tl.load(accepted + rows, valid, other=0)
     delta = tl.where(rows < num_extends, sizes, count)
     delta = tl.where(live, delta, 0)
-    start = tl.full((), 0, tl.int32)
+    start = tl.full((), 0, sizes.dtype)
     for chunk in range(0, first, ROWS):
         start += tl.sum(tl.load(lengths + chunk + tl.arange(0, ROWS)))
     last = tl.minimum(

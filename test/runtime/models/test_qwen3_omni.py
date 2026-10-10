@@ -70,6 +70,7 @@ class TestQwen3OmniConfig(unittest.TestCase):
             mapping=None,
             language_model_only=False,
             disaggregation_mode="encode",
+            speculative_algorithm=None,
         )
         with (
             patch(
@@ -123,6 +124,7 @@ class TestQwen3OmniMultimodalEmbedder(unittest.TestCase):
             mm_inputs=[MultimodalInputs(mm_items=[audio, video])],
             extend_prefix_lens=[0],
             extend_seq_lens=[2],
+            max_encoder_tokens=8192,
         )
 
         plan = MultimodalEmbedder()._plan(ctx)

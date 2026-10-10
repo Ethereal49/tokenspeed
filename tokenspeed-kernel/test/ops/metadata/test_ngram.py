@@ -409,3 +409,92 @@ def test_ngram_batch_shapes_reuse_compilation(capacity, uniform):
                 (32, 16, 0, 0),
             ):
                 run(bs, width, num_extends, capacity - trim)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm")
+@pytest.mark.parametrize("ids_dtype", (torch.int32, torch.int64))
+@pytest.mark.parametrize("lengths_dtype", (torch.int32, torch.int64))
+def test_ngram_kernels_fit_the_default_stack(ids_dtype, lengths_dtype):
+    """Spilling past the stack reserves extra memory on every SM at first use."""
+    from tokenspeed_kernel.ops.metadata import ngram
+    from utils import compiled_kernels
+
+    small = hash_params("cuda")
+    primes = small.primes.repeat_interleave(4, dim=-1)
+    params = NGramHashParams(
+        small.token_map,
+        primes,
+        small.reciprocals.repeat_interleave(4, dim=-1),
+        primes.flatten(1).cumsum(-1) - primes.flatten(1),
+        small.multipliers,
+        small.pad_id,
+    )
+    # Cover each commit request bucket, multi-program commits, and every
+    # preparation tile size, including empty requests and padded token rows.
+    batches = [1 << i for i in range(11)] + [1025, 3000]
+    for bs in batches:
+        for capacity in (max(bs, 512), max(bs, 1024), max(bs, 4096)):
+            for uniform in (False, True):
+                slots = torch.arange(bs, device="cuda")
+                lengths = torch.ones(bs, dtype=lengths_dtype, device="cuda")
+                if not uniform:
+                    lengths[0] = 0
+                total = bs if uniform else bs - 1
+                snapshots = torch.zeros((bs, 4), dtype=torch.int64, device="cuda")
+                positions = torch.zeros(bs, dtype=torch.int64, device="cuda")
+                reset = torch.ones_like(positions)
+                cache = torch.zeros(bs + 1, dtype=torch.int32, device="cuda")
+                tail = torch.full((bs + 1, 3), -1, dtype=torch.int64, device="cuda")
+                needs_seed = torch.ones(bs + 1, dtype=torch.bool, device="cuda")
+                ids = torch.ones(capacity, dtype=ids_dtype, device="cuda")
+                previous = torch.empty((capacity, 3), dtype=torch.int64, device="cuda")
+                mask = torch.empty(capacity, dtype=torch.bool, device="cuda")
+                prefix = torch.empty((bs, 3), dtype=torch.int64, device="cuda")
+                hashes = torch.empty(
+                    (capacity, 2, 24), dtype=torch.int64, device="cuda"
+                )
+                prepare_ngram_inputs(
+                    snapshots,
+                    positions,
+                    reset,
+                    slots,
+                    cache,
+                    lengths.cumsum(0),
+                    tail,
+                    needs_seed,
+                    ids,
+                    previous,
+                    mask,
+                    prefix,
+                    hashes,
+                    total,
+                    128,
+                    int(uniform),
+                    params,
+                )
+                ngram.commit_ngram_inputs(
+                    slots,
+                    lengths,
+                    lengths,
+                    ids,
+                    previous,
+                    mask,
+                    prefix,
+                    tail,
+                    needs_seed,
+                    cache,
+                    0,
+                    bs,
+                )
+    torch.cuda.synchronize()
+    compiled = compiled_kernels(ngram._prepare_ngram_hash) + compiled_kernels(
+        ngram._commit_ngram
+    )
+    # CUDA starts with 1 KiB per thread; HIP allocates scratch for any spill.
+    limit = 0 if torch.version.hip else 1024
+    over_limit = [
+        (kernel.src.constants, 4 * kernel.n_spills)
+        for kernel in compiled
+        if 4 * kernel.n_spills > limit
+    ]
+    assert compiled and not over_limit, over_limit

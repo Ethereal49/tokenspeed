@@ -21,6 +21,8 @@
 from dataclasses import dataclass
 from enum import Enum
 
+from tokenspeed_kernel.compile_monitor import CompileStats
+
 from tokenspeed.runtime.utils.env import envs
 
 TOKENSPEED_TEST_REQUEST_TIME_STATS = envs.TOKENSPEED_TEST_REQUEST_TIME_STATS.get()
@@ -163,6 +165,10 @@ class EngineMetrics:
     ) -> None:
         self.enabled = enabled
         self.labels = labels
+        # Serving-time compile totals already exported; counters only move
+        # forward, so each round adds the difference.
+        self._exported_serving_compiles = 0
+        self._exported_serving_compile_seconds = 0.0
 
         if self.enabled:
             self._init_prometheus(labels, registry=registry)
@@ -239,11 +245,36 @@ class EngineMetrics:
             labelnames=labelnames,
             **kw,
         )
+        self.jit_serving_compiles = Counter(
+            name="tokenspeed:jit_serving_compiles",
+            documentation=(
+                "Triton kernel compilations after startup; each one stalls the "
+                "forward thread."
+            ),
+            labelnames=labelnames,
+            **kw,
+        )
+        self.jit_serving_compile_seconds = Counter(
+            name="tokenspeed:jit_serving_compile_seconds",
+            documentation="Wall time spent in Triton kernel compilations after startup.",
+            labelnames=labelnames,
+            **kw,
+        )
         self.num_nan_aborted_requests = Counter(
             name="tokenspeed:num_nan_aborted_requests",
             documentation=(
                 "Requests terminated by the NaN guard (NaN in logits or an "
                 "out-of-vocab sampled token id)."
+            ),
+            labelnames=labelnames,
+            **kw,
+        )
+        self.num_capacity_aborted_requests = Counter(
+            name="tokenspeed:num_capacity_aborted_requests",
+            documentation=(
+                "Requests the scheduler aborted because a capacity retraction "
+                "could not image its victim (retraction snapshot pool or image "
+                "rows exhausted); clients may resubmit them."
             ),
             labelnames=labelnames,
             **kw,
@@ -299,10 +330,29 @@ class EngineMetrics:
             max(0, accepted_draft_tokens)
         )
 
+    def record_jit_compiles(self, stats: CompileStats | None) -> None:
+        """Export serving-time compilations; ``None`` when not monitored."""
+        if not self.enabled or stats is None:
+            return
+        compiles = stats.serving_compiles - self._exported_serving_compiles
+        if compiles <= 0:
+            return
+        self.jit_serving_compiles.labels(**self.labels).inc(compiles)
+        self.jit_serving_compile_seconds.labels(**self.labels).inc(
+            stats.serving_seconds - self._exported_serving_compile_seconds
+        )
+        self._exported_serving_compiles = stats.serving_compiles
+        self._exported_serving_compile_seconds = stats.serving_seconds
+
     def record_nan_abort(self) -> None:
         if not self.enabled:
             return
         self.num_nan_aborted_requests.labels(**self.labels).inc()
+
+    def record_capacity_abort(self) -> None:
+        if not self.enabled:
+            return
+        self.num_capacity_aborted_requests.labels(**self.labels).inc()
 
 
 class RequestMetrics:

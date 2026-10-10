@@ -28,10 +28,6 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
-from tokenspeed_kernel.ops.layernorm.triton import (
-    fused_qk_rmsnorm_rope_gate,
-    qk_rmsnorm,
-)
 from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.configs.qwen3_5_config import (
@@ -87,9 +83,6 @@ from tokenspeed.runtime.models.qwen3_5_moe import (
 )
 from tokenspeed.runtime.models.qwen3_vision import Qwen3VLMoeVisionModel
 from tokenspeed.runtime.models.utils import validate_attention_partition
-from tokenspeed.runtime.moe.distribution_recorder import (
-    get_global_expert_distribution_recorder,
-)
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
@@ -175,6 +168,54 @@ def _gdn_in_proj_stacked_mapping(param_names) -> list:
         ("in_proj_qkvzba.", "in_proj_b.", 4),
         ("in_proj_qkvzba.", "in_proj_a.", 5),
     ]
+
+
+def _input_norm(
+    comm_manager: CommManager,
+    norm: GemmaRMSNorm,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    fp8_scale: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """The layer-opening add + norm, plus a static-FP8 copy for ``fp8_scale``'s projection.
+
+    Past the first layer, without attention TP and with the fused layer boundary, one
+    kernel adds, normalizes and quantizes; otherwise the communication policy runs the
+    norm and the projection quantizes for itself.
+    """
+    if (
+        residual is None
+        or comm_manager.mapping.has_attn_tp
+        or comm_manager.layer_boundary_norm == "unfused"
+    ):
+        hidden_states, residual = comm_manager.input_reduce_norm(
+            hidden_states, residual
+        )
+        return hidden_states, None, residual
+    return norm.add_norm_with_fp8(hidden_states, residual, fp8_scale)
+
+
+def _post_attn_norm(
+    comm_manager: CommManager,
+    norm: GemmaRMSNorm,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    fp4_scale: torch.Tensor | None,
+    ctx: ForwardContext,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None, torch.Tensor]:
+    """The post-attention add + norm, plus gate_up_proj's NVFP4 input for ``fp4_scale``.
+
+    Without attention TP one kernel adds, normalizes and, unless dense TP gathers
+    the rows afterwards, quantizes; otherwise the communication policy runs the norm.
+    """
+    if comm_manager.mapping.has_attn_tp:
+        hidden_states, residual = comm_manager.post_attn_reduce_norm(
+            hidden_states, residual, ctx
+        )
+        return hidden_states, None, residual
+    if comm_manager.mapping.dense.has_tp:
+        fp4_scale = None
+    return norm.add_norm_with_fp4(hidden_states, residual, fp4_scale)
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
@@ -475,12 +516,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         return query, key, value, z, b, a
 
-    def _forward_input_proj(self, hidden_states: torch.Tensor):
+    def input_fp8_scale(self) -> torch.Tensor | None:
+        """The static-FP8 input scale of the projection that may take FP8 rows."""
+        proj = self.in_proj_qkvz if self._split_in_proj else self.in_proj_qkvzba
+        return proj.quant_method.static_fp8_input_scale(proj)
+
+    def _forward_input_proj(
+        self, hidden_states: torch.Tensor, hidden_fp8: torch.Tensor | None
+    ):
+        projection_input = hidden_states if hidden_fp8 is None else hidden_fp8
         if self._split_in_proj:
-            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            projected_states_qkvz, _ = self.in_proj_qkvz(projection_input)
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
             return projected_states_qkvz, projected_states_ba
-        projected_all, _ = self.in_proj_qkvzba(hidden_states)
+        projected_all, _ = self.in_proj_qkvzba(projection_input)
         projected_states_qkvz, projected_states_ba = projected_all.split(
             [self._qkvz_dim, self._ba_dim], dim=-1
         )
@@ -489,12 +538,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        hidden_fp8: torch.Tensor | None,
         ctx: ForwardContext,
     ):
         seq_len, _ = hidden_states.shape
 
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
-            hidden_states
+            hidden_states, hidden_fp8
         )
 
         if self.num_v_heads % self.num_k_heads == 0 and not getattr(
@@ -616,8 +666,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             layer_id=self.layer_id,
             is_moe=is_moe,
             prev_is_moe=is_moe,
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
+            query_sharded=False,
         )
 
     def forward(
@@ -631,23 +683,37 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             ctx
         )
 
+        hidden_fp4 = None
         if not ctx.forward_mode.is_idle():
-            hidden_states, residual = self.comm_manager.input_reduce_norm(
-                hidden_states, residual
+            hidden_states, hidden_fp8, residual = _input_norm(
+                self.comm_manager,
+                self.input_layernorm,
+                hidden_states,
+                residual,
+                self.linear_attn.input_fp8_scale(),
             )
             hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
 
             hidden_states = self.linear_attn(
                 hidden_states,
+                hidden_fp8,
                 ctx,
             )
+            # Free the copy once consumed, as the projection frees its own quant.
+            del hidden_fp8
 
-            hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
-                hidden_states, residual, ctx
+            hidden_states, hidden_fp4, residual = _post_attn_norm(
+                self.comm_manager,
+                self.post_attention_layernorm,
+                hidden_states,
+                residual,
+                self.mlp.nvfp4_global_scale(),
+                ctx,
             )
 
         hidden_states = self.forward_mlp(
             hidden_states,
+            hidden_fp4,
             residual,
             ctx,
             num_global_tokens,
@@ -659,6 +725,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
     def forward_mlp(
         self,
         hidden_states,
+        hidden_fp4,
         residual,
         ctx: ForwardContext,
         num_global_tokens,
@@ -670,7 +737,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
         else:
             hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp.forward_prequantized(hidden_states, hidden_fp4)
             hidden_states, residual = self.comm_manager.post_mlp_fused(
                 hidden_states, residual, ctx
             )
@@ -763,12 +830,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.attn = PagedAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            rotary_emb=self.rotary_emb,
+            qk_norm=(self.q_norm, self.k_norm),
         )
 
         # Dense MLP for non-MoE variant
@@ -802,63 +873,34 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-
         self.is_moe = is_moe
         self.comm_manager = CommManager(
             mapping=self.mapping,
             layer_id=self.layer_id,
             is_moe=is_moe,
             prev_is_moe=is_moe,
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
+            query_sharded=False,
         )
 
-    def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # qk_rmsnorm expects GemmaRMSNorm's effective gamma.
-        return qk_rmsnorm(
-            q,
-            k,
-            self.q_norm.gemma_weight,
-            self.k_norm.gemma_weight,
-            self.q_norm.variance_epsilon,
-        )
-
-    def _project_qkv_rope(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+    def _project_qkv(
+        self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """qkv_proj + split + rope (+ optional gate). ``gate`` is ``None`` when ``attn_output_gate=False``."""
+        """qkv_proj split into views; ``gate`` is ``None`` without ``attn_output_gate``."""
         qkv, _ = self.qkv_proj(hidden_states)
-        if self.attn_output_gate:
-            q_gate, k, v = qkv.split(
-                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
-            )
-            q, k, gate = fused_qk_rmsnorm_rope_gate(
-                q_gate,
-                k,
-                self.q_norm.gemma_weight,
-                self.k_norm.gemma_weight,
-                self.rotary_emb.cos_sin_cache,
-                positions,
-                self.q_norm.variance_epsilon,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                self.rotary_emb.rotary_dim,
-            )
-            return q, k, v, gate
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
-        return q, k, v, None
+        if not self.attn_output_gate:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            return q, k, v, None
+        q_gate, k, v = qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
+        heads = q_gate.view(q_gate.shape[0], self.num_heads, 2, self.head_dim)
+        q, gate = heads.unbind(dim=2)
+        return q, k, v, gate
 
     def _attn(
         self,
+        positions: torch.Tensor,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -866,8 +908,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         ctx: ForwardContext,
         **kwargs,
     ) -> torch.Tensor:
-        """Backend attention call + optional gate apply. Subclasses override."""
-        attn_output = self.attn(q, k, v, ctx, **kwargs)
+        """Attention with the optional output gate; draft subclasses override."""
+        attn_output = self.attn(q, k, v, positions, ctx, **kwargs)
         if gate is not None:
             sigmoid_mul(attn_output, gate)
         return attn_output
@@ -878,9 +920,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
     ) -> torch.Tensor:
-        """Full attention forward pass."""
-        q, k, v, gate = self._project_qkv_rope(positions, hidden_states)
-        attn_output = self._attn(q, k, v, gate, ctx)
+        """Full attention forward pass; ``hidden_states`` may be qkv_proj's FP8 copy, which only ``_project_qkv`` reads."""
+        q, k, v, gate = self._project_qkv(hidden_states)
+        attn_output = self._attn(positions, q, k, v, gate, ctx)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -904,23 +946,37 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             ctx
         )
 
+        hidden_fp4 = None
         if not ctx.forward_mode.is_idle():
-            hidden_states, residual = self.comm_manager.input_reduce_norm(
-                hidden_states, residual
+            hidden_states, hidden_fp8, residual = _input_norm(
+                self.comm_manager,
+                self.input_layernorm,
+                hidden_states,
+                residual,
+                self.qkv_proj.quant_method.static_fp8_input_scale(self.qkv_proj),
             )
             hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
+            # qkv_proj is the only reader, so the FP8 copy can stand in for the rows.
             hidden_states = self.self_attention(
                 positions=positions,
-                hidden_states=hidden_states,
+                hidden_states=hidden_states if hidden_fp8 is None else hidden_fp8,
                 ctx=ctx,
             )
+            # Free the copy once consumed, as the projection frees its own quant.
+            del hidden_fp8
             residual = self._maybe_narrow_residual(residual, ctx)
-            hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
-                hidden_states, residual, ctx
+            hidden_states, hidden_fp4, residual = _post_attn_norm(
+                self.comm_manager,
+                self.post_attention_layernorm,
+                hidden_states,
+                residual,
+                self.mlp.nvfp4_global_scale(),
+                ctx,
             )
 
         hidden_states = self.forward_mlp(
             hidden_states,
+            hidden_fp4,
             residual,
             ctx,
             num_global_tokens,
@@ -932,6 +988,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
     def forward_mlp(
         self,
         hidden_states,
+        hidden_fp4,
         residual,
         ctx: ForwardContext,
         num_global_tokens,
@@ -943,7 +1000,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         else:
             hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp.forward_prequantized(hidden_states, hidden_fp4)
             hidden_states, residual = self.comm_manager.post_mlp_fused(
                 hidden_states, residual, ctx
             )
@@ -1065,15 +1122,12 @@ class Qwen3_5ForCausalLM(nn.Module):
                 aux_hidden_states.append(
                     gathered if gathered is aux else gathered.clone()
                 )
-            with get_global_expert_distribution_recorder().with_current_layer(
-                layer_idx
-            ):
-                hidden_states, residual = layer(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    residual=residual,
-                    ctx=ctx,
-                )
+            hidden_states, residual = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+                ctx=ctx,
+            )
 
             # Process deepstack embeddings if provided
             if (
