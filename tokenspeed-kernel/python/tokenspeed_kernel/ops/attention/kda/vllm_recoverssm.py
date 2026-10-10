@@ -472,7 +472,9 @@ def _replay_conv_inputs_kernel(
     VERIFY_SMALL: gl.constexpr,
 ):
     row = gl.program_id(0)
-    layout: gl.constexpr = gl.BlockedLayout([4], [32], [gl.num_warps()], [0])
+    layout: gl.constexpr = gl.BlockedLayout(
+        [4 if VERIFY_SMALL else 1], [32], [gl.num_warps()], [0]
+    )
     channel = gl.program_id(1) * BLOCK + gl.arange(0, BLOCK, layout=layout)
     request, position = row // T, row % T
     page = gl.load(read_indices + request).to(gl.int64)
@@ -511,45 +513,58 @@ def _replay_conv_inputs_kernel(
         verify_acc * (1.0 / (1.0 + gl.exp(-verify_acc))),
         mask=mask,
     )
-    # Match main's BF16 producer boundary before FP32 normalization.
-    rounded_verify = (
-        (verify_acc * (1.0 / (1.0 + gl.exp(-verify_acc))))
-        .to(raw.dtype.element_ty)
-        .to(gl.float32)
-    )
-    verify_heads = rounded_verify.reshape((BLOCK // HEAD_DIM, HEAD_DIM))
-    if VERIFY_SMALL:
-        verify_heads = gl.convert_layout(
-            verify_heads, gl.BlockedLayout([1, 1], [1, 32], [1, gl.num_warps()], [1, 0])
+    # Normalize only Q/K tiles; V keeps its convolution value.
+    if gl.program_id(1) * BLOCK < 2 * P:
+        # Match main's BF16 producer boundary before FP32 normalization.
+        rounded_verify = (
+            (verify_acc * (1.0 / (1.0 + gl.exp(-verify_acc))))
+            .to(raw.dtype.element_ty)
+            .to(gl.float32)
         )
-    normalized_verify = verify_heads / gl.sqrt(
-        gl.sum(verify_heads * verify_heads, axis=1)[:, None] + 1e-6
-    )
-    normalized_verify = gl.convert_layout(normalized_verify.reshape((BLOCK,)), layout)
-    normalized_verify = gl.where(
-        feature < P, normalized_verify * HEAD_DIM**-0.5, normalized_verify
-    )
-    gl.store(
-        verify_qk + row * (2 * P) + feature,
-        normalized_verify,
-        mask=mask & (feature < 2 * P),
-    )
+        verify_heads = rounded_verify.reshape((BLOCK // HEAD_DIM, HEAD_DIM))
+        if VERIFY_SMALL:
+            verify_heads = gl.convert_layout(
+                verify_heads,
+                gl.BlockedLayout([1, 1], [1, 32], [1, gl.num_warps()], [1, 0]),
+            )
+        normalized_verify = verify_heads / gl.sqrt(
+            gl.sum(verify_heads * verify_heads, axis=1)[:, None] + 1e-6
+        )
+        normalized_verify = gl.convert_layout(
+            normalized_verify.reshape((BLOCK,)), layout
+        )
+        normalized_verify = gl.where(
+            feature < P, normalized_verify * HEAD_DIM**-0.5, normalized_verify
+        )
+        gl.store(
+            verify_qk + row * (2 * P) + feature,
+            normalized_verify,
+            mask=mask & (feature < 2 * P),
+        )
     gl.store(captured_raw + row * stride_capture + channel, current, mask=mask)
-    activated = acc * (1.0 / (1.0 + gl.exp(-acc)))
-    per_head = gl.convert_layout(
-        activated.reshape((BLOCK // HEAD_DIM, HEAD_DIM)),
-        gl.BlockedLayout([1, 1], [1, 32], [gl.num_warps(), 1], [1, 0]),
-    )
-    normalized = per_head / gl.sqrt(gl.sum(per_head * per_head, axis=1)[:, None] + 1e-6)
-    # Keep pre-SiLU V so record production can fuse SiLU with correction.
-    replay_input = gl.where(
-        feature < 2 * P, gl.convert_layout(normalized.reshape((BLOCK,)), layout), acc
-    )
-    gl.store(
-        output + row * (2 * P) + feature - P,
-        replay_input,
-        mask=mask & (feature >= P),
-    )
+    if (gl.program_id(1) + 1) * BLOCK > P:
+        if gl.program_id(1) * BLOCK < 2 * P:
+            activated = acc * (1.0 / (1.0 + gl.exp(-acc)))
+            per_head = gl.convert_layout(
+                activated.reshape((BLOCK // HEAD_DIM, HEAD_DIM)),
+                gl.BlockedLayout([1, 1], [1, 32], [gl.num_warps(), 1], [1, 0]),
+            )
+            normalized = per_head / gl.sqrt(
+                gl.sum(per_head * per_head, axis=1)[:, None] + 1e-6
+            )
+            # Keep pre-SiLU V so record production can fuse SiLU with correction.
+            replay_input = gl.where(
+                feature < 2 * P,
+                gl.convert_layout(normalized.reshape((BLOCK,)), layout),
+                acc,
+            )
+        else:
+            replay_input = acc
+        gl.store(
+            output + row * (2 * P) + feature - P,
+            replay_input,
+            mask=mask & (feature >= P),
+        )
 
 
 @triton.jit(do_not_specialize=["ROWS"])
@@ -586,14 +601,12 @@ def _recoverssm_gate_inputs_kernel(
         other=0,
     )
     gate = tl.dot(values, tl.trans(weights))
-    rounded = (
-        tl.load(
-            raw_gate + rows[:, None] * H * K + channel[None, :],
-            mask=(rows[:, None] < ROWS) & (key[None, :] < K),
-            other=0,
-        ).to(tl.float32)
-        + dt[None, :]
+    tl.store(
+        raw_gate + rows[:, None] * H * K + channel[None, :],
+        gate,
+        mask=(rows[:, None] < ROWS) & (key[None, :] < K),
     )
+    rounded = gate.to(raw_gate.dtype.element_ty).to(tl.float32) + dt[None, :]
     if LOWER is not None:
         verify_log = LOWER * tl.sigmoid(a * rounded)
     else:
@@ -605,7 +618,9 @@ def _recoverssm_gate_inputs_kernel(
         tl.exp(verify_log),
         mask=(rows[:, None] < ROWS) & (key[None, :] < K),
     )
-    biased = gate + dt[None, :]
+    # Main replay folds bias into the dot accumulator. The BF16 projection
+    # above must start from zero; adding bias after it changes FP32 rounding.
+    biased = tl.dot(values, tl.trans(weights), tl.broadcast_to(dt[None, :], (BT, BK)))
     if LOWER is not None:
         log_decay = LOWER * tl.sigmoid(a * biased)
     else:
@@ -636,8 +651,11 @@ def _recoverssm_gate_scalar_kernel(
     LOWER: gl.constexpr,
 ):
     head, tile, column_tile = gl.program_id(0), gl.program_id(1), gl.program_id(2)
-    gate_layout: gl.constexpr = gl.BlockedLayout(
-        [1, 1], [1, 32], [1, gl.num_warps()], [1, 0]
+    # Match main's bounded batched and generic softplus reduction trees.
+    gate_layout: gl.constexpr = (
+        gl.BlockedLayout([1, 8], [2, 16], [gl.num_warps(), 1], [1, 0])
+        if LOWER is None
+        else gl.BlockedLayout([1, 1], [1, 32], [1, gl.num_warps()], [1, 0])
     )
     key = column_tile * BK + gl.arange(0, BK, layout=gl.SliceLayout(1, gate_layout))
     channel = head * K + key
@@ -759,7 +777,7 @@ def prepare_recoverssm_conv(
         HEAD_DIM=head_dim,
         BLOCK=256,
         VERIFY_SMALL=rows // width < 4,
-        num_warps=4,
+        num_warps=4 if rows // width < 4 else 1,
     )
     shape = (1, rows, num_heads, head_dim)
     k, v = kv.chunk(2, dim=-1)
@@ -787,7 +805,7 @@ def prepare_recoverssm_gate(
 
     Low-rank gate inputs and weights use the existing main-path layout.
     num_layers is the number of recurrent layers in the all-layer commit.
-    FP32 accumulation follows main replay's shape-based tiling rule.
+    FP32 accumulation retains main replay's bias and reduction order.
     """
     from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         _gate_tiling,
@@ -815,7 +833,11 @@ def prepare_recoverssm_gate(
         raise ValueError("gate inputs must use the same device")
     if num_layers <= 0:
         raise ValueError("num_layers must be positive")
-    raw_gate = torch.nn.functional.linear(f_a, f_b)
+    raw_gate = (
+        torch.empty((rows, channels), device=f_a.device, dtype=f_a.dtype)
+        if rows >= 16
+        else torch.nn.functional.linear(f_a, f_b)
+    )
     gate = torch.empty((rows, channels), device=f_a.device, dtype=torch.float32)
     verify_decay = torch.empty_like(gate)
     bt, bk = (
@@ -823,6 +845,9 @@ def prepare_recoverssm_gate(
         if rows >= 16
         else _gate_tiling(rows, num_heads, head_dim, f_a.device, layers=num_layers)
     )
+    if rows >= 16:
+        # Both projections fit in a smaller tile without changing their K reduction.
+        bt = 16
     gate_kernel = (
         _recoverssm_gate_inputs_kernel if rows >= 16 else _recoverssm_gate_scalar_kernel
     )
@@ -842,7 +867,7 @@ def prepare_recoverssm_gate(
         BT=bt,
         BK=bk,
         LOWER=lower_bound,
-        num_warps=1 if bt >= 4 else 2,
+        num_warps=4 if rows >= 16 else (1 if bt >= 4 else 2),
     )
     return (
         raw_gate,

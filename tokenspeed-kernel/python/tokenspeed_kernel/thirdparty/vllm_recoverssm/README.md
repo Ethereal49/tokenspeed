@@ -26,24 +26,34 @@ CTAs consume these values in one launch, so each CTA holds one state tile.
 This preserves the two precision chains and avoids repeated transforms for
 each value tile.
 
-Verify and replay use explicit Triton Gluon layouts that retain main's
-respective reduction trees. Small-batch verify preserves cross-warp Q/K
-normalization. Replay preserves the fused local projection pairs and computes
-correction with a fused SiLU multiplication and subtraction. The convolution
-producer passes pre-SiLU FP32 V to avoid an extra rounding boundary. The BF16
-verify gate uses main's linear projection. Replay gate tiling includes the
-full recurrent-layer count. Token updates remain ordered FP32 CUDA-core
-operations. Four-warp verify tiles also preserve main's local projection
-FMA operands for both value rows per warp, and keep the token loop intact.
-One-warp tiles retain their existing expansion. Compositional tests require
-exact accepted state and exact verify output below batch four. The existing
-verify limits for other batches and scalar-reference limits remain unchanged. Full-model equality
-and performance are separate acceptance gates.
+Small-batch verify retains main's cross-warp Q/K normalization and local
+projection FMA operands. Its token loop stays intact. Larger batches pack
+value rows within the fixed BF16 output tolerances. Replay keeps main's
+ordered FP32 recurrence for every batch. It loads each checkpoint directly
+in the required layout, splits the local key groups, and redistributes only
+the projection partials before reduction. This avoids indexed gathers and
+full-state layout conversions. Corrections retain the fused SiLU multiply
+and subtraction; convolution supplies pre-SiLU FP32 V.
 
-The launch uses four warps below batch four and one warp otherwise, with
-batch-bucketed value tiles. Fixed model-layout strides specialize address
-arithmetic; request-dependent group pitches remain runtime values. Exact
-request counts do not create new binaries within the same launch bucket.
+Convolution skips normalization for V and replay preparation for Q. Large
+batches use a warp-local replay layout. The gate producer uses main's linear
+projection below 16 rows. At larger row counts, one launch computes both the
+unbiased BF16 projection and the independently biased FP32 replay projection.
+The latter starts its dot accumulator with bias, as main does. Scalar gate
+layouts retain the respective bounded and softplus reduction trees. The
+layer count remains part of scalar tiling.
+
+The producer uses eight-row value tiles for independent replay records,
+four warps below batch four, and one warp otherwise. Fixed model-layout
+strides specialize address arithmetic; request-dependent group pitches stay
+runtime values. Exact request counts do not create new binaries within the
+same launch bucket.
+
+Compositional tests require exact accepted state and exact verify output
+below batch four. Verify limits for other batches and scalar-reference limits
+remain unchanged. Gate regression tests require exact BF16 projections and
+FP32 decay for both formulas, multiple row counts, layer counts and seeds.
+Full-model equality and performance remain separate acceptance gates.
 
 Invalid tokens form a suffix in each request. Output and record stores mask
 that suffix. Verify does not write the input checkpoint, so it need not retain

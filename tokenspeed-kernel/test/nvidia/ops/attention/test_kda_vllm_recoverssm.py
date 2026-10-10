@@ -1075,10 +1075,14 @@ def test_recoverssm_rejects_invalid_records(field: str) -> None:
     assert expected in result.stderr, result.stderr
 
 
-@pytest.mark.parametrize("rows", [4, 8, 12, 16, 64])
+@pytest.mark.parametrize("rows", [4, 8, 12, 16, 32, 64, 128])
 @pytest.mark.parametrize("layers", [1, 69])
-def test_recoverssm_gate_matches_all_layer_tiling(rows: int, layers: int) -> None:
-    """Per-layer records retain the all-layer main gate reduction geometry."""
+@pytest.mark.parametrize("lower_bound", [-5.0, None])
+@pytest.mark.parametrize("seed", [0, 1573])
+def test_recoverssm_gate_matches_all_layer_tiling(
+    rows: int, layers: int, lower_bound: float | None, seed: int
+) -> None:
+    """Replay decay matches main while raw gates preserve BF16 rounding."""
     from kda_replay_reference import (
         batched_kda_gate_precompute_dot_kernel,
         batched_kda_gate_precompute_kernel,
@@ -1087,6 +1091,8 @@ def test_recoverssm_gate_matches_all_layer_tiling(rows: int, layers: int) -> Non
     from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         _gate_tiling,
         _gate_tiling_dot,
+        kda_gate_precompute_dot_kernel,
+        kda_gate_precompute_kernel,
     )
 
     @triton.jit
@@ -1095,7 +1101,7 @@ def test_recoverssm_gate_matches_all_layer_tiling(rows: int, layers: int) -> Non
         value = tl.load(log_gate + offset, mask=offset < N, other=0)
         tl.store(decay + offset, tl.exp(value), mask=offset < N)
 
-    torch.manual_seed(1573)
+    torch.manual_seed(seed)
     heads, dim = 12, 128
     channels = heads * dim
     fa = torch.randn(rows, dim, device="cuda", dtype=torch.bfloat16)
@@ -1114,24 +1120,46 @@ def test_recoverssm_gate_matches_all_layer_tiling(rows: int, layers: int) -> Non
         if rows >= 16
         else _gate_tiling(rows, heads, dim, fa.device, layers=layers)
     )
-    kernel = (
-        batched_kda_gate_precompute_dot_kernel
-        if rows >= 16
-        else batched_kda_gate_precompute_kernel
-    )
-    kernel[(layers * heads, triton.cdiv(rows, bt), triton.cdiv(dim, bk))](
-        addresses,
-        rows,
-        stride_fa=fa.stride(0),
-        stride_gate=channels,
-        lower_bound=-5.0,
-        HV=heads,
-        K=dim,
-        D_FA=dim,
-        BK=bk,
-        BT=bt,
-        num_warps=1 if bt >= 4 else 2,
-    )
+    if lower_bound is None:
+        # The unchanged batched oracle supports the bounded gate only.
+        kernel = (
+            kda_gate_precompute_dot_kernel if rows >= 16 else kda_gate_precompute_kernel
+        )
+        kernel[(heads, triton.cdiv(rows, bt), triton.cdiv(dim, bk))](
+            fa,
+            fb,
+            A,
+            bias,
+            logs[0],
+            lower_bound,
+            fa.stride(0),
+            channels,
+            rows,
+            K=dim,
+            D_FA=dim,
+            BK=bk,
+            BT=bt,
+            num_warps=1 if bt >= 4 else 2,
+        )
+    else:
+        kernel = (
+            batched_kda_gate_precompute_dot_kernel
+            if rows >= 16
+            else batched_kda_gate_precompute_kernel
+        )
+        kernel[(layers * heads, triton.cdiv(rows, bt), triton.cdiv(dim, bk))](
+            addresses,
+            rows,
+            stride_fa=fa.stride(0),
+            stride_gate=channels,
+            lower_bound=lower_bound,
+            HV=heads,
+            K=dim,
+            D_FA=dim,
+            BK=bk,
+            BT=bt,
+            num_warps=1 if bt >= 4 else 2,
+        )
     expected = torch.empty_like(logs[0])
     decay_reference[(triton.cdiv(expected.numel(), 256),)](
         logs[0], expected, N=expected.numel(), BLOCK=256
@@ -1144,7 +1172,7 @@ def test_recoverssm_gate_matches_all_layer_tiling(rows: int, layers: int) -> Non
         num_heads=heads,
         num_layers=layers,
         head_dim=dim,
-        lower_bound=-5.0,
+        lower_bound=lower_bound,
     )
     torch.testing.assert_close(raw, torch.nn.functional.linear(fa, fb), atol=0, rtol=0)
     torch.testing.assert_close(actual.reshape_as(expected), expected, atol=0, rtol=0)

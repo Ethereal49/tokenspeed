@@ -114,7 +114,7 @@ def _kda_recurrent_step(
         "BV": lambda args: min(
             triton.next_power_of_2(args["V"]),
             (
-                (8 if args["BATCH"] <= 4 else 16)
+                8
                 if args["SEPARATE_REPLAY_INPUTS"]
                 else 4 if args["BATCH"] <= 4 else 8 if args["BATCH"] <= 8 else 16
             ),
@@ -193,10 +193,12 @@ def _kda_recoverssm_verify_kernel(
     query_len = eos - bos
     state_idx = gl.load(state_indices_ptr + pid_b * stride_state_indices).to(gl.int64)
 
-    # Match main's key reduction: one value row per warp, four keys per lane.
-    # Changing this layout changes FP32 association before BF16 rounding.
-    state_layout: gl.constexpr = gl.BlockedLayout(
-        [1, 4], [1, 32], [gl.num_warps(), 1], [1, 0]
+    # Small batches retain main's verify reduction. Larger batches pack
+    # four value rows per warp within the existing BF16 output tolerance.
+    state_layout: gl.constexpr = (
+        gl.BlockedLayout([1, 4], [4, 8], [1, 1], [1, 0])
+        if gl.num_warps() == 1
+        else gl.BlockedLayout([1, 4], [1, 32], [gl.num_warps(), 1], [1, 0])
     )
     key_layout: gl.constexpr = gl.SliceLayout(0, state_layout)
     value_layout: gl.constexpr = gl.SliceLayout(1, state_layout)
@@ -250,31 +252,32 @@ def _kda_recoverssm_verify_kernel(
                 gl.store(stamp, position, mask=token_offset < query_len)
                 gl.store(stamp + 1, record_generation, mask=token_offset < query_len)
 
-    state_ptrs = (
-        state_ptr
-        + state_idx * stride_state_block
-        + pid_h * stride_state_head
-        + offs_v[:, None] * stride_state_v
-        + offs_k[None, :] * stride_state_k
-    )
-    state = gl.load(state_ptrs, mask=mask_state, other=0.0).to(gl.float32)
-
     # Each CTA keeps one state tile. Separate head-grid entries preserve the
     # independent precision chains without doubling per-thread state storage.
     # Verify and record production use different inputs but the same initial
     # checkpoint. Independent CTAs avoid keeping both state tiles live.
     if SEPARATE_REPLAY_INPUTS:
         if record_only:
-            replay_layout: gl.constexpr = gl.BlockedLayout(
-                [1, 1], [1, 32], [gl.num_warps(), 1], [1, 0]
+            replay_layout: gl.constexpr = (
+                gl.BlockedLayout([1, 4], [4, 8], [1, 1], [1, 0])
+                if gl.num_warps() == 1
+                else gl.BlockedLayout([1, 1], [1, 32], [gl.num_warps(), 1], [1, 0])
             )
-            replay_state = gl.convert_layout(state, replay_layout)
             replay_offs_k = gl.arange(0, BK, layout=gl.SliceLayout(0, replay_layout))
             replay_offs_v = pid_v * BV + gl.arange(
                 0, BV, layout=gl.SliceLayout(1, replay_layout)
             )
             replay_mask_k = replay_offs_k < K
             replay_mask_v = replay_offs_v < V
+            replay_state = gl.load(
+                state_ptr
+                + state_idx * stride_state_block
+                + pid_h * stride_state_head
+                + replay_offs_v[:, None] * stride_state_v
+                + replay_offs_k[None, :] * stride_state_k,
+                mask=replay_mask_v[:, None] & replay_mask_k[None, :],
+                other=0.0,
+            ).to(gl.float32)
             for token_offset in gl.static_range(SPEC_QUERY_LEN):
                 token_valid = token_offset < query_len
                 token = bos + token_offset
@@ -310,22 +313,33 @@ def _kda_recoverssm_verify_kernel(
                 normalized_k = replay_k
                 decay = replay_g
                 decayed_state = replay_state * decay[None, :]
-                # Main pairs keys 0/64 and 32/96 in each lane before
-                # reducing across the warp. Explicit FMAs retain rounding.
-                lane = gl.arange(0, 32, layout=gl.SliceLayout(0, replay_layout))
-                gather_indices = lane[None, :] + replay_offs_v[:, None] * 0
-                s0 = gl.gather(decayed_state, gather_indices, 1)
-                s1 = gl.gather(decayed_state, gather_indices + 32, 1)
-                s2 = gl.gather(decayed_state, gather_indices + 64, 1)
-                s3 = gl.gather(decayed_state, gather_indices + 96, 1)
-                k0 = gl.gather(normalized_k, lane, 0)
-                k1 = gl.gather(normalized_k, lane + 32, 0)
-                k2 = gl.gather(normalized_k, lane + 64, 0)
-                k3 = gl.gather(normalized_k, lane + 96, 0)
+                # Preserve main's 0/64 and 32/96 FMA pairs. Split key groups
+                # before reducing so vectorized loads do not change rounding.
+                s02, s13 = gl.split(
+                    decayed_state.reshape((BV, 2, 2, BK // 4)).permute((0, 3, 1, 2))
+                )
+                s0, s2 = gl.split(s02)
+                s1, s3 = gl.split(s13)
+                k02, k13 = gl.split(
+                    normalized_k.reshape((2, 2, BK // 4)).permute((2, 0, 1))
+                )
+                k0, k2 = gl.split(k02)
+                k1, k3 = gl.split(k13)
+                k0 = gl.convert_layout(k0, gl.SliceLayout(0, s0.type.layout))
+                k1 = gl.convert_layout(k1, gl.SliceLayout(0, s0.type.layout))
+                k2 = gl.convert_layout(k2, gl.SliceLayout(0, s0.type.layout))
+                k3 = gl.convert_layout(k3, gl.SliceLayout(0, s0.type.layout))
                 partial = gl.fma(s0, k0[None, :], s2 * k2[None, :]) + gl.fma(
                     s1, k1[None, :], s3 * k3[None, :]
                 )
-                projection = gl.sum(partial, axis=1)
+                if gl.num_warps() == 1:
+                    # Only the 32 projection partials need redistribution.
+                    partial = gl.convert_layout(
+                        partial, gl.BlockedLayout([1, 1], [4, 8], [1, 1], [1, 0])
+                    )
+                projection = gl.convert_layout(
+                    gl.sum(partial, axis=1), gl.SliceLayout(1, replay_layout)
+                )
                 # Main contracts SiLU's multiply with this subtraction.
                 # replay_v holds the pre-activation convolution value.
                 correction = gl.fma(replay_v, _sigmoid(replay_v), -projection)
@@ -364,6 +378,15 @@ def _kda_recoverssm_verify_kernel(
                         mask=token_valid & replay_mask_k,
                     )
             return
+
+    state_ptrs = (
+        state_ptr
+        + state_idx * stride_state_block
+        + pid_h * stride_state_head
+        + offs_v[:, None] * stride_state_v
+        + offs_k[None, :] * stride_state_k
+    )
+    state = gl.load(state_ptrs, mask=mask_state, other=0.0).to(gl.float32)
 
     A = gl.exp(gl.load(A_log_ptr + pid_h).to(gl.float32))
     dt_bias = gl.load(

@@ -463,6 +463,13 @@ preserves main's contraction for each value row and keeps its token loop.
 This is an arithmetic constraint within the existing producer, not another
 execution path or a weaker serving gate.
 
+A fused gate producer must keep two projection accumulators. The BF16 verify
+projection starts from zero. Main's FP32 replay projection starts with bias
+inside the dot accumulator. Adding bias to a reused unbiased result changes
+rounding. Tile size may change only when these contractions and the fixed
+numerical gates still hold. Replay state loads may use a vectorized layout,
+but the projection partials must retain the reference reduction order.
+
 The record producer and recovery must use the same normalization, gate transform, update
 order and FP32 rounding rules. K/U/D are stored after the required FP32
 operations. Do not cast them to BF16 or preweight one field by cumulative decay.
