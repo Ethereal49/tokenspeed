@@ -40,7 +40,11 @@ that suffix. Verify does not write the input checkpoint, so it need not retain
 the intermediate state after the last valid token. Tests cover ragged lengths,
 empty requests, null pages and untouched record suffixes.
 
-Record storage is request-indexed. Batched recovery accepts the existing
+Record storage is slot-indexed, with an explicit generation and absolute
+position stamp. Producer and recovery map absolute positions modulo ring
+capacity. Recovery rejects stale records before reading their payloads.
+PR1 assigns one slot per batch row for each round; the composition tests also
+exercise slot reassignment and longer rings. Batched recovery accepts the existing
 group-major state plan and strided layer pointer descriptors. Convolution
 commit uses the existing TokenSpeed kernel; unused vLLM convolution helpers
 are omitted. The NVIDIA runtime uses this adapter on the development branch.
@@ -67,8 +71,9 @@ do not read device values. Convolution output is dense even when the input is
 a strided projection view. No padding memset is added: graph consumers must
 ignore padded outputs under the unified-path contract.
 
-The old all-layer replay kernel remains an offline numerical reference while
-PR1 validation is in progress. The NVIDIA serving adapter no longer calls it.
-Shared producers and per-layer kernels still used by other paths must not be
-removed as part of this cleanup. Final PR cleanup remains a separate pending
-milestone; retention here does not add a serving-mode selector.
+The old all-layer replay kernel and its gate producers now live in
+`tokenspeed-kernel/test/kda_replay_reference.py` as the independent main oracle.
+They are excluded from the runtime package. Shared producers and per-layer
+kernels still used by other paths remain in place. The serving path has no
+legacy replay selector. Final validation and design-document cleanup remain
+pending.

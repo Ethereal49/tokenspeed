@@ -87,7 +87,7 @@ def _kda_recurrent_step(
         )
     }
 )
-@gluon.jit
+@gluon.jit(do_not_specialize=["RECORD_SLOTS"])
 def _kda_recoverssm_verify_kernel(
     q_ptr,
     k_ptr,
@@ -105,6 +105,10 @@ def _kda_recoverssm_verify_kernel(
     out_ptr,
     query_start_loc_ptr,
     state_indices_ptr,
+    record_metadata_ptr,
+    record_stamps_ptr,
+    RECORD_CAPACITY: gl.constexpr,
+    RECORD_SLOTS,
     lower_bound,
     null_block_id,
     stride_q_token: gl.constexpr,
@@ -180,6 +184,38 @@ def _kda_recoverssm_verify_kernel(
             )
         return
 
+    record_slot = pid_b.to(gl.int64)
+    record_start = record_slot * 0
+    record_generation = record_start
+    if record_metadata_ptr is not None and (not SEPARATE_REPLAY_INPUTS or record_only):
+        record_slot = gl.load(record_metadata_ptr + pid_b * 3)
+        record_generation = gl.load(record_metadata_ptr + pid_b * 3 + 1)
+        record_start = gl.load(record_metadata_ptr + pid_b * 3 + 2)
+        gl.device_assert(
+            (record_slot >= 0) & (record_slot < RECORD_SLOTS), "invalid replay slot"
+        )
+        gl.device_assert(
+            (record_generation >= 0) & (record_start >= 0), "invalid replay metadata"
+        )
+
+    # A later recovery launch observes stamps only after this entire producer
+    # completes. Write them before loading state so generation is not live
+    # across the recurrent updates.
+    if record_stamps_ptr is not None:
+        if (
+            (not SEPARATE_REPLAY_INPUTS or record_only)
+            and (pid_v == 0)
+            and (pid_h == 0)
+        ):
+            for token_offset in gl.static_range(SPEC_QUERY_LEN):
+                position = record_start + token_offset
+                stamp = (
+                    record_stamps_ptr
+                    + (record_slot * RECORD_CAPACITY + position % RECORD_CAPACITY) * 2
+                )
+                gl.store(stamp, position, mask=token_offset < query_len)
+                gl.store(stamp + 1, record_generation, mask=token_offset < query_len)
+
     state_ptrs = (
         state_ptr
         + state_idx * stride_state_block
@@ -233,9 +269,10 @@ def _kda_recoverssm_verify_kernel(
                 state = updated
                 correction_ptr = (
                     correction_cache_ptr
-                    + pid_b * stride_correction_block
+                    + record_slot * stride_correction_block
                     + pid_h * stride_correction_head
-                    + token_offset * stride_correction_pos
+                    + ((record_start + token_offset) % RECORD_CAPACITY)
+                    * stride_correction_pos
                 )
                 gl.store(
                     correction_ptr + offs_v * stride_correction_dim,
@@ -245,9 +282,10 @@ def _kda_recoverssm_verify_kernel(
                 if pid_v == 0:
                     kd_ptr = (
                         kd_cache_ptr
-                        + pid_b * stride_kg_block
+                        + record_slot * stride_kg_block
                         + pid_h * stride_kg_head
-                        + token_offset * stride_kg_pos
+                        + ((record_start + token_offset) % RECORD_CAPACITY)
+                        * stride_kg_pos
                     )
                     gl.store(
                         kd_ptr + offs_k * stride_kg_dim,
@@ -332,9 +370,10 @@ def _kda_recoverssm_verify_kernel(
         if not SEPARATE_REPLAY_INPUTS:
             correction_ptr = (
                 correction_cache_ptr
-                + pid_b * stride_correction_block
+                + record_slot * stride_correction_block
                 + pid_h * stride_correction_head
-                + token_offset * stride_correction_pos
+                + ((record_start + token_offset) % RECORD_CAPACITY)
+                * stride_correction_pos
             )
             gl.store(
                 correction_ptr + offs_v * stride_correction_dim,
@@ -344,9 +383,9 @@ def _kda_recoverssm_verify_kernel(
             if pid_v == 0:
                 kg_ptr = (
                     kd_cache_ptr
-                    + pid_b * stride_kg_block
+                    + record_slot * stride_kg_block
                     + pid_h * stride_kg_head
-                    + token_offset * stride_kg_pos
+                    + ((record_start + token_offset) % RECORD_CAPACITY) * stride_kg_pos
                 )
                 gl.store(
                     kg_ptr + offs_k * stride_kg_dim,
@@ -475,7 +514,7 @@ def _commit_kda_num_warps(args: dict[str, Any]) -> int:
         "num_warps": _commit_kda_num_warps,
     }
 )
-@triton.jit(do_not_specialize=["BATCH"])
+@triton.jit(do_not_specialize=["BATCH", "RECORD_SLOTS"])
 def _commit_kda_state_kernel(
     state_ref_ptr,
     state_base_addrs_ptr,
@@ -505,6 +544,11 @@ def _commit_kda_state_kernel(
     group_indices_ptr,
     stride_state_group,
     stride_pointer_layer: tl.constexpr,
+    record_metadata_ptr,
+    record_stamps_ptr,
+    stamp_layer_stride: tl.constexpr,
+    RECORD_CAPACITY: tl.constexpr,
+    RECORD_SLOTS,
     K: tl.constexpr,
     V: tl.constexpr,
     BK: tl.constexpr,
@@ -545,6 +589,48 @@ def _commit_kda_state_kernel(
     if final_state_idx <= null_block_id:
         return
 
+    record_slot = pid_b
+    record_start = 0
+    if record_metadata_ptr is not None:
+        record_slot = tl.load(record_metadata_ptr + pid_b * 3)
+        generation = tl.load(record_metadata_ptr + pid_b * 3 + 1)
+        record_start = tl.load(record_metadata_ptr + pid_b * 3 + 2)
+        slot_valid = (record_slot >= 0) & (record_slot < RECORD_SLOTS)
+        interval_valid = (
+            (commit_len >= 0)
+            & (commit_len <= RECORD_CAPACITY)
+            & (record_start >= 0)
+            & (generation >= 0)
+        )
+        tl.device_assert(slot_valid & interval_valid, "invalid replay interval")
+        if not (slot_valid & interval_valid):
+            return
+        offsets = tl.arange(0, triton.next_power_of_2(RECORD_CAPACITY))
+        positions = record_start + offsets
+        stamps = (
+            record_stamps_ptr
+            + pid_l * stamp_layer_stride
+            + (record_slot * RECORD_CAPACITY + positions % RECORD_CAPACITY) * 2
+        )
+        stamped_position = tl.load(stamps, mask=offsets < commit_len, other=-1)
+        stamped_generation = tl.load(stamps + 1, mask=offsets < commit_len, other=-1)
+        valid = (
+            tl.sum(
+                (
+                    (offsets < commit_len)
+                    & (
+                        (stamped_position != positions)
+                        | (stamped_generation != generation)
+                    )
+                ).to(tl.int32),
+                axis=0,
+            )
+            == 0
+        )
+        tl.device_assert(valid, "stale replay record")
+        if not valid:
+            return
+
     state_base_addr = tl.load(state_base_addrs_ptr + pid_l * stride_pointer_layer)
     state_ptr = state_base_addr.to(tl.pointer_type(state_ref_ptr.dtype.element_ty))
     source_state_ptr = (
@@ -558,13 +644,14 @@ def _commit_kda_state_kernel(
         tl.pointer_type(correction_cache_ref_ptr.dtype.element_ty)
     )
     correction_cache_ptr += (
-        pid_b * correction_cache_block_stride + pid_h * stride_correction_cache_head
+        record_slot * correction_cache_block_stride
+        + pid_h * stride_correction_cache_head
     )
     kd_cache_base_addr = tl.load(kd_cache_base_addrs_ptr + pid_l * stride_pointer_layer)
     kd_cache_ptr = kd_cache_base_addr.to(
         tl.pointer_type(kd_cache_ref_ptr.dtype.element_ty)
     )
-    kd_cache_ptr += pid_b * kd_cache_block_stride + pid_h * stride_kd_cache_head
+    kd_cache_ptr += record_slot * kd_cache_block_stride + pid_h * stride_kd_cache_head
 
     offs_k = tl.arange(0, BK)
     offs_v = pid_v * BV + tl.arange(0, BV)
@@ -589,9 +676,14 @@ def _commit_kda_state_kernel(
 
     for token_offset in range(commit_len):
         correction_ptr = (
-            correction_cache_ptr + token_offset * stride_correction_cache_pos
+            correction_cache_ptr
+            + ((record_start + token_offset) % RECORD_CAPACITY)
+            * stride_correction_cache_pos
         )
-        kg_ptr = kd_cache_ptr + token_offset * stride_kd_cache_pos
+        kg_ptr = (
+            kd_cache_ptr
+            + ((record_start + token_offset) % RECORD_CAPACITY) * stride_kd_cache_pos
+        )
         k = tl.load(
             kg_ptr + offs_k * stride_kd_cache_dim,
             mask=mask_k,
@@ -642,6 +734,8 @@ def kda_recoverssm_verify(
     replay_inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
     verify_decay: torch.Tensor | None,
     verify_qk: tuple[torch.Tensor, torch.Tensor] | None,
+    record_metadata: torch.Tensor | None,
+    record_stamps: torch.Tensor | None,
 ) -> torch.Tensor:
     """Verify a KDA speculative window without modifying its checkpoint."""
     if q.ndim != 4 or q.shape[0] != 1:
@@ -665,7 +759,7 @@ def kda_recoverssm_verify(
     expected_correction_shape = (
         correction_cache.shape[0],
         num_heads,
-        spec_query_len,
+        correction_cache.shape[2],
         value_dim,
     )
     if correction_cache.shape != expected_correction_shape:
@@ -675,7 +769,7 @@ def kda_recoverssm_verify(
     expected_kg_shape = (
         correction_cache.shape[0],
         num_heads,
-        spec_query_len,
+        correction_cache.shape[2],
         2 * key_dim,
     )
     if kd_cache.shape != expected_kg_shape:
@@ -691,6 +785,27 @@ def kda_recoverssm_verify(
     if not A_log.is_contiguous() or not dt_bias.is_contiguous():
         raise ValueError("KDA RecoverSSM gate parameters must be contiguous")
     batch = state_indices.shape[0]
+    capacity = correction_cache.shape[2]
+    if capacity < spec_query_len:
+        raise ValueError("replay capacity must cover the candidate window")
+    if (record_metadata is None) != (record_stamps is None):
+        raise ValueError("record metadata and stamps must be supplied together")
+    if record_metadata is not None:
+        if record_metadata.shape != (batch, 3) or record_stamps.shape != (
+            correction_cache.shape[0],
+            capacity,
+            2,
+        ):
+            raise ValueError(
+                "replay metadata needs [batch, 3] and stamps [slots, capacity, 2]"
+            )
+        if any(
+            x.dtype != torch.int64 or not x.is_contiguous() or x.device != q.device
+            for x in (record_metadata, record_stamps)
+        ):
+            raise ValueError(
+                "replay metadata and stamps must be contiguous INT64 on the input device"
+            )
     if correction_cache.shape[0] < batch:
         raise ValueError("record capacity is smaller than the runtime batch")
     if query_start_loc.shape[0] != batch + 1:
@@ -791,6 +906,10 @@ def kda_recoverssm_verify(
         out,
         query_start_loc,
         state_indices,
+        record_metadata,
+        record_stamps,
+        capacity,
+        correction_cache.shape[0],
         lower_bound or 0.0,
         NULL_BLOCK_ID,
         q.stride(1),
@@ -825,6 +944,7 @@ def kda_recoverssm_verify(
         PREPARED_GATE=verify_decay is not None,
         PREPARED_QK=verify_qk is not None,
         num_warps=1,
+        debug=True,
         num_stages=2,
     )
     return out

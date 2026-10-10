@@ -757,6 +757,11 @@ def test_batched_replay_call_contract() -> None:
         gate_stride=1,
         conv_width=4,
         lower_bound=-5.0,
+        **(
+            {"record_metadata": tensor, "record_stamps": tensor}
+            if "record_metadata" in parameters
+            else {}
+        ),
     )
 
 

@@ -1,5 +1,15 @@
 # RecoverSSM PR1 progress
 
+> **Benchmark correction:** Earlier attention-runtime timings from
+> `outputs/pr1/bench_runtime.py` reused the same parent page IDs across cache
+> groups whose arena views overlap. Those timings are invalid, including the
+> previously reported 3.41% and 6.64% slowdowns. They remain below as historical
+> investigation records, not acceptance evidence. The corrected harness assigns
+> disjoint parent pages and verifies every live tensor address range. See the
+> final corrected-timing section. Kernel and runtime correctness results are
+> separate from these invalid timing runs.
+
+
 Status: implementation in progress. The T4/two-accepted-token attention matrix
 improves, but B32 with one accepted token still regresses by 3.5%. The full
 performance gate has not passed.
@@ -9,7 +19,10 @@ performance gate has not passed.
 - Branch: `kda-recoverssm-pr1`.
 - Unchanged main baseline: `f4ac1affe11ad404720bcd150970487f75fbf59a`.
 - Design commit: `7a47827e6ce2112aa32f252fbc2e80514bfd411e`.
-- Implementation results below refer to uncommitted work after that commit.
+- Implementation and review fixes are committed as `c1208b87` and pushed.
+- Earlier GPU measurements below describe their recorded source snapshots.
+  The resumed validation at the end of this record covers the committed review
+  fixes and the new, uncommitted composition tests.
 - Claude approved the revised design, including the two-precision producer
   contract. This is not code approval or a performance exception.
 - Keep all design versions on this branch until validation and review finish.
@@ -36,7 +49,7 @@ and raw results are in ignored `outputs/pr1/`.
 | --- | --- |
 | New branch, design retained, rebase to main | Done |
 | Claude design review | Approved |
-| Licensed vLLM kernel copy and current-round runtime adapter | Implemented; uncommitted |
+| Licensed vLLM kernel copy and current-round runtime adapter | Committed as `c1208b87`; focused GPU suites pass |
 | Strict accepted-state compatibility | Initial tests pass |
 | Combined convolution and gate producers | Initial tests pass |
 | KDA performance non-regression | T4/A2 improves; B32/A1 still regresses |
@@ -409,7 +422,7 @@ claims: undefined padded output is allowed by the unified-path contract, and
 the incompatible per-layer fallback hits an existing assertion rather than
 demonstrating silent corruption. Neither claim justifies a numerical change.
 
-The review fixes remain uncommitted after the design commit listed above:
+The following review fixes are included in `c1208b87`:
 
 - Pass the required replay-record argument from the benchmark generator.
 - Remove dead gate and stride-array inputs from the standalone recovery API
@@ -433,12 +446,12 @@ The oracle now splits each head's record into K and decay; the production
 layout did not change. The existing 128-round differential test already
 checks prepared Q/K and decay against main.
 
-Python syntax and static launch-signature checks pass. The full repository
-hook suite ran and applied formatting changes. GPU tests and matched timing
-await a persistent one-node allocation under the existing binding. The
-login-node test environment lacks dependencies available in the GPU
-container. This is not a numerical test pass. Existing performance and E2E
-gates remain open; this review does not approve the whole PR.
+Python syntax and static launch-signature checks passed before the commit.
+The full repository hooks passed after formatting. The subsequent GPU
+allocation failed, so GPU tests and matched timing on the committed source
+were pending at that point. Resumed validation is recorded below. The login-node
+test environment lacks dependencies available in the GPU container. This is not a numerical test pass. Existing performance
+and E2E gates remain open; this review does not approve the whole PR.
 
 The source snapshot and review logs are in `outputs/pr1/review-fixes-code.patch`
 and `outputs/pr1/claude-review-fixes*.json`. The current launcher is
@@ -450,3 +463,177 @@ bash outputs/pr1/submit.sh python -m pytest -q -s tokenspeed-kernel/test/nvidia/
 bash outputs/pr1/submit.sh python -m pytest -q test/runtime/test_kimi_k3_kda_eager_commit.py
 bash outputs/pr1/submit.sh python -m pytest -q tokenspeed-kernel/test/ops/attention/test_kda_replay_commit.py
 ```
+
+## Initial multi-window composition validation
+
+An uncommitted test change extends the existing 128-round main-producer
+comparison to T1/T4 with R8/R16/R32 at B4, plus B16/T4/R8. Each round uses the
+actual FP32 record producer. A local ring retains only accepted records,
+poisons rejected suffixes, wraps absolute positions and repeatedly resets the
+checkpoint. Recovery replays the retained records through the existing kernel;
+its reconstructed endpoint seeds the next verify window. The test includes
+zero acceptance and keeps the existing output and strict main-state tolerances.
+Convolution uses independent candidate storage, the actual raw-input capture
+and production convolution commit; its accepted endpoints must match main
+exactly.
+
+The harness gathers ring rows into the current contiguous recovery interface.
+It does not implement or validate production generation/position stamps, slot
+reuse or direct ring addressing.
+
+The required general record interface remains a PR1 acceptance gap under
+Section 9.1 of the design. The production planner also currently launches per
+cache group, rather than once globally. Neither gap is deferred to PR2 by this
+validation change. The B32/T4/A1 regression, independent-start timings and
+real-model gates remain open.
+
+### Resumed correctness results
+
+The four suites pass on one GB300 using the existing CUDA 13 container,
+PyTorch 2.14.0+cu130 and tokenspeed-triton 3.8.10.post20260920:
+
+- Benchmark API: **12 passed**.
+- RecoverSSM kernel and composition: **20 passed**.
+- KDA runtime eager/graph commit: **20 passed**.
+- Existing replay kernels: **33 passed, 1 platform-specific skip**.
+
+Across the seven 128-round composition cases, maximum accepted-state error
+versus main is **3.5762787e-7**, state RMS is at most **1.0816872e-9**, and
+maximum BF16 verify-output error is **3.0517578e-5**. Independent convolution
+endpoints match exactly. No numerical threshold was changed.
+
+The runtime/kernel implementation is `c1208b87`; the composition test changes
+are uncommitted. All suites checked the same Python source manifest before and
+after execution. Its SHA-256 is
+`d98012b3639415a5dbfca3b58ff8b576ee7a2b39e5e03d242837e34df477d993`.
+The patch, per-suite logs and manifest are retained in local ignored
+`outputs/pr1/composition-validation/`. Full repository hooks pass. These are
+focused attention/runtime checks, not real-model, AIME or E2E results.
+
+### Resumed low-acceptance timing
+
+A diagnostic B32/T4/A1 run uses the same GB300 and environment as the tests,
+with 69 KDA layers, H12/D128 and CUDA graphs. Four fresh processes run in
+main/candidate/candidate/main order, with 50 CUDA-event samples per process.
+Main remains unchanged at `f4ac1aff`; candidate runtime is `c1208b87`.
+
+| Implementation | Process medians |
+| --- | ---: |
+| Main | 2284.240–2284.272 us |
+| RecoverSSM | 2362.096–2362.192 us |
+
+The mean of candidate process medians is **3.41% slower** than main.
+This reproduces the low-acceptance regression after the review fixes. It is
+not a full independent-start acceptance protocol or an E2E measurement. No
+kernel change or performance improvement is claimed. Raw samples and the
+exact launcher are retained beside the correctness logs. The source manifest
+remained unchanged through all four runs.
+
+
+## Stamped record contract and shared planning
+
+The next implementation increment uses the same stamped record view in verify
+and recovery. INT64 metadata supplies the physical slot, generation and
+absolute checkpoint position. INT64 stamps identify each record's absolute
+position and generation. Position `i` maps to `i % R`. Recovery checks the
+accepted interval before reading payloads; a stale position, generation or
+invalid slot raises a device assertion. Explicit unstamped calls remain only
+for standalone kernel diagnostics. Serving always supplies stamps.
+
+PR1 still uses per-round workspace with `R=T_max`. Each metadata refresh assigns
+a new generation. It does not add persistent request ownership or change LCM
+and scheduler semantics. The composition harness now calls the actual producer
+and recovery directly on R8/R16/R32 rings, without gathering records. It covers
+128 rounds, T1/T4, all accepted lengths, rejected payload poisoning, repeated
+checkpoint resets and physical slot reassignment to new requests.
+
+Commit planning now resolves destination pages and copies the original
+source-page snapshots for all cache groups in one kernel launch. The runtime
+no longer launches `torch.stack` before recovery. The GPU commit sequence is
+one shared planner, one all-layer recurrent recovery and one convolution commit.
+Descriptor, page, accepted-count, record-metadata and stamp buffers are allocated
+before capture and included in startup workspace accounting. Descriptor copies
+occur only when table addresses or geometry change. Rebinding clears this cache.
+
+Focused GPU validation of this increment:
+
+- RecoverSSM kernels: **26 passed**, including direct ring composition,
+  stale-record rejection in isolated processes, grouped planning and graph replay.
+- Runtime integration: **20 passed**, including padding, multiple rounds,
+  pool rebinding and exact planned-versus-allocated workspace bytes.
+
+The runtime tests found a stamp-view shape mismatch for live batches below
+maximum capacity. Verify now receives the live-batch stamp view; all-layer
+commit keeps the full fixed-capacity layer stride. The corrected tests pass.
+Kernel compilation tests also pass after slot count became a runtime argument.
+
+Local logs are `outputs/pr1/stamped-validation.log` and
+`outputs/pr1/stamped-runtime.log`. These results do not satisfy the full-model
+or performance gates. The prior B32/T4/A1 regression still requires a fresh
+measurement of this implementation, followed by the prescribed matrix.
+
+
+The replaced all-layer replay implementation and its gate producers have moved
+from the runtime package to `tokenspeed-kernel/test/kda_replay_reference.py`.
+The differential tests keep this independent main oracle. Shared per-layer
+kernels used by other serving paths remain unchanged.
+
+### Stamped-path performance investigation
+
+A fresh paired diagnostic uses the same GB300, PyTorch 2.14.0+cu130 and
+Triton 3.9.10.post20261008 for both arms. This dependency version differs from
+the earlier diagnostic, so its main timing was measured again.
+At B32/T4/A1, main takes **2283.264 us** and the first stamped implementation
+takes **2460.592 us**. Moving stamp writes before the recurrent-state load and
+removing the source-page stack lowers the candidate to **2435.776 us**,
+still **6.68% slower** than the paired main diagnostic.
+
+A recovery tile sweep over BV8/16/32/64 and one/two/four warps does not close
+the gap. Verify BV16 with one warp remains the fastest tested geometry.
+These measurements are diagnostic, not the prescribed independent-start
+statistical gate. They do not justify marking PR1 performance complete or
+starting final design-document removal. Full TP8 model, agentic, AIME 2026
+and E2E matrix validation remain uncompleted.
+
+
+### Frozen-source verification
+
+The final A/B/B/A diagnostic uses four fresh processes, 50 CUDA-event samples
+per process and the same environment for both arms. Main process medians are
+**2283.632–2284.288 us**; candidate medians are
+**2435.568–2435.840 us**. The ratio of mean process medians is
+**1.06644**, or **6.64% slower**.
+This remains a diagnostic and does not replace the formal acceptance protocol.
+No performance gate is marked complete.
+
+All Python sources remained unchanged across the four processes. The manifest
+SHA-256 is `5ff1e13acd4ac518946ef9b793486be0415753ceb53b29c7dc44b9c3a0d43393`.
+The manifest, patch, exact launchers and raw timing samples are under local
+ignored `outputs/pr1/final-stamped/`. The same manifest guards the final
+kernel, runtime and benchmark API validation scripts.
+
+Before the frozen-source rerun, the expanded cleanup suites reported
+**113 passed, 24 skipped**, runtime **20 passed**, and benchmark API
+**12 passed**. The four relocated reference functions retain the original
+AST. The full `pre-commit run --all-files` command passes.
+
+
+### Corrected timing with disjoint live pages
+
+The benchmark now assigns different parent IDs to each simultaneously live
+cache group. Before timing, it checks capacity, per-page contiguity and pairwise
+disjoint byte ranges for every live recurrent and convolution state tensor.
+B32 uses 96 live parent IDs and an arena with 104 usable parents. This replaces
+the invalid setup that reused 32 IDs across all three state groups.
+
+The corrected A/B/B/A run measures main at **2481.904–2481.920 us**
+and candidate at **2440.928–2442.896 us** for B32/T4/A1.
+The ratio of mean process medians is **0.98388**,
+or **1.61% faster** for the candidate.
+This is still a diagnostic. The prior regression claim is withdrawn; the
+complete matrix and independent-start statistics remain required.
+
+Corrected raw measurements and launchers are in
+`outputs/pr1/disjoint-stamped/`. The earlier timing directory contains an
+invalidation notice. The frozen-source correctness rerun completed with
+**145 passed, 24 skipped**, and its source manifest remained unchanged.

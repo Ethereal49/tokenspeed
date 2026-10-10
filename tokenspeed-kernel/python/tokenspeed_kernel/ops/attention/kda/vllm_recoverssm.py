@@ -70,6 +70,8 @@ def vllm_triton_kda_recoverssm_verify(
     replay_inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
     verify_decay: torch.Tensor | None,
     verify_qk: tuple[torch.Tensor, torch.Tensor] | None,
+    record_metadata: torch.Tensor | None,
+    record_stamps: torch.Tensor | None,
 ) -> torch.Tensor:
     """Verify candidates and save current-window recovery records.
 
@@ -88,6 +90,11 @@ def vllm_triton_kda_recoverssm_verify(
     verify_qk optionally supplies FP32 normalized/scaled Q and normalized K.
     verify_decay optionally supplies FP32 decay after BF16 gate rounding.
     These prepared inputs remove repeated transforms from value tiles.
+
+    record_metadata is INT64 [batch, 3] (slot, generation, absolute start).
+    record_stamps is INT64 [slots, capacity, 2] (position, generation).
+    Records use position % capacity; verify stamps each written candidate.
+    Both may be None only for standalone unstamped kernel diagnostics.
 
     Return out after writing verify results. The checkpoint is unchanged.
     """
@@ -110,6 +117,8 @@ def vllm_triton_kda_recoverssm_verify(
         replay_inputs=replay_inputs,
         verify_decay=verify_decay,
         verify_qk=verify_qk,
+        record_metadata=record_metadata,
+        record_stamps=record_stamps,
     )
 
 
@@ -146,6 +155,8 @@ def vllm_triton_kda_recoverssm_commit(
     correction_cache_base_addrs: torch.Tensor,
     kd_cache_base_addrs: torch.Tensor,
     spec_query_len: int,
+    record_metadata: torch.Tensor | None,
+    record_stamps: torch.Tensor | None,
 ) -> None:
     """Commit one layer's accepted FP32 K/U/decay records in place.
 
@@ -161,11 +172,34 @@ def vllm_triton_kda_recoverssm_commit(
     planner. commit_lens, final_state_indices, boundary_state_indices and
     boundary_recovery_lens are caller-owned int32 planner scratch.
 
+    record_metadata is INT64 [batch, 3] (slot, generation, checkpoint position).
+    record_stamps is INT64 [slots, capacity, 2] (position, generation).
+    Recovery checks every accepted stamp before reading payloads. Invalid
+    records raise a device assertion. Both may be None for unstamped diagnostics.
+
     Return None after updating checkpoint_state. No gate inputs are needed:
     verify already saved multiplicative decay in kd_cache.
     """
     del q, k, v
     batch = state_indices.shape[0]
+    if (record_metadata is None) != (record_stamps is None):
+        raise ValueError("record metadata and stamps must be supplied together")
+    if record_metadata is not None:
+        if record_metadata.shape != (batch, 3) or record_stamps.shape != (
+            correction_cache.shape[0],
+            correction_cache.shape[2],
+            2,
+        ):
+            raise ValueError("replay metadata does not match the record view")
+        if any(
+            x.dtype != torch.int64
+            or not x.is_contiguous()
+            or x.device != checkpoint_state.device
+            for x in (record_metadata, record_stamps)
+        ):
+            raise ValueError(
+                "record metadata must be contiguous INT64 on the state device"
+            )
     if batch == 0:
         return
     _prepare_commit_plan_kernel[(batch,)](
@@ -228,6 +262,11 @@ def vllm_triton_kda_recoverssm_commit(
         None,
         0,
         1,
+        record_metadata,
+        record_stamps,
+        0,
+        correction_cache.shape[2],
+        correction_cache.shape[0],
         K=key_dim,
         V=value_dim,
         BK=block_k,
@@ -235,6 +274,7 @@ def vllm_triton_kda_recoverssm_commit(
         ALIGN_MODE=False,
         BATCH=batch,
         LAUNCH_DEPENDENT_KERNELS=False,
+        debug=True,
         num_stages=2,
     )
 
@@ -261,6 +301,8 @@ def batched_recoverssm_commit(
     key_decay_stride: int,
     state_stride: int,
     conv_width: int,
+    record_metadata: torch.Tensor | None,
+    record_stamps: torch.Tensor | None,
 ) -> None:
     """Recover all layers from request-major FP32 records and commit conv.
 
@@ -280,6 +322,11 @@ def batched_recoverssm_commit(
     use contiguous [channel, conv_width - 1] BF16 values. Record K/U/decay
     is FP32. Source and destination pages may alias within a request, but
     requests must not share writable pages.
+
+    record_metadata is INT64 [batch, 3] (slot, generation, checkpoint position).
+    record_stamps is INT64 [layers, slots, capacity, 2] (position, generation).
+    Each recurrent layer validates its accepted interval before reading records.
+    Both may be None only for standalone unstamped kernel diagnostics.
 
     Return None after recurrent and convolution commits on the caller stream.
     """
@@ -310,6 +357,31 @@ def batched_recoverssm_commit(
         )
     if not batch:
         return
+    if (record_metadata is None) != (record_stamps is None):
+        raise ValueError("record metadata and stamps must be supplied together")
+    capacity = draft_token_num if record_stamps is None else record_stamps.shape[2]
+    slots = batch if record_stamps is None else record_stamps.shape[1]
+    if record_metadata is not None:
+        if record_metadata.shape != (batch, 3) or record_stamps.shape != (
+            layers,
+            slots,
+            capacity,
+            2,
+        ):
+            raise ValueError(
+                "batched replay metadata needs [batch, 3] and stamps [layers, slots, capacity, 2]"
+            )
+        if capacity < draft_token_num:
+            raise ValueError("record capacity must cover the candidate window")
+        if any(
+            x.dtype != torch.int64
+            or not x.is_contiguous()
+            or x.device != descriptors.device
+            for x in (record_metadata, record_stamps)
+        ):
+            raise ValueError(
+                "record metadata must be contiguous INT64 on the descriptor device"
+            )
     grid = lambda meta: (
         triton.cdiv(head_dim, meta["BV"]),
         batch,
@@ -324,10 +396,10 @@ def batched_recoverssm_commit(
         state_stride,
         typed,
         descriptors[:, 3],
-        draft_token_num * correction_stride,
+        capacity * correction_stride,
         typed,
         descriptors[:, 5],
-        draft_token_num * key_decay_stride,
+        capacity * key_decay_stride,
         read_indices,
         accepted_length,
         write_indices,
@@ -347,6 +419,11 @@ def batched_recoverssm_commit(
         group_indices,
         read_indices.stride(0),
         descriptors.stride(0),
+        record_metadata,
+        record_stamps,
+        0 if record_stamps is None else record_stamps.stride(0),
+        capacity,
+        slots,
         K=head_dim,
         V=head_dim,
         BK=triton.next_power_of_2(head_dim),
@@ -354,6 +431,7 @@ def batched_recoverssm_commit(
         ALIGN_MODE=False,
         BATCH=batch,
         LAUNCH_DEPENDENT_KERNELS=False,
+        debug=True,
         num_stages=2,
     )
     batched_kda_commit_conv_window_kernel[
@@ -719,4 +797,42 @@ def prepare_recoverssm_gate(
         raw_gate,
         gate.view(1, rows, num_heads, head_dim),
         verify_decay.view(1, rows, num_heads, head_dim),
+    )
+
+
+@triton.jit(do_not_specialize=["batch", "generation"])
+def _prepare_record_metadata_kernel(
+    committed, metadata, batch, generation, BLOCK: tl.constexpr
+):
+    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    live = row < batch
+    position = tl.load(committed + row, mask=live, other=0)
+    tl.store(metadata + row * 3, row.to(tl.int64), mask=live)
+    tl.store(metadata + row * 3 + 1, generation.to(tl.int64), mask=live)
+    tl.store(metadata + row * 3 + 2, position, mask=live)
+
+
+def prepare_recoverssm_metadata(
+    committed: torch.Tensor, metadata: torch.Tensor, *, batch: int, generation: int
+) -> None:
+    """Refresh the per-round slot, generation and checkpoint-position view.
+
+    committed contains INT64 checkpoint positions. metadata is caller-owned,
+    contiguous INT64 [max_batch, 3] storage. Only the first batch rows change.
+    generation identifies this round's workspace ownership. Return None.
+    """
+    if committed.dtype != torch.int64 or metadata.dtype != torch.int64:
+        raise ValueError("record metadata requires INT64 positions and storage")
+    if metadata.ndim != 2 or metadata.shape[1] != 3 or not metadata.is_contiguous():
+        raise ValueError("record metadata must be contiguous [max_batch, 3]")
+    if batch > min(committed.numel(), metadata.shape[0]) or generation < 0:
+        raise ValueError("invalid record metadata batch or generation")
+    if batch == 0:
+        return
+    _prepare_record_metadata_kernel[(triton.cdiv(batch, 128),)](
+        committed,
+        metadata,
+        batch,
+        generation,
+        BLOCK=128,
     )

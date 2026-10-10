@@ -23,6 +23,7 @@ What has to hold for that to be lossless:
 
 import pytest
 import torch
+from kda_replay_reference import batched_recurrent_kda_replay_commit
 from utils import is_cdna4, is_cdna5
 
 if not torch.cuda.is_available():
@@ -44,7 +45,6 @@ requires_registered_replay = pytest.mark.skipif(
 from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (  # noqa: E402
     _gate_tiling,
     batched_kda_commit_conv_window_kernel,
-    batched_recurrent_kda_replay_commit,
     fused_recurrent_kda_replay_commit,
     fused_recurrent_kda_verify_megafuse,
 )

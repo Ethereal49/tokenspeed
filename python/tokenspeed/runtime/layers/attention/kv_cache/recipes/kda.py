@@ -117,4 +117,17 @@ def kda_verify_workspace_bytes(
         # replaces the old low-rank gate input, beta and gate scratch.
         row_bytes = linear.conv_state_shape[0] * config.dtype.itemsize
         row_bytes += 3 * heads * head_dim * torch.float32.itemsize
-    return conv_bytes + len(conv_fields) * config.max_bs * draft_token_num * row_bytes
+    group_count = sum(spec.family == "state" for spec, _ in groups)
+    metadata_bytes = 0
+    if draft_token_num > 1:
+        metadata_bytes = len(conv_fields) * (10 * 8 + 4)
+        metadata_bytes += group_count * 4 * 8
+        metadata_bytes += (2 * group_count + 1) * config.max_bs * 4
+        if records:
+            metadata_bytes += config.max_bs * 3 * 8
+            metadata_bytes += len(conv_fields) * config.max_bs * draft_token_num * 2 * 8
+    return (
+        conv_bytes
+        + len(conv_fields) * config.max_bs * draft_token_num * row_bytes
+        + metadata_bytes
+    )

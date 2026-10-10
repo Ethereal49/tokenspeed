@@ -427,6 +427,8 @@ def triton_nvidia_kda_fused_paged_verify_split(
             replay_inputs=replay_records.replay_inputs,
             verify_decay=replay_records.verify_decay,
             verify_qk=replay_records.verify_qk,
+            record_metadata=replay_records.metadata,
+            record_stamps=replay_records.stamps,
         )
     return _nvidia_fused_verify(
         mixed_qkv,
@@ -630,6 +632,8 @@ def triton_nvidia_kda_batched_replay_commit(
     gate_stride: int,
     conv_width: int,
     lower_bound: float,
+    record_metadata: torch.Tensor,
+    record_stamps: torch.Tensor,
 ) -> None:
     """Recover every KDA layer from the FP32 records saved by verify.
 
@@ -679,6 +683,8 @@ def triton_nvidia_kda_batched_replay_commit(
         key_decay_stride=beta_stride,
         state_stride=state_stride,
         conv_width=conv_width,
+        record_metadata=record_metadata,
+        record_stamps=record_stamps,
     )
 
 
@@ -706,6 +712,7 @@ from tokenspeed_kernel.ops.attention.kda._triton.capture_payload import (  # noq
     capture_replay_payload,
 )
 from tokenspeed_kernel.ops.attention.kda._triton.state_pages import (  # noqa: E402
+    commit_state_groups,
     commit_state_pages,
     verify_state_blocks,
 )

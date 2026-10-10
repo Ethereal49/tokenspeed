@@ -24,7 +24,7 @@ See ``KdaAttnBackend`` for what separates the family from GDN."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import torch
@@ -235,6 +235,14 @@ class KdaAttnBackend(CapacityPrefillBackend):
         self._descriptor_row_by_layer: dict[int, int] = {}
         self._replay_group_ids: tuple[str, ...] = ()
         self._replay_group_rows: dict[str, int] = {}
+        self._replay_commit_table_signature: tuple[tuple[int, int, int, int], ...] = ()
+        self._replay_commit_tables: torch.Tensor | None = None
+        self._replay_commit_reads: torch.Tensor | None = None
+        self._replay_commit_pages: torch.Tensor | None = None
+        self._replay_commit_steps: torch.Tensor | None = None
+        self._replay_record_metadata: torch.Tensor | None = None
+        self._replay_record_stamps: torch.Tensor | None = None
+        self._replay_record_generation = 0
 
     @staticmethod
     def _replay_shape(kv_pool: CachePool) -> dict[str, int]:
@@ -374,6 +382,126 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 )
                 self._replay_descriptors = addresses
                 self._replay_group_indices = group_indices
+                self._replay_commit_tables = torch.empty(
+                    (len(self._replay_group_ids), 4),
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                self._replay_commit_pages = torch.empty(
+                    len(self._replay_group_ids) * self.max_bs,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                self._replay_commit_reads = torch.empty_like(self._replay_commit_pages)
+                self._replay_commit_steps = torch.empty(
+                    self.max_bs, dtype=torch.int32, device=self.device
+                )
+                if self._verify_split_producers:
+                    self._replay_record_metadata = torch.full(
+                        (self.max_bs, 3), -1, dtype=torch.int64, device=self.device
+                    )
+                    self._replay_record_stamps = torch.full(
+                        (
+                            len(layer_ids),
+                            self.max_bs,
+                            self.speculative_num_draft_tokens,
+                            2,
+                        ),
+                        -1,
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+
+    @override
+    def _verify_state_blocks(
+        self,
+        bs: int,
+        seq_lens: torch.Tensor,
+        draft_token_num: int,
+        block_tables: Mapping[str, torch.Tensor],
+        *,
+        pages_out: Mapping[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        committed, tables = super()._verify_state_blocks(
+            bs, seq_lens, draft_token_num, block_tables, pages_out=pages_out
+        )
+        if self._replay_commit_tables is not None and seq_lens.is_cuda:
+            rows = [tables[group] for group in self._replay_group_ids]
+            if any(
+                table.dtype != torch.int32 or table.stride(1) != 1 for table in rows
+            ):
+                raise ValueError(
+                    "KDA commit requires INT32 tables with contiguous columns"
+                )
+            signature = tuple(
+                (
+                    table.data_ptr(),
+                    table.stride(0),
+                    table.shape[1],
+                    pages_out[group].data_ptr(),
+                )
+                for group, table in zip(self._replay_group_ids, rows, strict=True)
+            )
+            if signature != self._replay_commit_table_signature:
+                self._replay_commit_tables.copy_(
+                    torch.tensor(
+                        signature,
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                )
+                self._replay_commit_table_signature = signature
+        if self._replay_record_metadata is not None and seq_lens.is_cuda:
+            from tokenspeed_kernel.ops.attention.kda.vllm_recoverssm import (
+                prepare_recoverssm_metadata,
+            )
+
+            self._replay_record_generation += 1
+            prepare_recoverssm_metadata(
+                committed,
+                self._replay_record_metadata,
+                batch=bs,
+                generation=self._replay_record_generation,
+            )
+        return committed, tables
+
+    @override
+    def _resolve_verify_commit_pages(
+        self, accepted_length: torch.Tensor, group_ids: Sequence[str]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._replay_commit_tables is None or not accepted_length.is_cuda:
+            return super()._resolve_verify_commit_pages(accepted_length, group_ids)
+        from tokenspeed_kernel.ops.attention.kda.triton import (
+            commit_state_groups,
+        )
+
+        if tuple(group_ids) != self._replay_group_ids:
+            raise ValueError(
+                "commit group order must match the prepared table descriptors"
+            )
+        assert self._replay_commit_reads is not None
+        assert self._replay_commit_pages is not None
+        assert self._replay_commit_steps is not None
+        committed, _, width, _ = self._verify_commit_ctx
+        batch = accepted_length.shape[0]
+        pages = self._replay_commit_pages[: len(group_ids) * batch].view(
+            len(group_ids), batch
+        )
+        steps = self._replay_commit_steps[:batch]
+        commit_state_groups(
+            accepted_length,
+            committed,
+            self._replay_commit_tables,
+            batch_size=batch,
+            draft_tokens=width,
+            granularity=self._checkpoint_granularity,
+            pages_out=pages,
+            reads_out=self._replay_commit_reads[: len(group_ids) * batch].view(
+                len(group_ids), batch
+            ),
+            steps_out=steps,
+        )
+        return pages, steps
 
     def _replay_payload(self, layer_id: int) -> tuple[torch.Tensor, ...]:
         """Return one layer's views in the shared descriptor order.
@@ -473,6 +601,16 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 draft_tokens = self.speculative_num_draft_tokens
 
                 def launch(read_indices, write_indices, accepted_length):
+                    record_args = {}
+                    if self._verify_split_producers:
+                        assert self._replay_record_metadata is not None
+                        assert self._replay_record_stamps is not None
+                        record_args = {
+                            "record_metadata": self._replay_record_metadata[
+                                : accepted_length.shape[0]
+                            ],
+                            "record_stamps": self._replay_record_stamps,
+                        }
                     self._batched_replay_kernel(
                         descriptors=descriptors,
                         group_indices=group_indices,
@@ -491,6 +629,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                         gate_stride=strides[5],
                         conv_width=conv_width,
                         lower_bound=next(iter(lower_bounds)),
+                        **record_args,
                     )
 
                 self._batched_replay_launch = launch
@@ -543,7 +682,21 @@ class KdaAttnBackend(CapacityPrefillBackend):
             else sum(pair[0].nbytes for pair in self._verify_scratch.values())
         )
         payload_bytes = sum(payload.nbytes for payload in (self._replay_payloads or ()))
-        return conv_bytes + payload_bytes
+        metadata_bytes = sum(
+            tensor.nbytes
+            for tensor in (
+                self._replay_descriptors,
+                self._replay_group_indices,
+                self._replay_commit_tables,
+                self._replay_commit_pages,
+                self._replay_commit_reads,
+                self._replay_commit_steps,
+                self._replay_record_metadata,
+                self._replay_record_stamps,
+            )
+            if tensor is not None
+        )
+        return conv_bytes + payload_bytes + metadata_bytes
 
     def _kda_gate(
         self,
@@ -792,7 +945,13 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 split_producers = {"g_raw": g_raw, "conv_qkv": conv_qkv}
                 # NVIDIA saves corrections and normalized key/decay records.
                 # Request rows, not pool block IDs, size the per-round cache.
+                assert self._replay_record_metadata is not None
+                assert self._replay_record_stamps is not None
                 replay_records = KdaReplayRecords(
+                    metadata=self._replay_record_metadata[:batch_size],
+                    stamps=self._replay_record_stamps[
+                        self._descriptor_row_by_layer[layer_id], :batch_size
+                    ],
                     correction=f_a[:rows, : heads * head_v_dim]
                     .view(batch_size, draft_token_num, heads, head_v_dim)
                     .transpose(1, 2),
@@ -978,12 +1137,18 @@ class KdaAttnBackend(CapacityPrefillBackend):
         rows = bs * draft_token_num
         if self._batched_replay_ready:
             self._batched_replay_launch(
-                torch.stack(
-                    [
-                        read_pages_by_group[group_id][:bs]
-                        for group_id in self._replay_group_ids
-                    ]
-                ).to(torch.int32),
+                (
+                    self._replay_commit_reads[: len(group_ids) * bs].view(
+                        len(group_ids), bs
+                    )
+                    if accepted_length.is_cuda and self._replay_commit_reads is not None
+                    else torch.stack(
+                        [
+                            read_pages_by_group[group_id][:bs]
+                            for group_id in self._replay_group_ids
+                        ]
+                    ).to(torch.int32)
+                ),
                 write_stack,
                 steps,
             )

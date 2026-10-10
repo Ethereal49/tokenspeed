@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from kda_replay_reference import batched_recurrent_kda_replay_commit
 
 if not torch.cuda.is_available():
     pytest.skip("requires an NVIDIA GPU", allow_module_level=True)
@@ -145,6 +146,8 @@ def test_vllm_recoverssm_verify_and_commit(width: int, accepted: int) -> None:
         replay_inputs=None,
         verify_decay=None,
         verify_qk=None,
+        record_metadata=None,
+        record_stamps=None,
     )
 
     num_accepted = torch.full((batch,), accepted, device=device, dtype=torch.int32)
@@ -167,6 +170,8 @@ def test_vllm_recoverssm_verify_and_commit(width: int, accepted: int) -> None:
         correction_cache_base_addrs=_device_addresses((correction_cache,)),
         kd_cache_base_addrs=_device_addresses((kd_cache,)),
         spec_query_len=width,
+        record_metadata=None,
+        record_stamps=None,
     )
     torch.cuda.synchronize()
 
@@ -190,8 +195,8 @@ def _recover_window(
     replay_inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     verify_decay: torch.Tensor,
     verify_qk: tuple[torch.Tensor, torch.Tensor],
-) -> torch.Tensor:
-    """Run the record producer and recovery on the same prepared inputs."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return output and actual producer records after current-window recovery."""
     batch, heads, dim, _ = state[1:].shape
     q, k, v = (
         value.reshape(1, batch * width, heads, dim) for value in qkv.chunk(3, dim=-1)
@@ -221,6 +226,8 @@ def _recover_window(
         replay_inputs=replay_inputs,
         verify_decay=verify_decay,
         verify_qk=verify_qk,
+        record_metadata=None,
+        record_stamps=None,
     )
     plan = tuple(torch.empty_like(indices) for _ in range(4))
     vllm_triton_kda_recoverssm_commit(
@@ -241,15 +248,23 @@ def _recover_window(
         correction_cache_base_addrs=_device_addresses((u,)),
         kd_cache_base_addrs=_device_addresses((kd,)),
         spec_query_len=width,
+        record_metadata=None,
+        record_stamps=None,
     )
-    return out
+    return out, u, kd
 
 
-@pytest.mark.parametrize("batch,width", [(4, 1), (4, 4), (16, 4)])
-def test_recoverssm_matches_main_producers_over_rounds(batch: int, width: int) -> None:
+@pytest.mark.parametrize(
+    "batch,width,capacity",
+    [(4, width, capacity) for width in (1, 4) for capacity in (8, 16, 32)]
+    + [(16, 4, 8)],
+)
+def test_recoverssm_matches_main_producers_over_rounds(
+    batch: int, width: int, capacity: int
+) -> None:
     """Compare against main's full-precision replay, not just rounded verify."""
     from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
-        batched_recurrent_kda_replay_commit,
+        batched_kda_commit_conv_window_kernel,
         fused_kda_verify_conv_update,
         fused_recurrent_kda_verify_megafuse,
     )
@@ -261,6 +276,8 @@ def test_recoverssm_matches_main_producers_over_rounds(batch: int, width: int) -
     raw = torch.randn(rows, 3 * channels, device=device, dtype=torch.bfloat16)
     conv_w = torch.randn(3 * channels, 4, device=device, dtype=torch.bfloat16) * 0.3
     conv = torch.randn(batch + 1, 3 * channels, 3, device=device, dtype=torch.bfloat16)
+    candidate_conv_state = conv.clone()
+    captured_raw = torch.empty_like(raw)
     fa = torch.randn(rows, dim, device=device, dtype=torch.bfloat16)
     fb = torch.randn(channels, dim, device=device, dtype=torch.bfloat16) * 0.05
     beta = torch.randn(rows, heads, device=device, dtype=torch.bfloat16)
@@ -268,12 +285,31 @@ def test_recoverssm_matches_main_producers_over_rounds(batch: int, width: int) -
     bias = torch.randn(heads, dim, device=device) * 0.1
     main_state = torch.randn(batch + 1, heads, dim, dim, device=device) * 0.02
     candidate_state = main_state.clone()
+    checkpoint = candidate_state.clone()
+    # The actual producer and recovery address the same stamped ring directly.
+    # Batch rows intentionally differ from physical record slots.
+    history_u = torch.full((batch, heads, capacity, dim), float("nan"), device=device)
+    history_kd = torch.full(
+        (batch, heads, capacity, 2 * dim), float("nan"), device=device
+    )
+    stamps = torch.full((batch, capacity, 2), -1, dtype=torch.int64, device=device)
+    slots = [(request + 1) % batch for request in range(batch)]
+    generations = [1] * batch
+    checkpoint_positions = [
+        capacity - 1 - request % (capacity // 2) for request in range(batch)
+    ]
+    endpoints = checkpoint_positions.copy()
+    resets = [0] * batch
+    wraps = [0] * batch
     gate_scratch = torch.empty(rows, channels, device=device)
     indices = torch.arange(1, batch + 1, device=device, dtype=torch.int32)
     groups = torch.zeros(1, device=device, dtype=torch.int32)
     descriptors = _device_addresses(
         (raw, conv_w, conv, fa, fb, beta, A, bias, main_state, gate_scratch)
     ).reshape(1, 10)
+    candidate_descriptors = descriptors.clone()
+    candidate_descriptors[:, 0] = captured_raw.data_ptr()
+    candidate_descriptors[:, 2] = candidate_conv_state.data_ptr()
     scratch_indices = torch.arange(rows, device=device, dtype=torch.int32).view(
         batch, width
     )
@@ -285,9 +321,30 @@ def test_recoverssm_matches_main_producers_over_rounds(batch: int, width: int) -
         raw.normal_()
         fa.normal_()
         beta.normal_()
-        accepted = (
-            torch.arange(batch, device=device, dtype=torch.int32) + step
-        ) % width + 1
+        accepted_cpu = [(request + step) % (width + 1) for request in range(batch)]
+        accepted = torch.tensor(accepted_cpu, device=device, dtype=torch.int32)
+        if step and step % 43 == 0:
+            # Reassign the physical slots to new requests. Keep stale storage;
+            # new generations and positions must exclude the previous owners.
+            slots = [(slot + 1) % batch for slot in slots]
+            seed = torch.randn_like(main_state) * 0.02
+            main_state.copy_(seed)
+            candidate_state.copy_(seed)
+            checkpoint.copy_(seed)
+            conv.normal_()
+            candidate_conv_state.copy_(conv)
+            checkpoint_positions = [
+                capacity - 1 - request % (capacity // 2) for request in range(batch)
+            ]
+            endpoints = checkpoint_positions.copy()
+            generations = [generation + 1 for generation in generations]
+        for request, count in enumerate(accepted_cpu):
+            retained = endpoints[request] - checkpoint_positions[request]
+            if retained + width > capacity or step % 17 == 0:
+                checkpoint[request + 1].copy_(candidate_state[request + 1])
+                checkpoint_positions[request] = endpoints[request]
+                generations[request] += 1
+                resets[request] += 1
         conv_qkv = fused_kda_verify_conv_update(
             raw,
             conv_w,
@@ -330,9 +387,9 @@ def test_recoverssm_matches_main_producers_over_rounds(batch: int, width: int) -
         )
         candidate_conv, replay_key, replay_value, verify_qk = prepare_recoverssm_conv(
             raw,
-            torch.empty_like(raw),
+            captured_raw,
             conv_w,
-            conv,
+            candidate_conv_state,
             indices,
             num_heads=heads,
             head_dim=dim,
@@ -349,19 +406,36 @@ def test_recoverssm_matches_main_producers_over_rounds(batch: int, width: int) -
         )
         record_inputs = (replay_key, replay_value, replay_gate)
         torch.testing.assert_close(candidate_conv, conv_qkv, atol=0, rtol=0)
-        out = _recover_window(
-            candidate_conv,
-            candidate_gate,
-            beta,
+        q, k, v = (
+            part.reshape(1, rows, heads, dim)
+            for part in candidate_conv.chunk(3, dim=-1)
+        )
+        record_metadata = torch.tensor(
+            list(zip(slots, generations, endpoints)), dtype=torch.int64, device=device
+        )
+        out = torch.empty_like(v)
+        vllm_triton_kda_recoverssm_verify(
+            q,
+            k,
+            v,
+            candidate_gate.reshape_as(q),
+            beta.reshape(1, rows, heads),
             A,
             bias,
-            candidate_state,
-            indices,
-            accepted,
-            width,
-            record_inputs,
-            verify_decay,
-            verify_qk,
+            checkpoint_state=candidate_state,
+            correction_cache=history_u,
+            kd_cache=history_kd,
+            query_start_loc=torch.arange(batch + 1, device=device, dtype=torch.int32)
+            * width,
+            state_indices=indices,
+            spec_query_len=width,
+            lower_bound=-5.0,
+            out=out,
+            replay_inputs=record_inputs,
+            verify_decay=verify_decay,
+            verify_qk=verify_qk,
+            record_metadata=record_metadata,
+            record_stamps=stamps,
         )
         batched_recurrent_kda_replay_commit(
             descriptors,
@@ -382,6 +456,82 @@ def test_recoverssm_matches_main_producers_over_rounds(batch: int, width: int) -
             conv_width=4,
             lower_bound=-5.0,
         )
+        batched_kda_commit_conv_window_kernel[(1, batch, (3 * channels + 127) // 128)](
+            candidate_descriptors,
+            groups,
+            indices[None],
+            indices[None],
+            accepted,
+            batch,
+            T=width,
+            STRIDE_QKV=captured_raw.stride(0),
+            STRIDE_CONV=candidate_conv_state.stride(0),
+            CONV_DIM=3 * channels,
+            BLOCK=128,
+            num_warps=1,
+        )
+        torch.testing.assert_close(candidate_conv_state, conv, atol=0, rtol=0)
+        for request, count in enumerate(accepted_cpu):
+            slot = slots[request]
+            # Rejected payloads remain stamped candidates but must never enter
+            # the accepted interval. NaNs expose any accidental recovery read.
+            for token in range(count, width):
+                row = (endpoints[request] + token) % capacity
+                history_u[slot, :, row].fill_(float("nan"))
+                history_kd[slot, :, row].fill_(float("nan"))
+            for token in range(count):
+                position = endpoints[request] + token
+                row = position % capacity
+                torch.testing.assert_close(
+                    stamps[slot, row],
+                    torch.tensor(
+                        [position, generations[request]],
+                        device=device,
+                        dtype=torch.int64,
+                    ),
+                    atol=0,
+                    rtol=0,
+                )
+                wraps[request] += int(row == 0)
+            endpoints[request] += count
+        retained_cpu = [
+            endpoints[request] - checkpoint_positions[request]
+            for request in range(batch)
+        ]
+        recovery_metadata = torch.tensor(
+            list(zip(slots, generations, checkpoint_positions)),
+            dtype=torch.int64,
+            device=device,
+        )
+        reconstructed = checkpoint.clone()
+        plan = tuple(torch.empty_like(indices) for _ in range(4))
+        vllm_triton_kda_recoverssm_commit(
+            candidate_conv,
+            candidate_conv,
+            candidate_conv,
+            checkpoint_state=reconstructed,
+            correction_cache=history_u,
+            kd_cache=history_kd,
+            state_indices=indices,
+            query_start_loc=torch.arange(batch + 1, device=device, dtype=torch.int32)
+            * capacity,
+            num_accepted_tokens=torch.tensor(
+                retained_cpu, device=device, dtype=torch.int32
+            ),
+            commit_lens=plan[0],
+            final_state_indices=plan[1],
+            boundary_state_indices=plan[2],
+            boundary_recovery_lens=plan[3],
+            state_base_addrs=_device_addresses((reconstructed,)),
+            correction_cache_base_addrs=_device_addresses((history_u,)),
+            kd_cache_base_addrs=_device_addresses((history_kd,)),
+            spec_query_len=capacity,
+            record_metadata=recovery_metadata,
+            record_stamps=stamps,
+        )
+        # Feed the reconstructed endpoint to the next actual verify producer;
+        # neither the main oracle nor current-window recovery seeds that round.
+        candidate_state.copy_(reconstructed)
         largest_output_error = max(
             largest_output_error,
             (out.reshape_as(expected_out).float() - expected_out.float())
@@ -398,8 +548,10 @@ def test_recoverssm_matches_main_producers_over_rounds(batch: int, width: int) -
         torch.testing.assert_close(candidate_state, main_state, atol=1e-5, rtol=1e-3)
         squared_state_error += (candidate_state - main_state).square().sum().item()
         state_elements += main_state.numel()
+    assert all(count > 1 for count in resets)
+    assert all(count > 1 for count in wraps)
     print(
-        f"B={batch} T={width}: max output error={largest_output_error:.8g}, max state error={largest_state_error:.8g}, state RMS={(squared_state_error / state_elements)**0.5:.8g}"
+        f"B={batch} T={width} R={capacity}: max output error={largest_output_error:.8g}, max state error={largest_state_error:.8g}, state RMS={(squared_state_error / state_elements)**0.5:.8g}"
     )
 
 
@@ -445,6 +597,8 @@ def test_record_chain_does_not_read_rounded_verify_inputs() -> None:
             replay_inputs=replay_inputs,
             verify_decay=None,
             verify_qk=None,
+            record_metadata=None,
+            record_stamps=None,
         )
         results.append((out, u, kd))
     assert not torch.equal(results[0][0], results[1][0])
@@ -555,6 +709,10 @@ def test_recoverssm_ragged_prefix_and_null_rows(separate_records: bool) -> None:
     u = torch.full((batch, heads, width, dim), float("nan"), device="cuda")
     kd = torch.full((batch, heads, width, 2 * dim), float("nan"), device="cuda")
     out = torch.full_like(v, float("nan"))
+    metadata = torch.zeros(batch, 3, dtype=torch.int64, device="cuda")
+    metadata[:, 0] = torch.arange(batch, device="cuda")
+    metadata[:, 1] = 1
+    stamps = torch.full((batch, width, 2), -1, dtype=torch.int64, device="cuda")
     if separate_records:
         record_k = k.float() / torch.sqrt(
             k.float().square().sum(-1, keepdim=True) + 1e-6
@@ -590,6 +748,8 @@ def test_recoverssm_ragged_prefix_and_null_rows(separate_records: bool) -> None:
         replay_inputs=replay_inputs,
         verify_decay=None,
         verify_qk=None,
+        record_metadata=metadata,
+        record_stamps=stamps,
     )
     torch.testing.assert_close(state, initial, atol=0, rtol=0)
     for request, length in enumerate(lengths):
@@ -637,6 +797,15 @@ def test_recoverssm_ragged_prefix_and_null_rows(separate_records: bool) -> None:
                     current = current + correction[:, :, None] * key[:, None, :]
         assert torch.isnan(u[request, :, valid:]).all()
         assert torch.isnan(kd[request, :, valid:]).all()
+        assert (stamps[request, valid:] == -1).all()
+        if valid:
+            torch.testing.assert_close(
+                stamps[request, :valid, 0],
+                torch.arange(valid, device="cuda", dtype=torch.int64),
+                atol=0,
+                rtol=0,
+            )
+            assert (stamps[request, :valid, 1] == 1).all()
 
 
 @pytest.mark.parametrize("captured", [False, True])
@@ -676,6 +845,13 @@ def test_batched_recoverssm_commit_groups_alias_and_padding(captured: bool) -> N
     kd[:, :, : 2 * channels].view(layers, batch * width, heads, 2, dim)[
         :, :, :, 1
     ].sigmoid_()
+    metadata = torch.tensor(
+        [[request, 7, 0] for request in range(batch)], device="cuda", dtype=torch.int64
+    )
+    stamps = torch.empty(layers, batch, width, 2, device="cuda", dtype=torch.int64)
+    stamps[..., 0] = torch.arange(width, device="cuda")
+    stamps[..., 1] = 7
+    stamps[:, -1].fill_(-1)
     seed_state, seed_conv = states.clone(), conv.clone()
     expected_state, expected_conv = states.clone(), conv.clone()
     descriptors = torch.zeros(layers, 10, device="cuda", dtype=torch.int64)
@@ -722,6 +898,8 @@ def test_batched_recoverssm_commit_groups_alias_and_padding(captured: bool) -> N
             key_decay_stride=kd.stride(1),
             state_stride=states.stride(1),
             conv_width=4,
+            record_metadata=metadata,
+            record_stamps=stamps,
         )
 
     launch()
@@ -746,3 +924,131 @@ def test_batched_recoverssm_commit_groups_alias_and_padding(captured: bool) -> N
         conv = torch.empty_like(conv)
         descriptors[:, 8] = _device_addresses(tuple(states.unbind()))
         descriptors[:, 2] = _device_addresses(tuple(conv.unbind()))
+
+
+@pytest.mark.parametrize("batch", [1, 7, 33])
+def test_commit_state_groups_strides_boundaries_and_graph(batch: int) -> None:
+    from tokenspeed_kernel.ops.attention.kda.triton import commit_state_groups
+
+    tables = [
+        torch.arange(batch * (columns + 3), device="cuda", dtype=torch.int32).view(
+            batch, columns + 3
+        )[:, :columns]
+        + group * 1000
+        for group, columns in enumerate((1, 3, 5))
+    ]
+    # Retain non-contiguous row strides in the actual source tables.
+    tables = [torch.nn.functional.pad(table, (0, 2))[:, :-2] for table in tables]
+    sources = [
+        torch.arange(batch, device="cuda", dtype=torch.int32) + group * 100
+        for group in range(3)
+    ]
+    descriptors = torch.tensor(
+        [
+            (table.data_ptr(), table.stride(0), table.shape[1], source.data_ptr())
+            for table, source in zip(tables, sources, strict=True)
+        ],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    committed = torch.arange(batch, device="cuda", dtype=torch.int64) * 127 + 126
+    accepted = torch.arange(batch, device="cuda", dtype=torch.int32) % 6
+    pages = torch.empty((3, batch), device="cuda", dtype=torch.int32)
+    reads = torch.empty_like(pages)
+    steps = torch.empty(batch, device="cuda", dtype=torch.int32)
+
+    def launch() -> None:
+        commit_state_groups(
+            accepted,
+            committed,
+            descriptors,
+            batch_size=batch,
+            draft_tokens=4,
+            granularity=128,
+            pages_out=pages,
+            reads_out=reads,
+            steps_out=steps,
+        )
+
+    launch()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    for iteration in range(2):
+        if iteration:
+            accepted.add_(1)
+            for source in sources:
+                source.add_(7)
+            committed.add_(128)
+            tables[1].add_(23)
+        graph.replay()
+        torch.testing.assert_close(reads, torch.stack(sources), atol=0, rtol=0)
+        expected_steps = accepted.clamp(1, 4)
+        torch.testing.assert_close(steps, expected_steps, atol=0, rtol=0)
+        for group, table in enumerate(tables):
+            slots = ((committed + expected_steps - 1) // 128).clamp(
+                0, table.shape[1] - 1
+            )
+            expected = table.gather(1, slots[:, None]).squeeze(1)
+            torch.testing.assert_close(pages[group], expected, atol=0, rtol=0)
+
+
+def _run_invalid_record_recovery(field: str) -> None:
+    """Run in a child process because a device assertion destroys its context."""
+    dim, capacity = 128, 4
+    state = torch.zeros(2, 1, dim, dim, device="cuda")
+    correction = torch.zeros(1, 1, capacity, dim, device="cuda")
+    kd = torch.ones(1, 1, capacity, 2 * dim, device="cuda")
+    indices = torch.ones(1, device="cuda", dtype=torch.int32)
+    metadata = torch.tensor([[0, 7, 11]], device="cuda", dtype=torch.int64)
+    stamps = torch.full((1, capacity, 2), -1, device="cuda", dtype=torch.int64)
+    stamps[0, 3] = torch.tensor([11, 7], device="cuda")
+    if field == "generation":
+        stamps[0, 3, 1] = 6
+    elif field == "position":
+        stamps[0, 3, 0] = 7
+    else:
+        metadata[0, 0] = 1
+    plan = tuple(torch.empty_like(indices) for _ in range(4))
+    vllm_triton_kda_recoverssm_commit(
+        correction,
+        correction,
+        correction,
+        checkpoint_state=state,
+        correction_cache=correction,
+        kd_cache=kd,
+        state_indices=indices,
+        query_start_loc=torch.tensor([0, capacity], device="cuda", dtype=torch.int32),
+        num_accepted_tokens=indices,
+        commit_lens=plan[0],
+        final_state_indices=plan[1],
+        boundary_state_indices=plan[2],
+        boundary_recovery_lens=plan[3],
+        state_base_addrs=_device_addresses((state,)),
+        correction_cache_base_addrs=_device_addresses((correction,)),
+        kd_cache_base_addrs=_device_addresses((kd,)),
+        spec_query_len=capacity,
+        record_metadata=metadata,
+        record_stamps=stamps,
+    )
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("field", ["generation", "position", "slot"])
+def test_recoverssm_rejects_invalid_records(field: str) -> None:
+    import subprocess
+    import sys
+
+    code = (
+        "import runpy; "
+        f"runpy.run_path({__file__!r})['_run_invalid_record_recovery']({field!r})"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode != 0, "invalid records must fail before state publication"
+    expected = "invalid replay interval" if field == "slot" else "stale replay record"
+    assert expected in result.stderr, result.stderr
