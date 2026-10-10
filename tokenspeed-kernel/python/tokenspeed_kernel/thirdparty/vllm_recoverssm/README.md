@@ -26,14 +26,21 @@ CTAs consume these values in one launch, so each CTA holds one state tile.
 This preserves the two precision chains and avoids repeated transforms for
 each value tile.
 
-Verify uses an explicit Triton Gluon layout: four value rows share a warp,
-with eight lanes per key reduction. Token updates stay ordered FP32 CUDA-core
-operations. This changes the within-token reduction tree; it does not promise
-bitwise equality with main. The strict state and output tolerances are unchanged.
-The launch uses one warp and batch-bucketed value tiles. Fixed model-layout
-strides specialize address arithmetic; request-dependent group pitches remain
-runtime values. Exact request counts do not create new binaries within the
-same launch bucket.
+Verify and replay use explicit Triton Gluon layouts that retain main's
+respective reduction trees. Small-batch verify preserves cross-warp Q/K
+normalization. Replay preserves the fused local projection pairs and computes
+correction with a fused SiLU multiplication and subtraction. The convolution
+producer passes pre-SiLU FP32 V to avoid an extra rounding boundary. The BF16
+verify gate uses main's linear projection. Replay gate tiling includes the
+full recurrent-layer count. Token updates remain ordered FP32 CUDA-core
+operations. Compositional tests require exact accepted state. Verify output and
+independent scalar-reference tolerances remain unchanged. Full-model equality
+and performance are separate acceptance gates.
+
+The launch uses four warps below batch four and one warp otherwise, with
+batch-bucketed value tiles. Fixed model-layout strides specialize address
+arithmetic; request-dependent group pitches remain runtime values. Exact
+request counts do not create new binaries within the same launch bucket.
 
 Invalid tokens form a suffix in each request. Output and record stores mask
 that suffix. Verify does not write the input checkpoint, so it need not retain

@@ -257,7 +257,7 @@ def _recover_window(
 @pytest.mark.parametrize(
     "batch,width,capacity",
     [(4, width, capacity) for width in (1, 4) for capacity in (8, 16, 32)]
-    + [(16, 4, 8)],
+    + [(batch, 4, 8) for batch in (1, 2, 3, 8, 16, 32)],
 )
 def test_recoverssm_matches_main_producers_over_rounds(
     batch: int, width: int, capacity: int
@@ -401,6 +401,7 @@ def test_recoverssm_matches_main_producers_over_rounds(
             A,
             bias,
             num_heads=heads,
+            num_layers=1,
             head_dim=dim,
             lower_bound=-5.0,
         )
@@ -545,7 +546,7 @@ def test_recoverssm_matches_main_producers_over_rounds(
         torch.testing.assert_close(
             out.reshape_as(expected_out), expected_out, atol=2e-2, rtol=2e-2
         )
-        torch.testing.assert_close(candidate_state, main_state, atol=1e-5, rtol=1e-3)
+        torch.testing.assert_close(candidate_state, main_state, atol=0, rtol=0)
         squared_state_error += (candidate_state - main_state).square().sum().item()
         state_elements += main_state.numel()
     assert all(count > 1 for count in resets)
@@ -630,7 +631,14 @@ def test_recoverssm_reuses_compilation_within_launch_buckets() -> None:
     def gate(rows: int):
         fa = torch.randn(rows, dim, device="cuda", dtype=torch.bfloat16)
         return prepare_recoverssm_gate(
-            fa, fb, A, bias, num_heads=heads, head_dim=dim, lower_bound=-5.0
+            fa,
+            fb,
+            A,
+            bias,
+            num_heads=heads,
+            num_layers=1,
+            head_dim=dim,
+            lower_bound=-5.0,
         )
 
     def run(batch: int) -> None:
@@ -720,6 +728,7 @@ def test_recoverssm_ragged_prefix_and_null_rows(separate_records: bool) -> None:
         record_v = v.float() * 1.25
         record_d = torch.rand(shape, device="cuda")
         replay_inputs = (record_k, record_v, record_d)
+        record_v = torch.nn.functional.silu(record_v)
     else:
         record_k = k.float() * torch.rsqrt(
             k.float().square().sum(-1, keepdim=True) + 1e-6
@@ -1058,3 +1067,78 @@ def test_recoverssm_rejects_invalid_records(field: str) -> None:
     assert result.returncode != 0, "invalid records must fail before state publication"
     expected = "invalid replay interval" if field == "slot" else "stale replay record"
     assert expected in result.stderr, result.stderr
+
+
+@pytest.mark.parametrize("rows", [4, 8, 12, 16, 64])
+@pytest.mark.parametrize("layers", [1, 69])
+def test_recoverssm_gate_matches_all_layer_tiling(rows: int, layers: int) -> None:
+    """Per-layer records retain the all-layer main gate reduction geometry."""
+    from kda_replay_reference import (
+        batched_kda_gate_precompute_dot_kernel,
+        batched_kda_gate_precompute_kernel,
+    )
+    from tokenspeed_kernel._triton import tl, triton
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
+        _gate_tiling,
+        _gate_tiling_dot,
+    )
+
+    @triton.jit
+    def decay_reference(log_gate, decay, N: tl.constexpr, BLOCK: tl.constexpr):
+        offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        value = tl.load(log_gate + offset, mask=offset < N, other=0)
+        tl.store(decay + offset, tl.exp(value), mask=offset < N)
+
+    torch.manual_seed(1573)
+    heads, dim = 12, 128
+    channels = heads * dim
+    fa = torch.randn(rows, dim, device="cuda", dtype=torch.bfloat16)
+    fb = torch.randn(channels, dim, device="cuda", dtype=torch.bfloat16) * 0.05
+    A = torch.randn(heads, device="cuda") * 0.1
+    bias = torch.randn(channels, device="cuda") * 0.1
+    logs = torch.empty(layers, rows, channels, device="cuda")
+    addresses = torch.zeros(layers, 10, device="cuda", dtype=torch.int64)
+    addresses[:, 3] = fa.data_ptr()
+    addresses[:, 4] = fb.data_ptr()
+    addresses[:, 6] = A.data_ptr()
+    addresses[:, 7] = bias.data_ptr()
+    addresses[:, 9] = _device_addresses(tuple(logs.unbind()))
+    bt, bk = (
+        _gate_tiling_dot(rows, dim)
+        if rows >= 16
+        else _gate_tiling(rows, heads, dim, fa.device, layers=layers)
+    )
+    kernel = (
+        batched_kda_gate_precompute_dot_kernel
+        if rows >= 16
+        else batched_kda_gate_precompute_kernel
+    )
+    kernel[(layers * heads, triton.cdiv(rows, bt), triton.cdiv(dim, bk))](
+        addresses,
+        rows,
+        stride_fa=fa.stride(0),
+        stride_gate=channels,
+        lower_bound=-5.0,
+        HV=heads,
+        K=dim,
+        D_FA=dim,
+        BK=bk,
+        BT=bt,
+        num_warps=1 if bt >= 4 else 2,
+    )
+    expected = torch.empty_like(logs[0])
+    decay_reference[(triton.cdiv(expected.numel(), 256),)](
+        logs[0], expected, N=expected.numel(), BLOCK=256
+    )
+    raw, actual, _ = prepare_recoverssm_gate(
+        fa,
+        fb,
+        A,
+        bias,
+        num_heads=heads,
+        num_layers=layers,
+        head_dim=dim,
+        lower_bound=-5.0,
+    )
+    torch.testing.assert_close(raw, torch.nn.functional.linear(fa, fb), atol=0, rtol=0)
+    torch.testing.assert_close(actual.reshape_as(expected), expected, atol=0, rtol=0)

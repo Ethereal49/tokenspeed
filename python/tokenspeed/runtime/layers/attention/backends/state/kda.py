@@ -924,6 +924,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                             A_log,
                             dt_bias,
                             num_heads=heads,
+                            num_layers=len(self._descriptor_row_by_layer),
                             head_dim=head_v_dim,
                             lower_bound=lower_bound,
                         )

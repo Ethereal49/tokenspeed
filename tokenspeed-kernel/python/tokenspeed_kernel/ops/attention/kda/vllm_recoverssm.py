@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel._triton import gl, gluon, tl, triton
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -85,7 +85,7 @@ def vllm_triton_kda_recoverssm_verify(
     correction_cache and kd_cache are request/head/token/channel FP32
     destinations. The latter stores normalized K followed by decay.
 
-    replay_inputs provides independent FP32 normalized K, convolved V and
+    replay_inputs provides independent FP32 normalized K, pre-SiLU convolution V and
     multiplicative decay. None records the verify chain instead.
     verify_qk optionally supplies FP32 normalized/scaled Q and normalized K.
     verify_decay optionally supplies FP32 decay after BF16 gate rounding.
@@ -452,7 +452,7 @@ def batched_recoverssm_commit(
     )
 
 
-@triton.jit
+@gluon.jit
 def _replay_conv_inputs_kernel(
     raw,
     weights,
@@ -462,77 +462,90 @@ def _replay_conv_inputs_kernel(
     verify_output,
     verify_qk,
     captured_raw,
-    stride_raw: tl.constexpr,
-    stride_pool: tl.constexpr,
-    stride_capture: tl.constexpr,
-    T: tl.constexpr,
-    P: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    BLOCK: tl.constexpr,
+    stride_raw: gl.constexpr,
+    stride_pool: gl.constexpr,
+    stride_capture: gl.constexpr,
+    T: gl.constexpr,
+    P: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    BLOCK: gl.constexpr,
+    VERIFY_SMALL: gl.constexpr,
 ):
-    row = tl.program_id(0)
-    channel = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    row = gl.program_id(0)
+    layout: gl.constexpr = gl.BlockedLayout([4], [32], [gl.num_warps()], [0])
+    channel = gl.program_id(1) * BLOCK + gl.arange(0, BLOCK, layout=layout)
     request, position = row // T, row % T
-    page = tl.load(read_indices + request).to(tl.int64)
+    page = gl.load(read_indices + request).to(gl.int64)
     mask = channel < 3 * P
     feature = channel
-    current = tl.load(raw + row * stride_raw + feature, mask=mask, other=0).to(
-        tl.float32
+    current = gl.load(raw + row * stride_raw + feature, mask=mask, other=0).to(
+        gl.float32
     )
-    weight = tl.load(weights + feature * 4 + 3, mask=mask, other=0).to(tl.float32)
+    weight = gl.load(weights + feature * 4 + 3, mask=mask, other=0).to(gl.float32)
     # Match _kda_window_step: current tap first, then taps 0, 1, 2.
     current_term = current * weight
     acc = current_term
-    verify_acc = tl.full((BLOCK,), 0.0, tl.float32)
-    for tap in tl.static_range(3):
+    verify_acc = gl.full((BLOCK,), 0.0, gl.float32, layout=layout)
+    for tap in gl.static_range(3):
         offset = position + tap
         from_raw = offset >= 3
-        history = tl.load(
-            pool + tl.maximum(page, 0) * stride_pool + feature * 3 + offset,
+        history = gl.load(
+            pool + gl.maximum(page, 0) * stride_pool + feature * 3 + offset,
             mask=mask & ~from_raw & (page >= 0),
             other=0,
-        ).to(tl.float32)
-        candidate = tl.load(
+        ).to(gl.float32)
+        candidate = gl.load(
             raw + (request * T + offset - 3) * stride_raw + feature,
             mask=mask & from_raw,
             other=0,
-        ).to(tl.float32)
-        weight = tl.load(weights + feature * 4 + tap, mask=mask, other=0).to(tl.float32)
-        value = tl.where(from_raw, candidate, history)
-        acc += value * weight
+        ).to(gl.float32)
+        weight = gl.load(weights + feature * 4 + tap, mask=mask, other=0).to(gl.float32)
+        value = gl.where(from_raw, candidate, history)
+        acc = gl.fma(value, weight, acc)
         verify_acc += value * weight
-    verify_acc += current * tl.load(weights + feature * 4 + 3, mask=mask, other=0).to(
-        tl.float32
+    verify_acc += current * gl.load(weights + feature * 4 + 3, mask=mask, other=0).to(
+        gl.float32
     )
-    tl.store(
+    gl.store(
         verify_output + row * (3 * P) + channel,
-        verify_acc * tl.sigmoid(verify_acc),
+        verify_acc * (1.0 / (1.0 + gl.exp(-verify_acc))),
         mask=mask,
     )
     # Match main's BF16 producer boundary before FP32 normalization.
     rounded_verify = (
-        (verify_acc * tl.sigmoid(verify_acc)).to(raw.dtype.element_ty).to(tl.float32)
+        (verify_acc * (1.0 / (1.0 + gl.exp(-verify_acc))))
+        .to(raw.dtype.element_ty)
+        .to(gl.float32)
     )
     verify_heads = rounded_verify.reshape((BLOCK // HEAD_DIM, HEAD_DIM))
-    normalized_verify = verify_heads / tl.sqrt(
-        tl.sum(verify_heads * verify_heads, axis=1)[:, None] + 1e-6
+    if VERIFY_SMALL:
+        verify_heads = gl.convert_layout(
+            verify_heads, gl.BlockedLayout([1, 1], [1, 32], [1, gl.num_warps()], [1, 0])
+        )
+    normalized_verify = verify_heads / gl.sqrt(
+        gl.sum(verify_heads * verify_heads, axis=1)[:, None] + 1e-6
     )
-    normalized_verify = normalized_verify.reshape((BLOCK,))
-    normalized_verify = tl.where(
+    normalized_verify = gl.convert_layout(normalized_verify.reshape((BLOCK,)), layout)
+    normalized_verify = gl.where(
         feature < P, normalized_verify * HEAD_DIM**-0.5, normalized_verify
     )
-    tl.store(
+    gl.store(
         verify_qk + row * (2 * P) + feature,
         normalized_verify,
         mask=mask & (feature < 2 * P),
     )
-    tl.store(captured_raw + row * stride_capture + channel, current, mask=mask)
-    activated = acc * tl.sigmoid(acc)
-    per_head = activated.reshape((BLOCK // HEAD_DIM, HEAD_DIM))
-    normalized = per_head / tl.sqrt(tl.sum(per_head * per_head, axis=1)[:, None] + 1e-6)
-    # Record production needs normalized K, but the original convolved V.
-    replay_input = tl.where(feature < 2 * P, normalized.reshape((BLOCK,)), activated)
-    tl.store(
+    gl.store(captured_raw + row * stride_capture + channel, current, mask=mask)
+    activated = acc * (1.0 / (1.0 + gl.exp(-acc)))
+    per_head = gl.convert_layout(
+        activated.reshape((BLOCK // HEAD_DIM, HEAD_DIM)),
+        gl.BlockedLayout([1, 1], [1, 32], [gl.num_warps(), 1], [1, 0]),
+    )
+    normalized = per_head / gl.sqrt(gl.sum(per_head * per_head, axis=1)[:, None] + 1e-6)
+    # Keep pre-SiLU V so record production can fuse SiLU with correction.
+    replay_input = gl.where(
+        feature < 2 * P, gl.convert_layout(normalized.reshape((BLOCK,)), layout), acc
+    )
+    gl.store(
         output + row * (2 * P) + feature - P,
         replay_input,
         mask=mask & (feature >= P),
@@ -555,7 +568,6 @@ def _recoverssm_gate_inputs_kernel(
     DFA: tl.constexpr,
     BT: tl.constexpr,
     BK: tl.constexpr,
-    DOT: tl.constexpr,
     LOWER: tl.constexpr,
 ):
     head, tile, column_tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -567,72 +579,106 @@ def _recoverssm_gate_inputs_kernel(
     )
     a = tl.exp(tl.load(a_log + head).to(tl.float32))
     dt = tl.load(bias + channel, mask=key < K, other=0).to(tl.float32)
-    if DOT:
-        rows = tile * BT + tl.arange(0, BT)
-        values = tl.load(
-            fa + rows[:, None] * stride_fa + reduction[None, :],
-            mask=rows[:, None] < ROWS,
-            other=0,
-        )
-        gate = tl.dot(values, tl.trans(weights))
-        tl.store(
+    rows = tile * BT + tl.arange(0, BT)
+    values = tl.load(
+        fa + rows[:, None] * stride_fa + reduction[None, :],
+        mask=rows[:, None] < ROWS,
+        other=0,
+    )
+    gate = tl.dot(values, tl.trans(weights))
+    rounded = (
+        tl.load(
             raw_gate + rows[:, None] * H * K + channel[None, :],
-            gate,
             mask=(rows[:, None] < ROWS) & (key[None, :] < K),
-        )
-        rounded = gate.to(raw_gate.dtype.element_ty).to(tl.float32) + dt[None, :]
-        if LOWER is not None:
-            verify_log = LOWER * tl.sigmoid(a * rounded)
-        else:
-            verify_log = -a * tl.where(
-                rounded > 20.0, rounded, tl.log(1.0 + tl.exp(rounded))
-            )
-        tl.store(
-            verify_decay + rows[:, None] * H * K + channel[None, :],
-            tl.exp(verify_log),
-            mask=(rows[:, None] < ROWS) & (key[None, :] < K),
-        )
-        biased = gate + dt[None, :]
-        if LOWER is not None:
-            log_decay = LOWER * tl.sigmoid(a * biased)
-        else:
-            log_decay = -a * tl.where(
-                biased < 20.0, tl.log(1.0 + tl.exp(biased)), biased
-            )
-        tl.store(
-            replay_gate + rows[:, None] * H * K + channel[None, :],
-            tl.exp(log_decay),
-            mask=(rows[:, None] < ROWS) & (key[None, :] < K),
-        )
+            other=0,
+        ).to(tl.float32)
+        + dt[None, :]
+    )
+    if LOWER is not None:
+        verify_log = LOWER * tl.sigmoid(a * rounded)
     else:
-        for index in range(BT):
-            row = tile * BT + index
-            if row < ROWS:
-                values = tl.load(fa + row * stride_fa + reduction).to(tl.float32)
-                gate = tl.sum(weights.to(tl.float32) * values[None, :], axis=1)
-                tl.store(raw_gate + row * H * K + channel, gate, mask=key < K)
-                rounded = gate.to(raw_gate.dtype.element_ty).to(tl.float32) + dt
-                if LOWER is not None:
-                    verify_log = LOWER * tl.sigmoid(a * rounded)
-                else:
-                    verify_log = -a * tl.where(
-                        rounded > 20.0, rounded, tl.log(1.0 + tl.exp(rounded))
-                    )
-                tl.store(
-                    verify_decay + row * H * K + channel,
-                    tl.exp(verify_log),
-                    mask=key < K,
+        verify_log = -a * tl.where(
+            rounded > 20.0, rounded, tl.log(1.0 + tl.exp(rounded))
+        )
+    tl.store(
+        verify_decay + rows[:, None] * H * K + channel[None, :],
+        tl.exp(verify_log),
+        mask=(rows[:, None] < ROWS) & (key[None, :] < K),
+    )
+    biased = gate + dt[None, :]
+    if LOWER is not None:
+        log_decay = LOWER * tl.sigmoid(a * biased)
+    else:
+        log_decay = -a * tl.where(biased < 20.0, tl.log(1.0 + tl.exp(biased)), biased)
+    tl.store(
+        replay_gate + rows[:, None] * H * K + channel[None, :],
+        tl.exp(log_decay),
+        mask=(rows[:, None] < ROWS) & (key[None, :] < K),
+    )
+
+
+@gluon.jit(do_not_specialize=["ROWS"])
+def _recoverssm_gate_scalar_kernel(
+    fa,
+    fb,
+    a_log,
+    bias,
+    raw_gate,
+    replay_gate,
+    verify_decay,
+    stride_fa: gl.constexpr,
+    ROWS,
+    H: gl.constexpr,
+    K: gl.constexpr,
+    DFA: gl.constexpr,
+    BT: gl.constexpr,
+    BK: gl.constexpr,
+    LOWER: gl.constexpr,
+):
+    head, tile, column_tile = gl.program_id(0), gl.program_id(1), gl.program_id(2)
+    gate_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1], [1, 32], [1, gl.num_warps()], [1, 0]
+    )
+    key = column_tile * BK + gl.arange(0, BK, layout=gl.SliceLayout(1, gate_layout))
+    channel = head * K + key
+    reduction = gl.arange(0, DFA, layout=gl.SliceLayout(0, gate_layout))
+    weights = gl.load(
+        fb + channel[:, None] * DFA + reduction[None, :], mask=key[:, None] < K, other=0
+    )
+    a = gl.exp(gl.load(a_log + head).to(gl.float32))
+    dt = gl.load(bias + channel, mask=key < K, other=0).to(gl.float32)
+    for index in range(BT):
+        row = tile * BT + index
+        if row < ROWS:
+            values = gl.load(fa + row * stride_fa + reduction).to(gl.float32)
+            gate = gl.sum(weights.to(gl.float32) * values[None, :], axis=1)
+            rounded = (
+                gl.load(raw_gate + row * H * K + channel, mask=key < K, other=0).to(
+                    gl.float32
                 )
-                biased = gate + dt
-                if LOWER is not None:
-                    log_decay = LOWER * tl.sigmoid(a * biased)
-                else:
-                    log_decay = -a * tl.where(
-                        biased < 20.0, tl.log(1.0 + tl.exp(biased)), biased
-                    )
-                tl.store(
-                    replay_gate + row * H * K + channel, tl.exp(log_decay), mask=key < K
+                + dt
+            )
+            if LOWER is not None:
+                verify_log = LOWER * (1.0 / (1.0 + gl.exp(-(a * rounded))))
+            else:
+                verify_log = -a * gl.where(
+                    rounded > 20.0, rounded, gl.log(1.0 + gl.exp(rounded))
                 )
+            gl.store(
+                verify_decay + row * H * K + channel,
+                gl.exp(verify_log),
+                mask=key < K,
+            )
+            biased = gate + dt
+            if LOWER is not None:
+                log_decay = LOWER * (1.0 / (1.0 + gl.exp(-(a * biased))))
+            else:
+                log_decay = -a * gl.where(
+                    biased < 20.0, gl.log(1.0 + gl.exp(biased)), biased
+                )
+            gl.store(
+                replay_gate + row * H * K + channel, gl.exp(log_decay), mask=key < K
+            )
 
 
 def prepare_recoverssm_conv(
@@ -652,7 +698,7 @@ def prepare_recoverssm_conv(
     Q/K/V rows. conv_weights uses [channel, 4]. conv_pool stores three
     prior values per channel. read_indices selects each request's page.
 
-    Return BF16 verify QKV, FP32 normalized replay K, FP32 convolved
+    Return BF16 verify QKV, FP32 normalized replay K, FP32 pre-SiLU
     replay V, and the FP32 normalized verify Q/K pair. Q includes the
     attention scale. Each chain retains main's convolution tap order.
     Verify normalization occurs after BF16 rounding, never before it.
@@ -712,6 +758,7 @@ def prepare_recoverssm_conv(
         P=channels,
         HEAD_DIM=head_dim,
         BLOCK=256,
+        VERIFY_SMALL=rows // width < 4,
         num_warps=4,
     )
     shape = (1, rows, num_heads, head_dim)
@@ -732,12 +779,14 @@ def prepare_recoverssm_gate(
     dt_bias: torch.Tensor,
     *,
     num_heads: int,
+    num_layers: int,
     head_dim: int,
     lower_bound: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return BF16 raw gates, FP32 replay decay and FP32 verify decay.
 
     Low-rank gate inputs and weights use the existing main-path layout.
+    num_layers is the number of recurrent layers in the all-layer commit.
     FP32 accumulation follows main replay's shape-based tiling rule.
     """
     from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
@@ -764,17 +813,20 @@ def prepare_recoverssm_gate(
         raise ValueError("gate parameters must have contiguous per-head/channel values")
     if any(tensor.device != f_a.device for tensor in (f_b, A_log, dt_bias)):
         raise ValueError("gate inputs must use the same device")
-    raw_gate = torch.empty((rows, channels), device=f_a.device, dtype=f_a.dtype)
+    if num_layers <= 0:
+        raise ValueError("num_layers must be positive")
+    raw_gate = torch.nn.functional.linear(f_a, f_b)
     gate = torch.empty((rows, channels), device=f_a.device, dtype=torch.float32)
     verify_decay = torch.empty_like(gate)
     bt, bk = (
         _gate_tiling_dot(rows, head_dim)
         if rows >= 16
-        else _gate_tiling(rows, num_heads, head_dim, f_a.device)
+        else _gate_tiling(rows, num_heads, head_dim, f_a.device, layers=num_layers)
     )
-    _recoverssm_gate_inputs_kernel[
-        (num_heads, triton.cdiv(rows, bt), triton.cdiv(head_dim, bk))
-    ](
+    gate_kernel = (
+        _recoverssm_gate_inputs_kernel if rows >= 16 else _recoverssm_gate_scalar_kernel
+    )
+    gate_kernel[(num_heads, triton.cdiv(rows, bt), triton.cdiv(head_dim, bk))](
         f_a,
         f_b,
         A_log,
@@ -789,7 +841,6 @@ def prepare_recoverssm_gate(
         DFA=f_a.shape[-1],
         BT=bt,
         BK=bk,
-        DOT=rows >= 16,
         LOWER=lower_bound,
         num_warps=1 if bt >= 4 else 2,
     )

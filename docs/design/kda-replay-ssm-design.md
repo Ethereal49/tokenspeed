@@ -122,6 +122,18 @@ the scalar-decay GDN protocol. The vendored recovery kernel is adapted to
 read the FP32 records directly; its provenance notes list that change.
 Sections 7 and 9 define the acceptance checks.
 
+Producer boundaries must preserve main's arithmetic, including contraction
+and reduction order. In particular, accepted-state replay fuses the value
+SiLU multiplication with subtraction of the state projection. The convolution
+producer therefore passes pre-SiLU FP32 V to record production. Storing an
+activated V first introduces an extra rounding step. Record production retains
+main's fused local reduction pairs before the warp reduction. Verify and
+replay use distinct layouts because main uses different reduction trees for
+these two precision chains. Small-batch verify also retains its cross-warp
+normalization. Gate tiling uses the full recurrent-layer count, even though
+the producer launches one layer at a time. These rules change producer
+intermediates, not the canonical K/U/D record or the recovery contract.
+
 Convolution uses a separate payload: the initial convolution window plus the
 current round's raw convolution inputs. It is not reconstructed from K/U/D.
 The accepted convolution window remains in the existing state storage.
