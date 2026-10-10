@@ -996,3 +996,56 @@ def test_padded_graph_verify_keeps_live_rows_and_commits_isolated():
     eager.backend._batched_replay_ready = False
     with pytest.raises(RuntimeError, match="record-based KDA replay was not ready"):
         eager.backend.commit_verified_state(accepted, accepted_path=None)
+
+
+def test_commit_plan_reuses_geometry_when_packed_storage_moves(monkeypatch):
+    """A fresh scheduler upload changes the base, not the plan descriptors."""
+    harness = _Harness(eager_replay=True, seed=173, max_bs=2, usable_pages=24)
+    first_pages = {
+        group: [1 + 2 * index, 2 + 2 * index]
+        for index, group in enumerate(_STATE_GROUPS)
+    }
+    next_pages = {
+        group: [7 + 2 * index, 8 + 2 * index]
+        for index, group in enumerate(_STATE_GROUPS)
+    }
+    harness.prepare_metadata([0, 1], first_pages, [64 + T, 64 + T])
+    # Retain the previous views so the allocator cannot reuse their address.
+    previous_tables = harness.backend._verify_commit_ctx[1]
+    descriptors = harness.backend._replay_commit_tables
+    uploaded = []
+    original_copy = torch.Tensor.copy_
+
+    def observe_copy(tensor, source, *args, **kwargs):
+        if tensor is descriptors:
+            uploaded.append(source)
+        return original_copy(tensor, source, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "copy_", observe_copy)
+        harness.prepare_metadata([0, 1], next_pages, [64 + T, 64 + T])
+    current_tables = harness.backend._verify_commit_ctx[1]
+    first_group = harness.backend._replay_group_ids[0]
+    assert (
+        previous_tables[first_group].data_ptr()
+        != current_tables[first_group].data_ptr()
+    )
+    assert not uploaded
+
+    accepted = torch.tensor([2, T], dtype=torch.int32, device=DEV)
+    pages, steps = harness.backend._resolve_verify_commit_pages(
+        accepted, harness.backend._replay_group_ids
+    )
+    expected = torch.tensor(
+        [next_pages[group] for group in harness.backend._replay_group_ids],
+        dtype=torch.int32,
+        device=DEV,
+    )
+    torch.testing.assert_close(pages, expected, atol=0, rtol=0)
+    torch.testing.assert_close(steps, accepted, atol=0, rtol=0)
+    torch.testing.assert_close(
+        harness.backend._replay_commit_reads[: expected.numel()].view_as(expected),
+        expected,
+        atol=0,
+        rtol=0,
+    )

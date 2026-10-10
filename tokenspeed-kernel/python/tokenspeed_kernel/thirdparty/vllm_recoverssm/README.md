@@ -62,8 +62,11 @@ its docstring identifies the fields that this record-based commit does not use.
 
 The production commit uses a contiguous ten-column pointer table and
 contiguous group-major page metadata. The shared state-page planner clamps
-accepted counts before this call. Live source and destination pages must be
-positive. Padding uses negative pages and zero accepted counts. Each request
+accepted counts before this call. Its page-table descriptors hold offsets
+relative to the current packed table base. A fresh scheduler upload therefore
+changes the kernel argument without uploading the same table geometry again.
+Live source and destination pages must be positive. Padding uses negative pages
+and zero accepted counts. Each request
 owns its writable pages; its own source and destination may alias.
 
 Producer wrappers check shapes, dtypes and strides on the host. These checks

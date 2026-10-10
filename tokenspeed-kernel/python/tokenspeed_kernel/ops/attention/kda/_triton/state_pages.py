@@ -301,10 +301,14 @@ def commit_state_pages(
     )
 
 
-@triton.jit(do_not_specialize=["bs", "draft_tokens", "granularity", "out_stride"])
+@triton.jit(
+    do_not_specialize=["bs", "draft_tokens", "granularity", "out_stride"],
+    do_not_specialize_on_alignment=["table_base"],
+)
 def _commit_state_groups_kernel(
     accepted,
     committed,
+    table_base,
     tables,
     pages_out,
     reads_out,
@@ -318,7 +322,7 @@ def _commit_state_groups_kernel(
     group = tl.program_id(1)
     row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     live = row < bs
-    table = tl.load(tables + group * 4).to(tl.pointer_type(tl.int32))
+    table = table_base + tl.load(tables + group * 4)
     reads = tl.load(tables + group * 4 + 3).to(tl.pointer_type(tl.int32))
     source = tl.load(reads + row, mask=live, other=-1)
     tl.store(reads_out + group * out_stride + row, source, mask=live)
@@ -340,6 +344,7 @@ def _commit_state_groups_kernel(
 def commit_state_groups(
     accepted_length: torch.Tensor,
     committed: torch.Tensor,
+    table_base: torch.Tensor,
     tables: torch.Tensor,
     *,
     batch_size: int,
@@ -354,9 +359,12 @@ def commit_state_groups(
     Args:
         accepted_length: Contiguous accepted counts, including the target token.
         committed: Contiguous INT64 checkpoint positions before verification.
-        tables: Contiguous INT64 [groups, 4] descriptors. Each row holds an
-            INT32 table address, its row stride, its number of columns and
-            an INT32 source-page vector address.
+        table_base: INT32 tensor anchoring the current packed page tables.
+            Its address can change between eager launches without changing
+            the descriptors. A captured launch retains this tensor address.
+        tables: Contiguous INT64 [groups, 4] descriptors. Each row holds a
+            signed offset from table_base in INT32 elements, its row stride,
+            its number of columns and an INT32 source-page vector address.
             The caller keeps the referenced tables alive through completion.
         batch_size: Number of live request rows.
         draft_tokens: Maximum accepted count for the current window.
@@ -377,8 +385,10 @@ def commit_state_groups(
         or reads_out.shape != pages_out.shape
     ):
         raise ValueError("destination blocks must have shape [groups, batch_size]")
-    if any(x.dtype != torch.int32 for x in (pages_out, reads_out, steps_out)):
-        raise ValueError("destination blocks and accepted counts must use INT32")
+    if any(
+        x.dtype != torch.int32 for x in (table_base, pages_out, reads_out, steps_out)
+    ):
+        raise ValueError("page tables, blocks and accepted counts must use INT32")
     if min(accepted_length.numel(), committed.numel(), steps_out.numel()) < batch_size:
         raise ValueError("commit metadata does not cover the live batch")
     if granularity < 1 or draft_tokens < 1:
@@ -390,7 +400,14 @@ def commit_state_groups(
         raise ValueError("commit metadata must be contiguous")
     if any(
         x.device != tables.device
-        for x in (accepted_length, committed, pages_out, reads_out, steps_out)
+        for x in (
+            accepted_length,
+            committed,
+            table_base,
+            pages_out,
+            reads_out,
+            steps_out,
+        )
     ):
         raise ValueError("commit metadata must use the descriptor device")
     if batch_size == 0 or tables.shape[0] == 0:
@@ -398,6 +415,7 @@ def commit_state_groups(
     _commit_state_groups_kernel[(triton.cdiv(batch_size, 256), tables.shape[0])](
         accepted_length,
         committed,
+        table_base,
         tables,
         pages_out,
         reads_out,

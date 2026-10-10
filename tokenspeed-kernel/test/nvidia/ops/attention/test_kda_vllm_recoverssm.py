@@ -945,7 +945,12 @@ def test_commit_state_groups_strides_boundaries_and_graph(batch: int) -> None:
     ]
     descriptors = torch.tensor(
         [
-            (table.data_ptr(), table.stride(0), table.shape[1], source.data_ptr())
+            (
+                (table.data_ptr() - tables[0].data_ptr()) // tables[0].element_size(),
+                table.stride(0),
+                table.shape[1],
+                source.data_ptr(),
+            )
             for table, source in zip(tables, sources, strict=True)
         ],
         dtype=torch.int64,
@@ -961,6 +966,7 @@ def test_commit_state_groups_strides_boundaries_and_graph(batch: int) -> None:
         commit_state_groups(
             accepted,
             committed,
+            tables[0],
             descriptors,
             batch_size=batch,
             draft_tokens=4,

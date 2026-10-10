@@ -433,9 +433,13 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 raise ValueError(
                     "KDA commit requires INT32 tables with contiguous columns"
                 )
+            # The scheduler uploads fresh packed storage each round. Keep
+            # relative table geometry so changing its base needs no upload.
+            table_base = rows[0]
             signature = tuple(
                 (
-                    table.data_ptr(),
+                    (table.data_ptr() - table_base.data_ptr())
+                    // table_base.element_size(),
                     table.stride(0),
                     table.shape[1],
                     pages_out[group].data_ptr(),
@@ -482,7 +486,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
         assert self._replay_commit_reads is not None
         assert self._replay_commit_pages is not None
         assert self._replay_commit_steps is not None
-        committed, _, width, _ = self._verify_commit_ctx
+        committed, tables, width, _ = self._verify_commit_ctx
         batch = accepted_length.shape[0]
         pages = self._replay_commit_pages[: len(group_ids) * batch].view(
             len(group_ids), batch
@@ -491,6 +495,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
         commit_state_groups(
             accepted_length,
             committed,
+            tables[self._replay_group_ids[0]],
             self._replay_commit_tables,
             batch_size=batch,
             draft_tokens=width,
