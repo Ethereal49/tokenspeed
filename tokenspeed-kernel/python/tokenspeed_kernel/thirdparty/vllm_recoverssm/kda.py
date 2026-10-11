@@ -70,6 +70,23 @@ def _verify_projection(state, key):
 
 
 @gluon.jit
+def _verify_packed_projection(state, key):
+    # Main rounds each product before combining its four adjacent keys.
+    BV: gl.constexpr = state.type.shape[0]
+    products = gl.extra.libdevice.mul_rn(state, key[None, :])
+    even, odd = gl.split(products.reshape((BV, 32, 2, 2)))
+    p0, p2 = gl.split(even)
+    p1, p3 = gl.split(odd)
+    partial = (p0 + p2) + (p1 + p3)
+    partial = gl.convert_layout(
+        partial, gl.BlockedLayout([1, 1], [4, 8], [1, 1], [1, 0])
+    )
+    return gl.convert_layout(
+        gl.sum(partial, axis=1), gl.SliceLayout(1, state.type.layout)
+    )
+
+
+@gluon.jit
 def _kda_recurrent_step(
     state,
     k,
@@ -95,6 +112,8 @@ def _kda_recurrent_step(
     state *= decay[None, :]
     if PREPARED_QK and gl.num_warps() == 4 and state.type.shape == [8, 128]:
         projection = _verify_projection(state, normalized_k)
+    elif PREPARED_QK and gl.num_warps() == 1 and state.type.shape[1] == 128:
+        projection = _verify_packed_projection(state, normalized_k)
     else:
         projection = gl.sum(state * normalized_k[None, :], axis=1)
     correction = v - projection
@@ -193,8 +212,7 @@ def _kda_recoverssm_verify_kernel(
     query_len = eos - bos
     state_idx = gl.load(state_indices_ptr + pid_b * stride_state_indices).to(gl.int64)
 
-    # Small batches retain main's verify reduction. Larger batches pack
-    # four value rows per warp within the existing BF16 output tolerance.
+    # Packed rows retain main's arithmetic through explicit partial sums.
     state_layout: gl.constexpr = (
         gl.BlockedLayout([1, 4], [4, 8], [1, 1], [1, 0])
         if gl.num_warps() == 1
@@ -452,7 +470,10 @@ def _kda_recoverssm_verify_kernel(
             # add a full-tile select without changing any observable result.
             state = updated_state
 
-            out = gl.sum(state * q[None, :], axis=1)
+            if PREPARED_QK and gl.num_warps() == 1 and BK == 128:
+                out = _verify_packed_projection(state, q)
+            else:
+                out = gl.sum(state * q[None, :], axis=1)
             gl.store(
                 out_ptr + token * stride_out_token + pid_h * V + offs_v,
                 out,

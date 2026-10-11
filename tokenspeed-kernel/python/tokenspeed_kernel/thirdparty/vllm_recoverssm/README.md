@@ -26,9 +26,11 @@ CTAs consume these values in one launch, so each CTA holds one state tile.
 This preserves the two precision chains and avoids repeated transforms for
 each value tile.
 
-Small-batch verify retains main's cross-warp Q/K normalization and local
-projection FMA operands. Its token loop stays intact. Larger batches pack
-value rows within the fixed BF16 output tolerances. Replay keeps main's
+Verify retains main's Q/K normalization and projection order. Small batches
+keep the cross-warp reduction and local projection FMA operands. Larger batches
+pack value rows, round each product before addition, and combine four adjacent
+keys before reducing the 32 partial sums. This preserves main's one-warp
+arithmetic without restoring its full-state layout. Replay keeps main's
 ordered FP32 recurrence for every batch. It loads each checkpoint directly
 in the required layout, splits the local key groups, and redistributes only
 the projection partials before reduction. This avoids indexed gathers and
@@ -50,8 +52,8 @@ runtime values. Exact request counts do not create new binaries within the
 same launch bucket.
 
 Compositional tests require exact accepted state and exact verify output
-below batch four. Verify limits for other batches and scalar-reference limits
-remain unchanged. Gate regression tests require exact BF16 projections and
+at every tested batch size. Scalar-reference limits remain unchanged.
+Gate regression tests require exact BF16 projections and
 FP32 decay for both formulas, multiple row counts, layer counts and seeds.
 Full-model equality and performance remain separate acceptance gates.
 

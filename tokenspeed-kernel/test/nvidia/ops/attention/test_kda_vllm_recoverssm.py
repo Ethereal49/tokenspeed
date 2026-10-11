@@ -83,10 +83,13 @@ def _reference(
 @pytest.mark.parametrize(
     "width,accepted", [(1, 0), (1, 1), (4, 0), (4, 1), (4, 2), (4, 3), (4, 4)]
 )
-def test_vllm_recoverssm_verify_and_commit(width: int, accepted: int) -> None:
+@pytest.mark.parametrize("dim,prepared_qk", [(128, False), (64, True)])
+def test_vllm_recoverssm_verify_and_commit(
+    width: int, accepted: int, dim: int, prepared_qk: bool
+) -> None:
     torch.manual_seed(7331)
     device = "cuda"
-    batch, heads, dim = 4, 12, 128
+    batch, heads = 4, 12
     q = torch.randn(batch, width, heads, dim, device=device).bfloat16()
     k = torch.randn_like(q)
     v = torch.randn_like(q).mul_(0.2)
@@ -127,6 +130,14 @@ def test_vllm_recoverssm_verify_and_commit(width: int, accepted: int) -> None:
     packed_g = raw_g.reshape_as(packed_q)
     packed_beta = raw_beta.reshape(1, batch * width, heads)
     out = torch.empty_like(packed_v)
+    verify_qk = None
+    if prepared_qk:
+        normalized_q = packed_q.float()
+        normalized_k = packed_k.float()
+        normalized_q *= torch.rsqrt(normalized_q.square().sum(-1, keepdim=True) + 1e-6)
+        normalized_q *= dim**-0.5
+        normalized_k *= torch.rsqrt(normalized_k.square().sum(-1, keepdim=True) + 1e-6)
+        verify_qk = (normalized_q, normalized_k)
     vllm_triton_kda_recoverssm_verify(
         packed_q,
         packed_k,
@@ -145,7 +156,7 @@ def test_vllm_recoverssm_verify_and_commit(width: int, accepted: int) -> None:
         out=out,
         replay_inputs=None,
         verify_decay=None,
-        verify_qk=None,
+        verify_qk=verify_qk,
         record_metadata=None,
         record_stamps=None,
     )
@@ -543,15 +554,11 @@ def test_recoverssm_matches_main_producers_over_rounds(
         largest_state_error = max(
             largest_state_error, (candidate_state - main_state).abs().max().item()
         )
+        # Preserve verify rounding at concurrent batches as well as single
+        # requests; small BF16 changes can alter speculative acceptance.
         torch.testing.assert_close(
-            out.reshape_as(expected_out), expected_out, atol=2e-2, rtol=2e-2
+            out.reshape_as(expected_out), expected_out, atol=0, rtol=0
         )
-        if batch < 4:
-            # The four-warp projection used to change near-zero BF16 outputs
-            # despite exact convolution, gates and accepted recurrent state.
-            torch.testing.assert_close(
-                out.reshape_as(expected_out), expected_out, atol=0, rtol=0
-            )
         torch.testing.assert_close(candidate_state, main_state, atol=0, rtol=0)
         squared_state_error += (candidate_state - main_state).square().sum().item()
         state_elements += main_state.numel()

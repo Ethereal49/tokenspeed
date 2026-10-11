@@ -527,6 +527,11 @@ def _replay_conv_inputs_kernel(
                 verify_heads,
                 gl.BlockedLayout([1, 1], [1, 32], [1, gl.num_warps()], [1, 0]),
             )
+        else:
+            verify_heads = gl.convert_layout(
+                verify_heads,
+                gl.BlockedLayout([1, 4], [1, 32], [1, 1], [1, 0]),
+            )
         normalized_verify = verify_heads / gl.sqrt(
             gl.sum(verify_heads * verify_heads, axis=1)[:, None] + 1e-6
         )

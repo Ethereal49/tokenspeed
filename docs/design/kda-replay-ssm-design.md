@@ -129,8 +129,11 @@ producer therefore passes pre-SiLU FP32 V to record production. Storing an
 activated V first introduces an extra rounding step. Record production retains
 main's fused local reduction pairs before the warp reduction. Verify and
 replay use distinct layouts because main uses different reduction trees for
-these two precision chains. Small-batch verify also retains its cross-warp
-normalization. Gate tiling uses the full recurrent-layer count, even though
+these two precision chains. Verify retains main's normalization and projection
+order at every batch size, including the cross-warp normalization at small
+batches. Packed one-warp verify rounds products before combining four adjacent
+keys and reducing the 32 partial sums; it must not contract these operations
+into FMAs. Gate tiling uses the full recurrent-layer count, even though
 the producer launches one layer at a time. These rules change producer
 intermediates, not the canonical K/U/D record or the recovery contract.
 
