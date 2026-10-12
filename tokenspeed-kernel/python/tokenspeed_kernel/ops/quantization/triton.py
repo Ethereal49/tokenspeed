@@ -842,7 +842,7 @@ def _rmsnorm_fp8_group32_ue8m0(
     bits = raw.to(tl.int32, bitcast=True)
     exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
     quantized = tl.reshape(
-        values * ((254 - exponent) << 23).to(tl.float32, bitcast=True)[:, None],
+        values * (1.0 / (exponent << 23).to(tl.float32, bitcast=True))[:, None],
         (BLOCK,),
     ).to(tl.float8e4nv)
     tl.store(Q + row * K + col, quantized, col < K)

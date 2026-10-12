@@ -1130,10 +1130,12 @@ class DeepseekV41AttentionBackend(AttentionBackend):
     ):
         """Select/reuse request-local global rows; return (physical slots, lengths).
 
-        Index Q is post-RoPE BF16 [T,Hindex,128]; weights are already scaled as
-        in the model reference. Supply both only at an index source, otherwise
-        None. A sharded indexer must supply its head-reduction process group;
-        replicated indexer heads supply None. Candidates survive Reindex updates.
+        Index Q is post-RoPE BF16 [T,Hindex,128] with already-scaled weights,
+        or IndexQueryInput containing pre-RoPE BF16 values, paired with
+        unscaled BF16 weights. Preprocessing applies its weight_scale once.
+        Supply both only at an index source, otherwise None. A sharded indexer
+        must supply its head-reduction process group; replicated indexer heads
+        supply None. Candidates survive Reindex updates.
         Decode graph Full sources use the refresh's full query window; consumers
         may reorder/subset it. A subset Reindex and its Reuse consumers share the
         same window tensors. Other source windows retain eager coverage validation.
