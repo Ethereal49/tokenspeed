@@ -1,6 +1,7 @@
 # L3 Host lifecycle implementation and validation
 
-Baseline: `c50a2f09528b8e13c1d9eeff287e2e74b1ed92b6`. This covers the
+Baseline: `057a4daa` (the cache/scheduler implementation is unchanged from
+`c50a2f09528b8e13c1d9eeff287e2e74b1ed92b6`). This covers the
 architecture refactor requested in issue #1793 and safe expiry of queued
 prefetches. It is a component validation report, not a production release.
 
@@ -20,8 +21,11 @@ prefetches. It is a component validation report, not a production release.
 
 - Native C++ scheduler: 618 tests passed.
 - Scheduler Python bindings built from this checkout: 279 tests passed.
-- Host/control tests include actual two-process gloo convergence for a
+- Host/control tests: 112 passed, including actual two-process gloo convergence for a
   rank-local lookup failure and different landed-prefix lengths.
+- Mocked Host-copy orchestration: 23 passed, 9 CUDA tests skipped,
+  10 subtests passed. Optional GPU imports are substituted; kernel execution
+  is prohibited. This is not CUDA-copy validation.
 - Repeated Host experiment: 30 / 30 runs passed,
   using two independent Host engines and `MemoryKvStore` with a gated read.
   Budget: 20 ms; injected hold: 40 ms.
