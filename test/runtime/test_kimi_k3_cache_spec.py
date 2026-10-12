@@ -155,9 +155,13 @@ def test_bf16_recurrent_state_keeps_layout_and_latent_stride() -> None:
             assert field.page_stride_bytes == old.page_stride_bytes
 
 
+@pytest.mark.parametrize("kvp_size", [1, 4])
 def test_speculative_verify_workspace_is_reserved_outside_the_arena(
     monkeypatch,
+    kvp_size,
 ) -> None:
+    from dataclasses import replace
+
     monkeypatch.setattr(
         "tokenspeed_kernel.ops.attention.kda.kda_replay_commit_supported",
         lambda dtype, **kwargs: False,
@@ -167,6 +171,17 @@ def test_speculative_verify_workspace_is_reserved_outside_the_arena(
         max_bs=4,
         speculative_algorithm="DSPARK",
         speculative_num_draft_tokens=8,
+    )
+
+    recipe.attn_config = replace(
+        recipe.attn_config,
+        device="cuda",
+        kvp_size=kvp_size,
+        kvp_group=tuple(range(kvp_size)),
+        components=(
+            replace(recipe.attn_config.components[0], backend_name="tokenspeed_mla"),
+            *recipe.attn_config.components[1:],
+        ),
     )
 
     # Four requests, each with one committed seed row and eight candidate rows,
@@ -182,8 +197,10 @@ def test_speculative_verify_workspace_is_reserved_outside_the_arena(
     assert setup.spec.memory_plan.num_lcm_blocks == expected_parents
 
 
+@pytest.mark.parametrize("raw_gate", [False, True])
 def test_replay_verify_workspace_reserves_conv_rows_and_payloads(
     monkeypatch,
+    raw_gate,
 ) -> None:
     monkeypatch.setattr(
         "tokenspeed_kernel.ops.attention.kda.kda_replay_commit_supported",
@@ -191,7 +208,7 @@ def test_replay_verify_workspace_reserves_conv_rows_and_payloads(
     )
     monkeypatch.setattr(
         "tokenspeed_kernel.ops.attention.kda.kda_batched_replay_uses_raw_gate",
-        lambda dtype, **kwargs: False,
+        lambda dtype, **kwargs: raw_gate,
     )
     recipe, groups, layout = kimi_tp8_layout(
         draft_layers=5,
@@ -206,10 +223,17 @@ def test_replay_verify_workspace_reserves_conv_rows_and_payloads(
         for field in fields
         if field.field_id.endswith(".conv_state")
     )
+    # Raw-gate replay aliases the committed conv pool and stores BF16 gates;
+    # other replay paths reserve transient conv rows and FP32 gates.
+    if raw_gate:
+        conv_row_bytes = 0
+    gate_bytes = 2 if raw_gate else 4
     # 69 KDA layers x (4 requests x 8 draft tokens) rows, each one bf16
-    # qkv/f_a/beta row (4608 + 128 + 12 channels) plus an fp32 gate row
+    # qkv/f_a/beta row (4608 + 128 + 12 channels) plus a gate row
     # (12 x 128), per rank at TP8.
-    expected_payload_bytes = 69 * 4 * 8 * ((4608 + 128 + 12) * 2 + 12 * 128 * 4)
+    expected_payload_bytes = (
+        69 * 4 * 8 * ((4608 + 128 + 12) * 2 + 12 * 128 * gate_bytes)
+    )
     expected_workspace_bytes = conv_row_bytes + expected_payload_bytes
 
     setup = recipe.setup()
@@ -352,16 +376,16 @@ def test_kda_state_dtype_cli_defaults_to_fp32() -> None:
 
 
 @pytest.mark.parametrize("limit", [1, 16384])
-@pytest.mark.parametrize("dcp_size", [1, 4])
-def test_token_limit_retains_kda_working_set(limit, dcp_size):
+@pytest.mark.parametrize("kvp_size", [1, 4])
+def test_token_limit_retains_kda_working_set(limit, kvp_size):
     from dataclasses import replace
 
     recipe, _, layout = kimi_tp8_layout(max_bs=4)
     recipe.attn_config = replace(
         recipe.attn_config,
         device="cuda",
-        dcp_size=dcp_size,
-        dcp_group=tuple(range(dcp_size)),
+        kvp_size=kvp_size,
+        kvp_group=tuple(range(kvp_size)),
         components=(
             replace(recipe.attn_config.components[0], backend_name="flashmla"),
             recipe.attn_config.components[1],

@@ -58,7 +58,15 @@ from tokenspeed_kernel.signature import (
 # isort: split
 import tokenspeed_kernel.numerics.gemm  # noqa: F401
 
-__all__ = ["prepare_dense_bmm", "prepare_dense_mm", "prepare_mm", "prepare_mxfp8_mm"]
+__all__ = [
+    "prepare_decode_gemv",
+    "prepare_dense_bmm",
+    "prepare_dense_mm",
+    "prepare_grouped_bf16_projection",
+    "prepare_linear_attnres_partials",
+    "prepare_mm",
+    "prepare_mxfp8_mm",
+]
 
 
 _DTYPE_NAMES = {
@@ -714,3 +722,253 @@ def prepare_mm(
             f"gemm.mm requires quant to be one of: {accepted}",
         )
     return generator(request, platform)
+
+
+def _reject_unknown_parameters(request: BenchmarkRequest, allowed: set[str]) -> None:
+    unknown = sorted(set(request.parameters) - allowed)
+    if unknown:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            f"Unknown gemm.{request.mode} parameters: {', '.join(unknown)}",
+        )
+
+
+def _random_tensors(
+    seed: int,
+    dtype: torch.dtype,
+    *shapes: tuple[int, ...],
+) -> list[torch.Tensor]:
+    """Return seeded standard-normal device tensors, one per shape."""
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    return [
+        torch.randn(shape, device="cuda", dtype=dtype, generator=generator)
+        for shape in shapes
+    ]
+
+
+def _prepared_timing(
+    spec: KernelSpec,
+    invoke: Callable[[], torch.Tensor],
+    parameters: dict[str, object],
+) -> PreparedBenchmark:
+    return PreparedBenchmark(
+        registration=spec,
+        invocation=PreparedInvocation(invoke=invoke),
+        parameters=parameters,
+        validation=None,
+    )
+
+
+def prepare_decode_gemv(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare a small-M dense GEMV benchmark computing ``x @ weight.T``."""
+
+    _reject_unknown_parameters(request, {"M", "N", "K", "dtype"})
+    M = _positive_int(request.parameters.get("M"), "M")
+    N = _positive_int(request.parameters.get("N"), "N")
+    K = _positive_int(request.parameters.get("K"), "K")
+    dtype = _parse_dtype(request.parameters.get("dtype"))
+    shape = {"M": M, "N": N, "K": K}
+    signature = format_signature(
+        x=dense_tensor_format(dtype),
+        weight=dense_tensor_format(dtype),
+    )
+
+    load_builtin_kernels()
+    spec, selected = _select_registration(
+        request,
+        platform,
+        signature,
+        {"m": M, "n": N, "k": K},
+        shape,
+    )
+
+    x, weight = _random_tensors(request.seed, dtype, (M, K), (N, K))
+    out = torch.empty((M, N), dtype=dtype, device=x.device)
+
+    def invoke() -> torch.Tensor:
+        return selected(x, weight, out)
+
+    return _prepared_timing(
+        spec,
+        invoke,
+        {
+            "M": M,
+            "N": N,
+            "K": K,
+            "dtype": "bfloat16",
+            "x_layout": "MK",
+            "weight_layout": "NK",
+            "out_layout": "MN",
+        },
+    )
+
+
+def prepare_grouped_bf16_projection(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare a grouped projection computing ``einsum('tgd,grd->tgr')``.
+
+    ``x[M, groups, K]`` is a view whose rows are ``x_token_stride`` elements
+    apart: ``groups * K`` for a contiguous activation, or more for a slice of
+    padded attention heads. ``weight[groups, N, K]`` is contiguous. As in the
+    models, no ``out`` buffer is passed, so the registration allocates its
+    ``[M, groups, N]`` result.
+    """
+
+    _reject_unknown_parameters(
+        request, {"groups", "M", "N", "K", "x_token_stride", "dtype"}
+    )
+    groups = _positive_int(request.parameters.get("groups"), "groups")
+    M = _positive_int(request.parameters.get("M"), "M")
+    N = _positive_int(request.parameters.get("N"), "N")
+    K = _positive_int(request.parameters.get("K"), "K")
+    x_token_stride = _positive_int(
+        request.parameters.get("x_token_stride"), "x_token_stride"
+    )
+    if x_token_stride < groups * K:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "gemm.grouped_bf16_projection x_token_stride must be at least "
+            "groups * K",
+        )
+    dtype = _parse_dtype(request.parameters.get("dtype"))
+    shape = {"groups": groups, "M": M, "N": N, "K": K}
+
+    rows, weight = _random_tensors(
+        request.seed, dtype, (M, x_token_stride), (groups, N, K)
+    )
+    x = rows[:, : groups * K].unflatten(1, (groups, K))
+    signature = format_signature(
+        x=dense_tensor_format(dtype),
+        weight=dense_tensor_format(dtype),
+    )
+    # Mirror the operation's selection traits for these inputs.
+    traits = {
+        "batch": groups,
+        "m": M,
+        "n": N,
+        "k": K,
+        "a_inner_stride_one": x.stride(-1) == 1,
+        "b_inner_stride_one": weight.stride(-1) == 1,
+        "is_cuda": x.is_cuda,
+    }
+
+    load_builtin_kernels()
+    spec, selected = _select_registration(request, platform, signature, traits, shape)
+
+    def invoke() -> torch.Tensor:
+        return selected(x, weight, None)
+
+    return _prepared_timing(
+        spec,
+        invoke,
+        {
+            **shape,
+            "x_token_stride": x_token_stride,
+            "dtype": "bfloat16",
+            "x_layout": "MGK",
+            "weight_layout": "GNK",
+            "out_layout": "MGN",
+        },
+    )
+
+
+def prepare_linear_attnres_partials(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare a projection fused with two AttnRes block partials.
+
+    The case projects ``hidden_states[tokens, input_size]`` through
+    ``weight[output_size, input_size]`` and reduces ``num_blocks`` residual
+    blocks into two FP32 ``(max, sum, accumulator)`` scratch tuples.
+    """
+
+    _reject_unknown_parameters(
+        request,
+        {"tokens", "input_size", "output_size", "num_blocks", "dtype", "eps"},
+    )
+    tokens = _positive_int(request.parameters.get("tokens"), "tokens")
+    input_size = _positive_int(request.parameters.get("input_size"), "input_size")
+    output_size = _positive_int(request.parameters.get("output_size"), "output_size")
+    num_blocks = _positive_int(request.parameters.get("num_blocks"), "num_blocks")
+    dtype = _parse_dtype(request.parameters.get("dtype"))
+    eps = request.parameters.get("eps")
+    if not isinstance(eps, float) or not math.isfinite(eps) or eps <= 0.0:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "gemm.linear_attnres_partials parameter 'eps' must be a positive float",
+        )
+
+    shape = {
+        "tokens": tokens,
+        "input_size": input_size,
+        "output_size": output_size,
+        "num_blocks": num_blocks,
+    }
+    signature = format_signature(
+        hidden_states=dense_tensor_format(dtype),
+        weight=dense_tensor_format(dtype),
+        blocks=dense_tensor_format(dtype),
+        score_weight_a=dense_tensor_format(dtype),
+        score_weight_b=dense_tensor_format(dtype),
+        out=dense_tensor_format(dtype),
+    )
+    traits: dict[str, object] = {**shape, "inputs_contiguous": True}
+    if platform.is_cdna5:
+        # Mirror the operation's dispatch, which opts CDNA5 into its kernel.
+        traits["gfx1250_linear_attnres_enabled"] = True
+
+    load_builtin_kernels()
+    spec, selected = _select_registration(request, platform, signature, traits, shape)
+
+    hidden_states, weight, blocks, score_weight_a, score_weight_b = _random_tensors(
+        request.seed,
+        dtype,
+        (tokens, input_size),
+        (output_size, input_size),
+        (num_blocks, tokens, input_size),
+        (input_size,),
+        (input_size,),
+    )
+
+    def scratch() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            torch.empty(tokens, dtype=torch.float32, device=blocks.device),
+            torch.empty(tokens, dtype=torch.float32, device=blocks.device),
+            torch.empty(
+                (tokens, input_size), dtype=torch.float32, device=blocks.device
+            ),
+        )
+
+    scratch_a = scratch()
+    scratch_b = scratch()
+    out = torch.empty((tokens, output_size), dtype=dtype, device=blocks.device)
+
+    def invoke() -> torch.Tensor:
+        return selected(
+            hidden_states=hidden_states,
+            weight=weight,
+            blocks=blocks,
+            score_weight_a=score_weight_a,
+            score_weight_b=score_weight_b,
+            scratch_a=scratch_a,
+            scratch_b=scratch_b,
+            eps=eps,
+            out=out,
+        )
+
+    return _prepared_timing(
+        spec,
+        invoke,
+        {
+            **shape,
+            "dtype": "bfloat16",
+            "eps": eps,
+            "scratch_dtype": "float32",
+        },
+    )

@@ -40,7 +40,7 @@ _MAX_AMD_GLUON_TOKENS = 65536
 _MAX_N = 12
 
 
-def _select_attn_res_kernel(
+def select_attn_res_fwd_kernel(
     layer_residual,
     block_residual,
     res_weight,
@@ -53,6 +53,15 @@ def _select_attn_res_kernel(
     num_valid_blocks,
     block_write_idx,
 ):
+    """Select the kernel :func:`attn_res_fwd` runs for these inputs.
+
+    Arguments match :func:`attn_res_fwd`, with ``output_eps`` the resolved
+    output RMSNorm epsilon.
+
+    Returns:
+        ``(kernel, valid_blocks)``: the selected kernel and the number of
+        snapshots it mixes.
+    """
     tokens, hidden_size = layer_residual.shape
     valid_blocks = (
         block_residual.shape[0] if num_valid_blocks is None else int(num_valid_blocks)
@@ -174,7 +183,7 @@ def attn_res_fwd(
     output_eps = (
         eps if out_norm_weight is None or out_norm_eps is None else out_norm_eps
     )
-    kernel, valid_blocks = _select_attn_res_kernel(
+    kernel, valid_blocks = select_attn_res_fwd_kernel(
         layer_residual,
         block_residual,
         res_weight,
@@ -235,7 +244,7 @@ def attn_res_fwd_available(
         eps if out_norm_weight is None or out_norm_eps is None else out_norm_eps
     )
     try:
-        kernel, _ = _select_attn_res_kernel(
+        kernel, _ = select_attn_res_fwd_kernel(
             layer_residual,
             block_residual,
             res_weight,
@@ -547,15 +556,62 @@ def mhc_mixes(
         raise ValueError(
             "mhc_mixes requires contiguous colocated tensors and positive iterations"
         )
+    traits = {
+        "buffer_offsets_fit_int32": residual.numel() < 2**31,
+        "hidden_size": int(residual.shape[-1]),
+    }
     kernel = select_kernel(
         "residual",
         "mhc_mixes",
         format_signature(residual=dense_tensor_format(residual.dtype)),
-        traits=None,
+        traits=traits,
         override=None,
         solution=None,
     )
     return kernel(residual, weight, scale, base, rms_eps, hc_eps, sinkhorn_iters)
+
+
+def mhc_apply_pre(
+    residual: _torch.Tensor,
+    pre: _torch.Tensor,
+    *,
+    norm_weight: _torch.Tensor | None,
+    norm_eps: float | None,
+) -> _torch.Tensor:
+    """Collapse residual streams with given pre coefficients into a layer input.
+
+    Args:
+        residual: Contiguous BF16 residual streams ``[..., hc_mult, H]``.
+        pre: Contiguous FP32 pre coefficients ``[..., hc_mult]``, e.g. the
+            previous sublayer's ``mhc_mixes`` output.
+        norm_weight: Optional RMSNorm weight ``[H]`` applied to the BF16-rounded
+            stream sum. ``None`` returns the plain collapse.
+        norm_eps: RMSNorm epsilon; must be given exactly when ``norm_weight`` is.
+
+    Returns:
+        BF16 layer input ``[..., H]``.
+    """
+    if (norm_weight is None) != (norm_eps is None):
+        raise ValueError("norm_weight and norm_eps must be provided together")
+    if pre.shape != residual.shape[:-1]:
+        raise ValueError("mhc_apply_pre requires pre shaped like residual[..., :, 0]")
+    traits = {
+        "buffer_offsets_fit_int32": residual.numel() < 2**31,
+        "fused_norm": norm_weight is not None,
+        "hc_mult": int(residual.shape[-2]),
+    }
+    kernel = select_kernel(
+        "residual",
+        "mhc_apply_pre",
+        format_signature(
+            residual=dense_tensor_format(residual.dtype),
+            pre=dense_tensor_format(pre.dtype),
+        ),
+        traits=traits,
+        override=None,
+        solution=None,
+    )
+    return kernel(residual, pre, norm_weight=norm_weight, norm_eps=norm_eps)
 
 
 def mhc_pre(
@@ -603,6 +659,7 @@ def mhc_pre(
     num_tokens = int(residual.numel() // (hc_mult * hidden_size))
     traits = {
         "num_tokens": num_tokens,
+        "buffer_offsets_fit_int32": residual.numel() < 2**31,
         "hc_mult": hc_mult,
         "hidden_size": hidden_size,
         "sinkhorn_iters": int(sinkhorn_iters),
@@ -671,6 +728,7 @@ def mhc_post(
     num_tokens = int(residual.numel() // (hc_mult * hidden_size))
     traits = {
         "num_tokens": num_tokens,
+        "buffer_offsets_fit_int32": residual.numel() < 2**31,
         "hc_mult": hc_mult,
         "hidden_size": hidden_size,
     }
@@ -771,6 +829,7 @@ __all__ = [
     "attn_res_fwd_available",
     "gated_residual_combine",
     "gated_residual_mix",
+    "mhc_apply_pre",
     "mhc_fused_hc",
     "mhc_mixes",
     "mhc_post",
