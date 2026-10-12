@@ -92,6 +92,7 @@ from tokenspeed.runtime.cache.l2.sizing import (
     RetractionPoolRequest,
     tail_lcm_blocks_per_request,
 )
+from tokenspeed.runtime.cache.transfer.ops import CacheShutdownFailure
 from tokenspeed.runtime.engine.scheduler_utils import cache_ops_from_plan
 from tokenspeed.runtime.epd.recv_pool import recv_pool_bytes
 from tokenspeed.runtime.execution.types import (
@@ -566,7 +567,7 @@ class DeviceHandle:
                 errors.append(exc)
         final_results = self._thread.run(self._l2.shutdown)
         if errors:
-            raise errors[0]
+            raise CacheShutdownFailure(final_results) from errors[0]
         return final_results
 
     def run_idle_forward(self, dp_metadata: DpForwardMetadata) -> None:

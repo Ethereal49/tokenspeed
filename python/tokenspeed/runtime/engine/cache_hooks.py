@@ -126,10 +126,10 @@ class CacheOpHooks:
     def count_plan_ops(self, execution_plan) -> None:
         """Count the cache ops this plan will put in flight.
 
-        ``DeviceHandle.execute`` submits them, from the same plan (write-backs
-        and snapshot stores ahead of the page zeroing, L3 prefetches on their
-        own lane, load-backs and restores behind the zeroing), through the
-        same adapter (``scheduler_utils.cache_ops_from_plan``). An L2 batch
+        ``DeviceHandle.execute`` submits Device copies from the same plan
+        (write-backs and snapshot stores ahead of zeroing, loads and restores
+        behind it); ``L3CacheHooks.submit_plan`` submits Host-only prefetches.
+        Both use the same adapter (``scheduler_utils.cache_ops_from_plan``). An L2 batch
         carries one ticket per ``op_ids`` entry; each request of a snapshot
         store, restore or prefetch batch is one ticket, acknowledged on its
         own. Call this with the SAME plan and only when ``execute`` will run:

@@ -34,6 +34,7 @@ import zmq
 from tokenspeed_kernel.compile_monitor import compile_stats
 from tokenspeed_scheduler import Scheduler
 
+from tokenspeed.runtime.cache.transfer.ops import CacheShutdownFailure
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -1373,6 +1374,9 @@ class EventLoop:
         final_copy_results = []
         try:
             final_copy_results = self._device.shutdown_cache()
+        except CacheShutdownFailure as exc:
+            final_copy_results = exc.final_copy_results
+            raise
         finally:
             self._cache_engine.shutdown(final_copy_results)
 

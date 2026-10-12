@@ -15,7 +15,10 @@ from unittest.mock import Mock
 from tokenspeed.runtime.cache.hicache import HiCacheEngine
 from tokenspeed.runtime.cache.l3.backend import resolve_l3_weight_version
 from tokenspeed.runtime.cache.transfer.host_buffer import HostBufferView
-from tokenspeed.runtime.cache.transfer.ops import HostWriteBackCompletion
+from tokenspeed.runtime.cache.transfer.ops import (
+    CacheShutdownFailure,
+    HostWriteBackCompletion,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -67,6 +70,7 @@ def test_device_handle_only_runs_device_copy_work_and_returns_host_metadata():
             "enum": enum,
             "deque": deque,
             "cache_ops_from_plan": lambda plan: list(plan.cache),
+            "CacheShutdownFailure": CacheShutdownFailure,
         },
     )
     trace = []
@@ -196,3 +200,49 @@ def test_host_export_keeps_bytes_and_geometry_without_retaining_device_layout():
     assert view.host_buffer is buffer
     assert view.host_block_range(0, 6) == (40, 8)
     assert view.host_block_range(1, 2) == (24, 24)
+
+
+def test_failed_device_submission_delivers_final_host_writes_before_raising():
+    scope = definitions(
+        ROOT / "python/tokenspeed/runtime/execution/device.py",
+        {"DeviceRole", "_settle", "_resolve_role", "DeviceHandle"},
+        {"enum": enum, "deque": deque, "CacheShutdownFailure": CacheShutdownFailure},
+    )
+    completed = HostWriteBackCompletion((9,), ((0, 1, "last", 0),))
+    handle = scope["DeviceHandle"](
+        SimpleNamespace(forward_thread=ImmediateThread([])),
+        host_cache_executor=SimpleNamespace(shutdown=lambda: [completed]),
+        kv_transfer=None,
+    )
+    failed = Future()
+    failed.set_exception(ValueError("copy submission failed"))
+    handle._l2_submissions.append(failed)
+    # Execute the real EventLoop.close body against low-frequency collaborator
+    # doubles, so its finally ordering is checked even when Device shutdown raises.
+    path = ROOT / "python/tokenspeed/runtime/engine/event_loop.py"
+    cls = next(
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.ClassDef) and n.name == "EventLoop"
+    )
+    close = next(
+        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "close"
+    )
+    space = {"CacheShutdownFailure": CacheShutdownFailure}
+    exec(compile(ast.Module(body=[close], type_ignores=[]), str(path), "exec"), space)
+    cache = Mock()
+    loop = SimpleNamespace(
+        _device=handle,
+        _cache_engine=cache,
+        load_reporter=Mock(),
+        _eplb_hooks=Mock(),
+        send_to_tokenizer=Mock(),
+        kv_transfer=None,
+    )
+    try:
+        space["close"](loop)
+        raise AssertionError("submission failure did not propagate")
+    except CacheShutdownFailure as exc:
+        assert isinstance(exc.__cause__, ValueError)
+        assert exc.final_copy_results == (completed,)
+    cache.shutdown.assert_called_once_with((completed,))

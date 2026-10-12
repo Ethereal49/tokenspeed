@@ -21,7 +21,7 @@ prefetches. It is a component validation report, not a production release.
 
 - Native C++ scheduler: 618 tests passed.
 - Scheduler Python bindings built from this checkout: 279 tests passed.
-- Host/control tests: 112 passed, including actual two-process gloo convergence for a
+- Host/control tests: 113 passed, including actual two-process gloo convergence for a
   rank-local lookup failure and different landed-prefix lengths.
 - Mocked Host-copy orchestration: 23 passed, 9 CUDA tests skipped,
   10 subtests passed. Optional GPU imports are substituted; kernel execution
@@ -52,6 +52,9 @@ PYTHONPATH=python python test/ci_system/run_host_cpu_tests.py \
 
 This launcher substitutes only optional GPU imports and prohibits GPU kernel
 execution. It does not validate CUDA copies. Normal GPU CI uses normal pytest.
+
+A shutdown-failure regression test also verifies that final retired Host
+writes reach the coordinator before a Device submission error is re-raised.
 
 ## Remaining roadmap gates
 
