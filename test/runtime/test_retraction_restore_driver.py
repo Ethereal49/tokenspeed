@@ -39,6 +39,7 @@ import pytest
 
 ts = pytest.importorskip("tokenspeed_scheduler")
 
+from tokenspeed.runtime.cache.hicache import HiCacheEngine
 from tokenspeed.runtime.cache.transfer.ops import (  # noqa: E402
     HostTier,
     RestoreOp,
@@ -109,6 +110,7 @@ class _Acks:
 def _hooks(device) -> CacheOpHooks:
     return CacheOpHooks(
         device,
+        cache_engine=HiCacheEngine(None),
         speculative_algorithm=None,
         attn_tp_rank=0,
         attn_tp_size=1,

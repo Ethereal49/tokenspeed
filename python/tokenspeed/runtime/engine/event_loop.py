@@ -297,6 +297,7 @@ class EventLoop:
             max_batch_size=per_rank_max_batch,
         )
         self._device = device.handle
+        self._cache_engine = device.cache_engine
         specs = device.specs
         self.multimodal_encoder_dtype = specs.multimodal_encoder_dtype
         self.cache_storage = specs.cache_storage
@@ -350,6 +351,7 @@ class EventLoop:
         )
         self._cache_hooks = CacheOpHooks(
             self._device if armed else None,
+            cache_engine=self._cache_engine,
             speculative_algorithm=server_args.speculative_algorithm,
             attn_tp_rank=attn_tp_rank,
             attn_tp_size=cache_replica_tp_size,
@@ -436,7 +438,7 @@ class EventLoop:
         self.scheduler = Scheduler(scheduler_cfg)
         self._l3_hooks = L3CacheHooks(
             self.scheduler,
-            self._device if scheduler_cfg.enable_l3_storage else None,
+            self._cache_engine.l3,
             attn_tp_size=cache_replica_tp_size,
             attn_tp_cpu_group=self.attn_tp_cpu_group,
             pp_size=self.pp_size,
@@ -567,6 +569,7 @@ class EventLoop:
             pause_controller=self._pause,
             memory_controller=self._memory,
             device=self._device,
+            l3_engine=self._cache_engine.l3,
         )
 
         # The rebalance's loop-side glue: the controller's ops ride the request
@@ -1166,6 +1169,7 @@ class EventLoop:
                 else:
                     execution_plan = self.scheduler.next_execution_plan()
                     self._cache_hooks.count_plan_ops(execution_plan)
+                    self._l3_hooks.submit_plan(execution_plan)
                     # A capacity retraction whose victim could not be imaged
                     # aborted that request inside the plan build; it is gone
                     # from the scheduler, so finish it toward the client here
@@ -1366,7 +1370,11 @@ class EventLoop:
         close_transfer = getattr(self.kv_transfer, "close", None)
         if callable(close_transfer):
             close_transfer()
-        self._device.shutdown_cache()
+        final_copy_results = []
+        try:
+            final_copy_results = self._device.shutdown_cache()
+        finally:
+            self._cache_engine.shutdown(final_copy_results)
 
 
 def run_event_loop(

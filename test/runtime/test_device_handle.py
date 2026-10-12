@@ -533,7 +533,7 @@ def test_a_failed_cache_submission_surfaces_at_the_next_poll(wire_ops):
     assert isinstance(info.value.__cause__, ValueError)
 
 
-def test_prefetches_start_on_the_control_plane_between_zeroing_and_loads(wire_ops):
+def test_device_execution_does_not_submit_host_only_prefetches(wire_ops):
     """An L3 prefetch fills Host pages on the executor's own lane: no stream,
     no Device page, so it is started right on the control plane -- after the
     stores and the zeroing were queued, before the loads -- and never rides
@@ -577,7 +577,6 @@ def test_prefetches_start_on_the_control_plane_between_zeroing_and_loads(wire_op
         "write_backs",
         "submit",
         "zero",
-        ("prefetches", [(4, 3), (5, 1)]),
         "submit",
         "load_backs",
     ]
@@ -971,12 +970,6 @@ def test_the_handle_stays_a_closed_list_of_named_operations():
         "execute",
         "role",
         "poll_cache_results",
-        "consume_l3_backup_poll_failure",
-        "query_l3_storage",
-        "l3_prefetch_progress",
-        "complete_l3_prefetch",
-        "delete_l3_namespace",
-        "set_l3_weight_version",
         "shutdown_cache",
         "run_idle_forward",
         "run_multimodal_work",

@@ -132,23 +132,32 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
                 kvp_rank=0,
             )
         store = self.MemoryKvStore()
-        executor.attach_l3_storage(
-            store,
-            key_prefix="e2e",
-            rank=0,
+        from tokenspeed.runtime.cache.hicache import HiCacheEngine
+        from tokenspeed.runtime.cache.l3.engine import L3CacheEngine
+        from tokenspeed.runtime.cache.l3.executor import L3HostStore
+
+        l3 = L3CacheEngine(
+            L3HostStore(
+                store,
+                executor.host_storage.host_buffer_view(),
+                key_prefix="e2e",
+                rank=0,
+            ),
+            executor.block_owners,
             prefix_for_weight_version=lambda version: f"e2e-{version}",
             prefetch_timeout_base_s=10.0,
             prefetch_timeout_per_page_s=0.0,
             prefetch_batch_pages=128,
         )
-        self.addCleanup(executor.shutdown)
+        cache = HiCacheEngine(l3)
+        self.addCleanup(lambda: cache.shutdown(executor.shutdown()))
 
         # A CUDA fence cannot complete a CPU storage future. Hold PUT until
         # the test observes the pending ACK, then let normal polling finish it.
         put_started = threading.Event()
         release_put = threading.Event()
         self.addCleanup(release_put.set)
-        backend = executor.l3_store.backend
+        backend = l3._store.backend
         original_put = backend.batch_put_from
 
         def gated_put(keys, host_buffer, offsets, sizes):
@@ -176,22 +185,22 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
         executor._start_writing(  # pylint: disable=protected-access
             [7],
             [(0, 1, 1), (0, 4, 4), (1, 3, 3)],
-            backup_pages,
+            host_pages=backup_pages,
             lane=executor._pinned_write_lane,
             prerequisite_stream=torch.cuda.current_stream(),
         )
         executor.write_stream.synchronize()
-        write_results = executor.poll_results()
+        write_results = cache.process_results(executor.poll_results())
         self.assertEqual(write_results, [])
         self.assertTrue(put_started.wait(timeout=10), "L3 backup did not start")
         release_put.set()
         deadline = time.monotonic() + 10
         while not write_results and time.monotonic() < deadline:
-            write_results = executor.poll_results()
+            write_results = cache.process_results(executor.poll_results())
             if not write_results:
                 time.sleep(0.001)
         self.assertEqual([int(event.op_id) for event in write_results], [7])
-        self.assertEqual(executor.l3_store.exists(backup_pages), [True, True, True])
+        self.assertEqual(l3._store.exists(backup_pages), [True, True, True])
 
         # Prove restore comes from L3, not leftover Host bytes.
         executor.host_storage.host_buffer.fill_(0)
@@ -200,7 +209,7 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
         torch.cuda.synchronize()
         self.assertFalse(bool(executor.host_storage.host_buffer.any().item()))
 
-        self.assertEqual(executor.l3_store.prefetch(backup_pages), [True, True, True])
+        self.assertEqual(l3._store.prefetch(backup_pages), [True, True, True])
         self.assertTrue(bool(executor.host_storage.host_buffer.any().item()))
 
         load_index = executor._start_loading(  # pylint: disable=protected-access
@@ -213,7 +222,7 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
         pool.load_tracker.wait_for_layer(0)
         pool.load_tracker.wait_for_layer(1)
         torch.cuda.synchronize()
-        load_results = executor.poll_results()
+        load_results = cache.process_results(executor.poll_results())
         self.assertEqual([int(event.op_id) for event in load_results], [9])
 
         self.assertTrue(

@@ -70,7 +70,7 @@ class _Scheduler:
         self.registered = (list(groups), list(hashes), list(offsets))
 
 
-class _Device:
+class _L3Engine:
     """The DeviceHandle surface the hooks use: the exists probe and the
     prefetch lane's progress/completion."""
 
@@ -80,14 +80,17 @@ class _Device:
         self.progress: dict[int, tuple[bool, int]] = {}
         self.completed: list[tuple[int, int]] = []
 
-    def query_l3_storage(self, pages):
+    def exists(self, pages):
         self.pages = list(pages)
         return None if self.exists_flags is None else list(self.exists_flags)
 
-    def l3_prefetch_progress(self):
+    def submit_prefetches(self, cache_ops):
+        assert not cache_ops
+
+    def prefetch_progress(self):
         return dict(self.progress)
 
-    def complete_l3_prefetch(self, op_id, landed_pages) -> None:
+    def complete_prefetch(self, op_id, landed_pages) -> None:
         self.completed.append((int(op_id), int(landed_pages)))
         self.progress.pop(int(op_id))
 
@@ -96,7 +99,7 @@ class _Harness:
     """Construct the real hooks with explicit scheduler/device dependencies."""
 
     def __init__(self, exists_flags) -> None:
-        self.device = _Device(exists_flags)
+        self.device = _L3Engine(exists_flags)
         self.scheduler = _Scheduler()
         self.hooks = L3CacheHooks(
             self.scheduler,
@@ -239,7 +242,7 @@ def test_exists_rpc_error_converges_as_misses() -> None:
         ctx.device.pages = list(pages)
         raise RuntimeError("batch_is_exist failed")
 
-    ctx.device.query_l3_storage = boom
+    ctx.device.exists = boom
     ctx.hooks.submit_requests([_spec("r0", [1, 2, 3, 4])])
     assert probed == [[False]]
     assert ctx.scheduler.registered is None
@@ -342,7 +345,7 @@ def test_the_hooks_no_longer_skip_forwards_or_reprobe_queued_hits() -> None:
     # hooks have no forward to skip, nothing to retract and no queue to
     # re-probe. The surface is the submit-time probe and the convergence.
     public = sorted(name for name in vars(L3CacheHooks) if not name.startswith("_"))
-    assert public == ["converge_prefetches", "submit_requests"]
+    assert public == ["converge_prefetches", "submit_plan", "submit_requests"]
 
 
 @pytest.fixture
@@ -391,10 +394,13 @@ def test_prefetch_convergence_precedes_the_rounds_cache_poll(
     trace = []
     first_forward = SimpleNamespace(request_ids=["running"], input_lengths=[1])
     first_plan = SimpleNamespace(
-        forward=[first_forward], remote_prefill=None, aborts=[]
+        forward=[first_forward], remote_prefill=None, aborts=[], cache=()
     )
     second_plan = SimpleNamespace(
-        forward=[], remote_prefill=SimpleNamespace(request_ids=["remote"]), aborts=[]
+        forward=[],
+        remote_prefill=SimpleNamespace(request_ids=["remote"]),
+        aborts=[],
+        cache=(),
     )
     plans = iter([first_plan, second_plan])
 
@@ -414,18 +420,19 @@ def test_prefetch_convergence_precedes_the_rounds_cache_poll(
 
     progress = {7: (False, 0)}
 
-    def l3_prefetch_progress():
+    def prefetch_progress():
         trace.append(("progress", dict(progress)))
         return dict(progress)
 
-    def complete_l3_prefetch(op_id, landed):
+    def complete_prefetch(op_id, landed):
         trace.append(("complete", op_id, landed))
         progress.pop(op_id)
 
     device = SimpleNamespace(
-        query_l3_storage=lambda pages: [True],
-        l3_prefetch_progress=l3_prefetch_progress,
-        complete_l3_prefetch=complete_l3_prefetch,
+        exists=lambda pages: [True],
+        submit_prefetches=lambda ops: trace.append(("prefetch_submit",)),
+        prefetch_progress=prefetch_progress,
+        complete_prefetch=complete_prefetch,
         execute=execute,
         run_idle_forward=lambda metadata: trace.append(("idle",)),
     )
@@ -519,7 +526,8 @@ def test_prefetch_convergence_precedes_the_rounds_cache_poll(
         assert advances == [["cache0"], ["prefetch_done:7"], ["committed:running"]]
     for plan in (first_plan, second_plan):
         plan_index = trace.index(("plan", plan))
-        assert trace[plan_index + 1] == ("aborts", [])
+        assert trace[plan_index + 1] == ("prefetch_submit",)
+        assert trace[plan_index + 2] == ("aborts", [])
     loop._cache_hooks.count_plan_ops.assert_any_call(second_plan)
 
 

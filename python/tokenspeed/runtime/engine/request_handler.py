@@ -203,6 +203,7 @@ class RequestHandler:
         architectures: list[str] | None = None,
         *,
         tokenizer_kwargs: Mapping[str, object],
+        l3_engine,
         pause_controller=None,
         memory_controller=None,
         device=None,
@@ -219,6 +220,7 @@ class RequestHandler:
         # data plane so it is ordered against forwards. The scheduler worker
         # passes the handle in; None elsewhere (e.g. unit tests).
         self._device = device
+        self._l3 = l3_engine
 
         mapping = server_args.mapping
         self.attn_tp_size = mapping.attn.tp_size
@@ -700,10 +702,10 @@ class RequestHandler:
         return self.clear_cache_fn is not None and self.clear_cache_fn()
 
     def _delete_l3_namespace(self) -> bool:
-        device = self._device
-        if device is None:
+        l3 = self._l3
+        if l3 is None:
             return True
-        return bool(device.delete_l3_namespace())
+        return bool(l3.delete_namespace())
 
     def _converge_replica_decision(self, local_ok: bool) -> bool:
         """MIN-reduce a yes/no across every rank that shares this flush.
@@ -765,7 +767,8 @@ class RequestHandler:
         if version is None:
             return True, msg
         self.server_args.weight_version = str(version)
-        self._device.set_l3_weight_version(str(version))
+        if self._l3 is not None:
+            self._l3.set_weight_version(str(version))
         return True, msg
 
     def handle_generate_request(

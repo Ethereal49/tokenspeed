@@ -5,6 +5,15 @@ on:
     branches: [main]
     paths:
       - "python/tokenspeed/runtime/cache/l3/**"
+      - "python/tokenspeed/runtime/cache/hicache.py"
+      - "python/tokenspeed/runtime/cache/transfer/host_buffer.py"
+      - "python/tokenspeed/runtime/cache/transfer/ops.py"
+      - "python/tokenspeed/runtime/cache/l2/**"
+      - "python/tokenspeed/runtime/engine/*cache_hooks.py"
+      - "python/tokenspeed/runtime/execution/device.py"
+      - "tokenspeed-scheduler/**"
+      - "test/test_l3_engine.py"
+      - "test/test_hicache_boundaries.py"
       - "test/test_l3_mooncake_master.py"
       - "test/test_l3_kvstore.py"
       - ".github/workflows/mooncake-l3-test.yml"
@@ -12,6 +21,15 @@ on:
     branches: [main]
     paths:
       - "python/tokenspeed/runtime/cache/l3/**"
+      - "python/tokenspeed/runtime/cache/hicache.py"
+      - "python/tokenspeed/runtime/cache/transfer/host_buffer.py"
+      - "python/tokenspeed/runtime/cache/transfer/ops.py"
+      - "python/tokenspeed/runtime/cache/l2/**"
+      - "python/tokenspeed/runtime/engine/*cache_hooks.py"
+      - "python/tokenspeed/runtime/execution/device.py"
+      - "tokenspeed-scheduler/**"
+      - "test/test_l3_engine.py"
+      - "test/test_hicache_boundaries.py"
       - "test/test_l3_mooncake_master.py"
       - "test/test_l3_kvstore.py"
       - ".github/workflows/mooncake-l3-test.yml"
@@ -38,6 +56,7 @@ jobs:
         run: |
           python -m pip install --retries 10 --timeout 60 \
             'tokenspeed-mooncake==0.3.13.post20260825' \
+            'tokenspeed-scheduler==0.1.30' \
             'nvidia-cuda-runtime==13.0.96'
           # The wheel links CUDA 13 and libcuda even for Host-only TCP tests.
           # Install user-space driver libraries; no GPU or kernel driver is used.
@@ -55,4 +74,4 @@ jobs:
           MOONCAKE_REQUIRE_MASTER: "1"
           PYTHONPATH: python
         run: |
-          python -m unittest test.test_l3_kvstore test.test_l3_mooncake_master -v
+          python -m unittest test.test_l3_kvstore test.test_l3_engine test.test_l3_mooncake_master -v

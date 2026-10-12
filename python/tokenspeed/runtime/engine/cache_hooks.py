@@ -91,6 +91,7 @@ class CacheOpHooks:
         self,
         device,
         *,
+        cache_engine,
         speculative_algorithm: str | None,
         attn_tp_rank: int,
         attn_tp_size: int,
@@ -100,6 +101,7 @@ class CacheOpHooks:
         global_rank: int,
     ) -> None:
         self._device = device
+        self._cache_engine = cache_engine
         # Replica-wide skip/intersect is the general path, not DFLASH-only.
         # The argument stays required so EventLoop wiring remains explicit.
         self._speculative_algorithm = speculative_algorithm
@@ -150,7 +152,9 @@ class CacheOpHooks:
         """
         if self._device is None:
             return []
-        cache_results = self._device.poll_cache_results()
+        cache_results = self._cache_engine.process_results(
+            self._device.poll_cache_results()
+        )
         self._num_inflight -= len(cache_results)
         for event in cache_results:
             payload = cache_event_to_payload(event)
@@ -162,7 +166,7 @@ class CacheOpHooks:
         # while others return, deadlocking the group. Agree on work and on
         # backup failure via a two-int MAX all_reduce on each replica group.
         local_has_work = bool(self._num_inflight != 0 or self._pending_payloads)
-        local_backup_failed = self._device.consume_l3_backup_poll_failure()
+        local_backup_failed = self._cache_engine.consume_backup_poll_failure()
         if self._replica_groups:
             has_work, backup_failed = self._converge_poll_state(
                 local_has_work, local_backup_failed

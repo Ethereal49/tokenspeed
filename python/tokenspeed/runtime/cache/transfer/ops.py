@@ -50,6 +50,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum
 
+HostPage = tuple[int, int, str, int]  # group index, local Host block, hash, page offset
+
+
+@dataclass(frozen=True, slots=True)
+class HostWriteBackCompletion:
+    """Completed D2H bytes whose scheduler ACK may still require a Store PUT.
+
+    Attributes:
+        op_ids: Scheduler operation IDs protected by this copy's completion.
+        host_pages: Hashed Host destinations, owned by the copy's tickets.
+    """
+
+    op_ids: tuple[int, ...]
+    host_pages: tuple[HostPage, ...]
+
 
 class HostTier(IntEnum):
     """Which pinned Host buffer a restore row reads (``Cache.HostTier`` on the wire)."""

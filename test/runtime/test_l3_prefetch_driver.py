@@ -35,6 +35,7 @@ import pytest
 
 ts = pytest.importorskip("tokenspeed_scheduler")
 
+from tokenspeed.runtime.cache.hicache import HiCacheEngine
 from tokenspeed.runtime.cache.transfer.ops import PrefetchOp  # noqa: E402
 from tokenspeed.runtime.engine.cache_hooks import CacheOpHooks  # noqa: E402
 from tokenspeed.runtime.engine.l3_cache_hooks import L3CacheHooks  # noqa: E402
@@ -56,10 +57,10 @@ class _Device:
         self.progress: dict[int, tuple[bool, int]] = {}
         self.results: list = []
 
-    def l3_prefetch_progress(self):
+    def prefetch_progress(self):
         return dict(self.progress)
 
-    def complete_l3_prefetch(self, op_id, landed_pages) -> None:
+    def complete_prefetch(self, op_id, landed_pages) -> None:
         self.progress.pop(op_id)
         self.results.append(ts.Cache.PrefetchDoneEvent(op_id, landed_pages))
 
@@ -102,6 +103,7 @@ def _scheduler() -> ts.Scheduler:
 def _cache_hooks(device) -> CacheOpHooks:
     return CacheOpHooks(
         device,
+        cache_engine=HiCacheEngine(None),
         speculative_algorithm=None,
         attn_tp_rank=0,
         attn_tp_size=1,

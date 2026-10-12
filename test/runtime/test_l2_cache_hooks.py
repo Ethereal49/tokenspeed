@@ -108,7 +108,7 @@ class _Device:
         results, self.results = self.results, []
         return results
 
-    def consume_l3_backup_poll_failure(self) -> bool:
+    def consume_backup_poll_failure(self) -> bool:
         failed = self.backup_failed
         self.backup_failed = False
         return failed
@@ -116,6 +116,7 @@ class _Device:
 
 def _hooks(
     device,
+    cache_engine,
     speculative_algorithm,
     attn_tp_size,
     attn_tp_cpu_group,
@@ -124,6 +125,7 @@ def _hooks(
 ) -> CacheOpHooks:
     return CacheOpHooks(
         device,
+        cache_engine=cache_engine,
         speculative_algorithm=speculative_algorithm,
         attn_tp_rank=0,
         attn_tp_size=attn_tp_size,
@@ -137,6 +139,14 @@ def _hooks(
 def _single_rank_hooks(device) -> CacheOpHooks:
     return _hooks(
         device,
+        cache_engine=SimpleNamespace(
+            process_results=lambda results: results,
+            consume_backup_poll_failure=(
+                device.consume_backup_poll_failure
+                if device is not None
+                else lambda: False
+            ),
+        ),
         speculative_algorithm=None,
         attn_tp_size=1,
         attn_tp_cpu_group=None,
@@ -294,6 +304,14 @@ def test_pp_peer_missing_writeback_keeps_payload_pending(
     pp_group = object()
     hooks = _hooks(
         device,
+        cache_engine=SimpleNamespace(
+            process_results=lambda results: results,
+            consume_backup_poll_failure=(
+                device.consume_backup_poll_failure
+                if device is not None
+                else lambda: False
+            ),
+        ),
         speculative_algorithm=None,
         attn_tp_size=1,
         attn_tp_cpu_group=None,
@@ -329,6 +347,14 @@ def test_pp_agreed_writeback_emits_event(
     pp_group = object()
     hooks = _hooks(
         device,
+        cache_engine=SimpleNamespace(
+            process_results=lambda results: results,
+            consume_backup_poll_failure=(
+                device.consume_backup_poll_failure
+                if device is not None
+                else lambda: False
+            ),
+        ),
         speculative_algorithm=None,
         attn_tp_size=1,
         attn_tp_cpu_group=None,
@@ -367,6 +393,14 @@ def test_gather_order_is_attention_tp_then_pp(
     pp_group = object()
     hooks = _hooks(
         device,
+        cache_engine=SimpleNamespace(
+            process_results=lambda results: results,
+            consume_backup_poll_failure=(
+                device.consume_backup_poll_failure
+                if device is not None
+                else lambda: False
+            ),
+        ),
         speculative_algorithm=None,
         attn_tp_size=2,
         attn_tp_cpu_group=tp_group,
@@ -407,6 +441,14 @@ def test_empty_tp_intersection_still_gathers_pp(
     pp_group = object()
     hooks = _hooks(
         device,
+        cache_engine=SimpleNamespace(
+            process_results=lambda results: results,
+            consume_backup_poll_failure=(
+                device.consume_backup_poll_failure
+                if device is not None
+                else lambda: False
+            ),
+        ),
         speculative_algorithm=None,
         attn_tp_size=2,
         attn_tp_cpu_group=tp_group,
@@ -449,6 +491,14 @@ def test_idle_replica_max_reduces_then_gathers_when_peer_has_work(
     pp_group = object()
     hooks = _hooks(
         device,
+        cache_engine=SimpleNamespace(
+            process_results=lambda results: results,
+            consume_backup_poll_failure=(
+                device.consume_backup_poll_failure
+                if device is not None
+                else lambda: False
+            ),
+        ),
         speculative_algorithm=None,
         attn_tp_size=1,
         attn_tp_cpu_group=None,
@@ -486,6 +536,14 @@ def test_idle_replica_skips_gather_only_after_unanimous_max_reduce(
     pp_group = object()
     hooks = _hooks(
         device,
+        cache_engine=SimpleNamespace(
+            process_results=lambda results: results,
+            consume_backup_poll_failure=(
+                device.consume_backup_poll_failure
+                if device is not None
+                else lambda: False
+            ),
+        ),
         speculative_algorithm=None,
         attn_tp_size=1,
         attn_tp_cpu_group=None,
@@ -519,6 +577,14 @@ def test_replica_backup_failure_raises_after_poll_all_reduce(
     pp_group = object()
     hooks = _hooks(
         device,
+        cache_engine=SimpleNamespace(
+            process_results=lambda results: results,
+            consume_backup_poll_failure=(
+                device.consume_backup_poll_failure
+                if device is not None
+                else lambda: False
+            ),
+        ),
         speculative_algorithm=None,
         attn_tp_size=1,
         attn_tp_cpu_group=None,

@@ -32,6 +32,7 @@ how long the caller may hold each piece:
 | --- | --- | --- |
 | `DeviceSpecs` | plain values the loop plans with: cache geometry, cache groups, speculation widths, capability flags | keep forever |
 | `DeviceHandle` | the running handle: the complete list of what the loop may ask of the device side | the only one stored (`self._device`) |
+| `cache_engine` | Host-only coordinator; CPU buffer view, L3 Store and background I/O | kept by the cache hooks; no Device objects |
 | `transfer` | the PD peer's CONTROL face — bootstrap register/abort, event polling — or None outside PD | held by the PD hooks |
 | `encoder_model_facts` | a callable resolving the encoder facts EPD admission needs (raises on text-only) | consumed at startup, past the EPD gate |
 
@@ -92,14 +93,15 @@ Consequences:
   closure" slot is the hole this whole design closes, so a second KIND of
   user does not join it — it gets its own name.
   The architecture test pins the exact public operation names, not a numeric
-  size limit. L3 adds named Host-tier operations for the existence probe,
-  the prefetch lane's progress and completion (the hooks converge them each
-  round), namespace and weight-version changes, and cache shutdown. These
-  keep the executor and Host buffer hidden; they do not introduce another
-  generic work slot. The
-  retraction snapshot pool adds no operation at all: its stores ride
+  size limit. Host-only L3 operations live on `L3CacheEngine`, outside
+  `DeviceHandle`. The builder hands `HiCacheEngine` to the control plane;
+  its buffer view carries CPU bytes and scalar geometry, never the
+  `HostCacheStorage` object whose layout retains Device buffers.
+  Changing the Device surface requires updating its operation allowlist
+  in `test/runtime/test_device_handle.py`.
+  The retraction snapshot pool adds no operation at all: its stores ride
   `execute` with the write-backs, its restores with the load-backs, its ACKs
-  `poll_cache_results`, and `shutdown_cache` closes it with L2 -- one
+  `poll_cache_results`, and `shutdown_cache` retires it with L2 -- one
   `HostCacheExecutor` behind the handle, two Host buffers inside it. The
   plan's cache ops cross the handle through one adapter,
   `scheduler_utils.cache_ops_from_plan`: the L2 batches (`Cache.WriteBackOp`,
@@ -128,8 +130,6 @@ Consequences:
   op). Both are rank-local on the handle. The rebalance may reduce the
   snapshot over the EP group because its ops ride the same-round gate
   (below), unlike the profile's dump.
-  Changing this surface requires updating both this contract and the explicit
-  operation allowlist in `test/runtime/test_device_handle.py`.
 * The role is a **value** (`DeviceRole`), not a class hierarchy. Subclassing
   per role forced the handle to publish its own internals so the subclasses
   could call back into it — a reference cycle for about a dozen lines of
@@ -348,7 +348,7 @@ Current inventory:
 | `_epd_hooks`   | `EpdPrefillHooks` — `epd/prefill_hooks.py`    | glue (EpdPrefillAdmission decides)          | `try_stage`, `drain_ready_embeddings`, `assert_embeddings_received` |
 | `_pd_hooks`    | `PdTransferHooks` — `pd/transfer_hooks.py`    | glue (transfer executors decide)            | `poll_transfer_events` |
 | `_cache_hooks` | `CacheOpHooks` — `engine/cache_hooks.py`      | glue-ish (handed the `DeviceHandle`: submission rides `execute`; polling stays control-side event queries; counts the Host L2 write-backs/load-backs and the retraction image's snapshot stores/restores alike) | `count_plan_ops`, `poll_ready_events` |
-| `_l3_hooks` | `L3CacheHooks` — `engine/l3_cache_hooks.py` | self-contained (injected scheduler, `DeviceHandle`, static replica groups; no loop reference) | `submit_requests`, `converge_prefetches` |
+| `_l3_hooks` | `L3CacheHooks` — `engine/l3_cache_hooks.py` | self-contained (injected scheduler, Host-only L3 engine, static replica groups; no loop reference) | `submit_requests`, `submit_plan`, `converge_prefetches` |
 | `_eplb_hooks` | `EplbHooks` — `engine/eplb_hooks.py` | glue (`ExpertRebalanceController` in `moe/expert_rebalance.py` is the state machine; handed the `DeviceHandle`, the request handler and the EP gloo group; no loop reference) | `note_round` |
 
 `_pause_hooks` and `_pd_hooks` also receive the `DeviceHandle`: both have
@@ -376,16 +376,20 @@ loop body knows a rebalance exists.
 submission (the `batch_exists` probe, MIN-reduced so every mirrored scheduler
 registers the same keys) and, once a round, the convergence of the in-flight
 prefetch ops -- the scheduler fetches an L3 hit into Host pages *before* it
-admits the request (`Cache.PrefetchOp`, a CPU lane behind `DeviceHandle`),
+admits the request (`Cache.PrefetchOp`, a CPU lane on `L3CacheEngine`),
 and the hooks MIN-reduce each op's done flag and landed prefix across the
-replica, completing a converged op on the device so its one
+replica, completing a converged op on the L3 engine so its one
 `PrefetchDoneEvent(op_id, landed_pages)` rides the next cache poll. They
 return nothing and never advance the scheduler; no forward is ever skipped
 or retracted because of L3, since only the L3-to-Host leg can miss and it
 runs before admission. With L3 disabled, the same hooks submit requests
 without token hashing, storage probes or replica collectives. Storage state
-and the prefetch lane remain behind `DeviceHandle`; namespace deletion and
-flush coordination stay in `RequestHandler`.
+and the prefetch lane live in `L3CacheEngine`; namespace deletion and
+flush coordination stay in `RequestHandler`, which receives that engine
+separately from its Device handle. `HostCacheExecutor` reports completed
+D2H destinations as `HostWriteBackCompletion`. `HiCacheEngine` starts their
+PUTs and returns write ACKs only after success, preserving transfer pins and
+the replica-wide failure decision in `CacheOpHooks`.
 
 Per-round dispatch needs no hooks class at all: the loop hands
 `DeviceHandle.execute` the plan and the round's `PlannedForward`, and the
@@ -417,12 +421,13 @@ For orientation, one iteration of `event_loop`:
    and EPD admission hooks inline as single lines.
 2. Converge the in-flight L3 prefetches (`_l3_hooks.converge_prefetches`:
    a replica MIN of each op's landed prefix; a finished op is completed on
-   the device), then poll completed Host cache ops (L2 write-backs/
+   the L3 engine), then poll completed Host cache ops (L2 write-backs/
    load-backs, prefetches, snapshot stores/restores); **advance the
    scheduler (head call site)** so this round's plan sees them.
 3. Frozen (`PAUSED_ALL`)? Drain the in-flight queue and run the paused idle
    step. Otherwise: plan (`next_execution_plan`),
-   count its cache ops, finish the requests the plan aborted
+   count its cache ops, submit Host-only prefetches through `_l3_hooks.submit_plan`,
+   finish the requests the plan aborted
    (`plan.aborts`: a capacity retraction whose victim could not be imaged
    aborted the newest resident inside the plan build; the scheduler
    released its pages in that round and emits nothing further for it, so
@@ -434,9 +439,7 @@ For orientation, one iteration of `event_loop`:
 4. **One `DeviceHandle.execute(plan, planned)` call per round**, in an order
    that is itself a correctness contract for same-round page reuse. The
    handle adapts the plan's cache ops once (`cache_ops_from_plan`, on the
-   control plane), starts the L3 prefetches on the executor's CPU lane
-   (`PrefetchOp`: no stream, no Device page, nothing on the FIFO) and
-   submits, on the FIFO: the Host-bound stores first --
+   control plane) and submits, on the FIFO: the Host-bound stores first --
    `WriteBackOp` and `SnapshotOp`, a retraction image's two legs (the
    stream-ordered L2 write-back of the victim's hash-complete pages and the
    snapshot store of its tail pages and slot state) must read the reused
@@ -445,9 +448,7 @@ For orientation, one iteration of `event_loop`:
    anything else of the plan is enqueued; an ordinary store's sources are
    pinned by the scheduler until the ACK, so its copy rides the write stream
    and fences nothing -- then page zeroing (the new owner's sanitization),
-   then L3 prefetches (`PrefetchOp`: Host-lane submissions with no stream
-   dependency, nothing in the round reads their pages), then the
-   Device-bound copies -- `LoadBackOp` and `RestoreOp`, ordered
+   then the Device-bound copies -- `LoadBackOp` and `RestoreOp`, ordered
    behind the zeroing: a load-back lands on zeroed pages and the forward
    reads it layer by layer behind the layerwise fences, so the loads start
    first on the load stream; a restore queues behind them, overwrites its
@@ -553,8 +554,12 @@ For orientation, one iteration of `event_loop`:
   it) while the executor's lane fills the pages in prefix order, stopping at
   the first missing object or at the deadline -- which bounds when the next
   batch may start, not a batch in flight: the store's `batch_get_into` has
-  no timeout, so a hung get holds the single-thread lane and every later
-  prefetch, the namespace delete and shutdown behind it. Each round the hooks
+  no timeout, so a hung get holds its Host pages, the namespace delete and
+  shutdown. Prefetch budgets start at submission. A queued future may expire
+  as a miss only when `ThreadPoolExecutor.cancel()` proves its worker never
+  started; an in-flight future cannot be cancelled or acknowledged early.
+  Queued requests can therefore compute instead of waiting behind the stalled
+  call, while the active call's destinations stay pinned until retirement. Each round the hooks
   MIN-reduce every in-flight op's landed prefix across the replica; the
   converged op is acknowledged once as `PrefetchDoneEvent(op_id,
   landed_pages)`, the scheduler publishes the landed prefix in the Host
