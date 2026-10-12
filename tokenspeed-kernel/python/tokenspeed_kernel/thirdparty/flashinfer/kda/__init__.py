@@ -42,15 +42,19 @@ FLASHINFER_KDA_MAX_VERIFY_TOKENS = 16
 
 @cache
 def flashinfer_kda_recurrent_available() -> bool:
-    """Require both public modes and their optional CuTe implementations."""
+    """Require the public frozen-state API and both optional CuTe backends."""
     try:
-        from flashinfer import kda_decode
+        from flashinfer import recurrent_kda
+        from flashinfer.kda_kernels import run_recurrent_kda
+        from flashinfer.kda_kernels.kda_decode_wy_output_only import kda_wy_output_only
     except (ImportError, OSError, RuntimeError):
         return False
-    return bool(
-        getattr(kda_decode, "_RECURRENT_KDA_AVAILABLE", False)
-        and getattr(kda_decode, "_KDA_OUTPUT_ONLY_AVAILABLE", False)
-        and "disable_state_update" in signature(kda_decode.recurrent_kda).parameters
+    # The public facade can import even when the optional kernels cannot.
+    # Check the backends without relying on the deprecated facade's flags.
+    return (
+        callable(run_recurrent_kda)
+        and callable(kda_wy_output_only)
+        and "disable_state_update" in signature(recurrent_kda).parameters
     )
 
 
@@ -70,7 +74,7 @@ def _recurrent_decode(
     lower_bound: float | None,
 ) -> torch.Tensor:
     """Run one recurrent step with independent source and destination indices."""
-    from flashinfer.kda_decode import recurrent_kda
+    from flashinfer import recurrent_kda
 
     # FI's grouped branch rebuilds dense token strides for Q/K/V and beta.
     # TS supplies slices of packed projection/conv tensors; compact them.
@@ -207,7 +211,7 @@ def flashinfer_kda_producer_verify(
             f"{FLASHINFER_KDA_MAX_VERIFY_TOKENS}; got {draft_token_num}. "
             "Use automatic dispatch or native Triton for longer windows."
         )
-    from flashinfer.kda_decode import recurrent_kda
+    from flashinfer import recurrent_kda
 
     batch = read_indices.numel()
     rows = batch * draft_token_num
