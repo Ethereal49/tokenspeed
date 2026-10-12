@@ -905,14 +905,14 @@ class KimiK3RegistrationTests(unittest.TestCase):
         from tokenspeed.runtime.models import kimi_k3
 
         config = KimiLinearConfig(
-            hidden_size=128,
+            hidden_size=256 if fp8 else 128,
             num_hidden_layers=1,
             num_attention_heads=1,
             num_key_value_heads=1,
             linear_attn_config={
                 "kda_layers": [1],
                 "full_attn_layers": [],
-                "num_heads": 1,
+                "num_heads": 2 if fp8 else 1,
                 "head_dim": 128,
                 "short_conv_kernel_size": 4,
                 "gate_lower_bound": -5.0,
@@ -933,15 +933,17 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 )
             )
             layer.o_proj.weight = torch.nn.Parameter(
-                torch.empty(128, 128, dtype=torch.float8_e4m3fn), requires_grad=False
+                torch.empty(256, 256, dtype=torch.float8_e4m3fn), requires_grad=False
             )
             layer.o_proj.register_parameter(
                 "weight_scale_inv",
-                torch.nn.Parameter(torch.ones(1, 1), requires_grad=False),
+                torch.nn.Parameter(torch.ones(2, 2), requires_grad=False),
             )
         return layer
 
-    def test_kda_output_plan_is_prepared_after_quantization_and_reset_on_reload(self):
+    def test_kda_output_plan_is_prepared_after_quantization_and_refreshed_on_reload(
+        self,
+    ):
         from tokenspeed.runtime.models import kimi_k3
 
         layer = self._kda_output_layer(fp8=True)
@@ -949,7 +951,9 @@ class KimiK3RegistrationTests(unittest.TestCase):
             kimi_k3.KimiLinearForCausalLM
         )
         torch.nn.Module.__init__(language_model)
-        language_model.model = layer
+        language_model.model = torch.nn.ModuleDict(
+            {"layers": torch.nn.ModuleList([torch.nn.ModuleDict({"self_attn": layer})])}
+        )
         model = kimi_k3.KimiK3ForConditionalGeneration.__new__(
             kimi_k3.KimiK3ForConditionalGeneration
         )
@@ -963,18 +967,31 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 kimi_k3, "has_flashinfer_fp8_blockscale", return_value=True
             ),
         ):
+            model.post_load_weights()
+            self.assertIsNone(layer._output_plan)
             model.post_quant_warmup()
             first_plan = layer._output_plan
             self.assertTrue(kimi_k3.fp8_linear_gated_rmsnorm_supported(first_plan))
-            layer.fuse_conv_weights()
-            self.assertIsNone(layer._output_plan)
+            scales = first_plan.prepared_weight_scales
+            scales_ptr = scales.data_ptr()
+            updated_scales = torch.tensor([[2.0, 3.0], [5.0, 7.0]])
+            layer.o_proj.weight_scale_inv.copy_(updated_scales)
+            model.post_load_weights()
+            self.assertIs(layer._output_plan, first_plan)
+            self.assertEqual(first_plan.prepared_weight_scales.data_ptr(), scales_ptr)
+            torch.testing.assert_close(scales, updated_scales.t(), atol=0, rtol=0)
             model.post_quant_warmup()
-            self.assertIsNot(layer._output_plan, first_plan)
+            self.assertIs(layer._output_plan, first_plan)
+            self.assertEqual(first_plan.prepared_weight_scales.data_ptr(), scales_ptr)
 
             layer.o_proj.quant_method.quant_config.scale_fmt = "ue8m0"
-            model.post_quant_warmup()
-            self.assertIsNone(layer._output_plan)
-            layer.o_proj.quant_method.quant_config.scale_fmt = None
+            with self.assertRaisesRegex(ValueError, "changed format"):
+                model.post_quant_warmup()
+            self.assertIs(layer._output_plan, first_plan)
+            unsupported = self._kda_output_layer(fp8=True)
+            unsupported.o_proj.quant_method.quant_config.scale_fmt = "ue8m0"
+            unsupported.prepare_output_plan()
+            self.assertIsNone(unsupported._output_plan)
             for weight_shape, scale_shape, scale_dtype in (
                 ((128, 128), (1,), torch.float32),
                 ((129, 128), (2, 1), torch.float32),
@@ -986,14 +1003,15 @@ class KimiK3RegistrationTests(unittest.TestCase):
                     scale_shape=scale_shape,
                     scale_dtype=scale_dtype,
                 ):
-                    layer.o_proj.weight.data = torch.empty(
+                    unsupported = self._kda_output_layer(fp8=True)
+                    unsupported.o_proj.weight.data = torch.empty(
                         weight_shape, dtype=torch.float8_e4m3fn
                     )
-                    layer.o_proj.weight_scale_inv.data = torch.ones(
+                    unsupported.o_proj.weight_scale_inv.data = torch.ones(
                         scale_shape, dtype=scale_dtype
                     )
-                    model.post_quant_warmup()
-                    self.assertIsNone(layer._output_plan)
+                    unsupported.prepare_output_plan()
+                    self.assertIsNone(unsupported._output_plan)
             unquantized = self._kda_output_layer(fp8=False)
             unquantized.prepare_output_plan()
             self.assertIsNone(unquantized._output_plan)

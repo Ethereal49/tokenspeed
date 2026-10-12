@@ -1416,7 +1416,6 @@ class KimiLinearKDA(nn.Module):
         A live weight update re-runs this; the bank is written in place so
         captured CUDA graphs keep its address.
         """
-        self._output_plan = None
         self.conv_weights = bind_or_copy(
             self.conv_weights,
             torch.cat(
@@ -1426,8 +1425,7 @@ class KimiLinearKDA(nn.Module):
         )
 
     def prepare_output_plan(self) -> None:
-        """Prepare the fused KDA output after quantized weights are finalized."""
-        self._output_plan = None
+        """Prepare or refresh FP8 scales while preserving captured storage."""
         method = self.o_proj.quant_method
         if (
             self.output_parallel is not None
@@ -1444,12 +1442,23 @@ class KimiLinearKDA(nn.Module):
             or global_server_args_dict["dense_gemm_backend"] != "auto"
             or not has_flashinfer_fp8_blockscale()
         ):
+            if self._output_plan is not None:
+                raise ValueError(
+                    "KDA output projection changed format after preparation"
+                )
             return
-        self._output_plan = prepare_fp8_linear(
+        plan = prepare_fp8_linear(
             self.o_proj.weight,
             self.o_proj.weight_scale_inv,
             method.quant_config.weight_block_size,
         )
+        if self._output_plan is None:
+            self._output_plan = plan
+        else:
+            bind_or_copy(
+                self._output_plan.prepared_weight_scales,
+                plan.prepared_weight_scales,
+            )
 
     def _project_qkvfab(
         self,
@@ -4198,6 +4207,10 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 )
             elif isinstance(self_attn, KimiLinearKDA):
                 self_attn.fuse_conv_weights()
+                # Initial preparation waits for quantization; live updates
+                # refresh the existing scales without changing graph pointers.
+                if self_attn._output_plan is not None:
+                    self_attn.prepare_output_plan()
                 merged = self_attn.qkvgb_proj
                 if self_attn.qkv_parallel is not None:
                     merged.verify_load_complete()
