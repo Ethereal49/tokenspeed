@@ -26,8 +26,10 @@ from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not current_platform().is_blackwell,
-    reason="requires native Blackwell indexer",
+    not torch.cuda.is_available()
+    or not current_platform().is_blackwell
+    or current_platform().arch_version.minor > 3,
+    reason="requires SM100-SM103 native indexer",
 )
 
 
