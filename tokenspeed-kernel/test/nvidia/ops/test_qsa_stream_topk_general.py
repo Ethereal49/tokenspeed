@@ -73,6 +73,39 @@ def _assert_selection(
     assert bool(((ordered[:, 1:] != ordered[:, :-1]) | (ordered[:, 1:] == -1)).all())
 
 
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_nvidia_stream_empty_queries(
+    device: str, monkeypatch: pytest.MonkeyPatch, enable_pdl: bool
+) -> None:
+    monkeypatch.setattr(general, "_COMPILED", {})
+
+    def unexpected_compile(*args, **kwargs):
+        pytest.fail("Empty QSA queries must not compile or launch a kernel")
+
+    monkeypatch.setattr(general.cute, "compile", unexpected_compile)
+    query = torch.empty((0, 4, 128), device=device, dtype=torch.bfloat16)
+    keys = torch.empty((64, 1, 128), device=device, dtype=query.dtype)
+    table = torch.empty((1, 1), device=device, dtype=torch.int32)
+    requests = torch.empty((0,), device=device, dtype=torch.int32)
+    complete = torch.empty_like(requests)
+
+    selected = cute_ops.cute_dsl_qwen4_exp_qsa_block_topk(
+        query,
+        keys,
+        table,
+        requests,
+        complete,
+        page_size=64,
+        block_topk=512,
+        queries_per_request=None,
+        max_partial_bytes=0,
+        enable_pdl=enable_pdl,
+    )
+    assert selected.shape == (0, 512)
+    assert selected.dtype == torch.int32
+    assert selected.device == query.device
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("enable_pdl", [False, True])
 @pytest.mark.parametrize(

@@ -486,6 +486,7 @@ def kernel(
 
     Tensor dimensions, strides and alignment remain runtime values. Page size,
     head geometry, top-k and PDL are fixed model/kernel choices.
+    Empty query batches return without compiling or launching a kernel.
 
     Args:
         query: BF16, FP16 or FP32 queries shaped ``[rows, heads, head_dim]``.
@@ -533,6 +534,8 @@ def kernel(
     selected_blocks = torch.empty(
         (rows, block_topk), device=query.device, dtype=torch.int32
     )
+    if rows == 0:
+        return selected_blocks
     # Keep alignment a runtime choice so vector and scalar copies share one
     # compiled kernel when feature or projection strides change.
     vectorized_copy = int(
