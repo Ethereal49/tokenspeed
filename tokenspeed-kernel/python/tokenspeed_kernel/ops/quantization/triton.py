@@ -750,7 +750,8 @@ def _fp8_group32_ue8m0_quantize(X, Q, S, K: tl.constexpr, X0: tl.constexpr):
     raw = amax * (1.0 / 448.0)
     bits = raw.to(tl.int32, bitcast=True)
     exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
-    inverse_scale = ((254 - exponent) << 23).to(tl.float32, bitcast=True)
+    scale = (exponent << 23).to(tl.float32, bitcast=True)
+    inverse_scale = 1.0 / scale
     quantized = (values * inverse_scale).to(tl.float8e4nv)
     tl.store(Q + row * K + column, quantized)
     tl.store(S + group, exponent.to(tl.uint8))
