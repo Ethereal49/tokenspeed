@@ -81,7 +81,7 @@ def _configuration(
 ) -> StreamConfig | None:
     # Request widths only establish ownership. Geometry and power-of-two
     # capacity buckets specialize the JIT; live lengths and row counts do not.
-    if rows < 1 or not 0 < capacity <= 65536:
+    if rows < 1 or not 0 < capacity <= 131072:
         return None
     grouped = (
         queries_per_request is not None
@@ -247,8 +247,9 @@ def kernel(
         query: Aligned BF16 queries shaped ``[rows, 4, 128]``.
         key_cache: Contiguous BF16 keys shaped ``[slots, 1, 128]`` with
             complete 64-slot physical pages.
-        page_table: Contiguous int32 physical pages shaped ``[requests, pages]``;
-            at most 1024 pages per request.
+        page_table: Aligned int32 physical pages shaped ``[requests, pages]``
+            with contiguous columns and a runtime row stride; at most 2048
+            pages per request, including speculative context padding.
         request_indices: Contiguous int32 or int64 request id per query row.
         complete_blocks: Contiguous int32 valid compressed-block count per row.
             Counts are clamped to the page-table capacity on the device.
@@ -303,9 +304,15 @@ def kernel(
         raise ValueError("CuTe QSA stream query storage must be 16-byte aligned")
     if not key_cache.is_contiguous() or key_cache.data_ptr() % 16:
         raise ValueError("CuTe QSA stream key cache must be contiguous and aligned")
+    if (
+        page_table.stride(1) != 1
+        or page_table.stride(0) < page_table.shape[1]
+        or page_table.data_ptr() % 16
+    ):
+        raise ValueError("CuTe QSA page-table columns must be contiguous and aligned")
     if not all(
         tensor.is_contiguous() and tensor.data_ptr() % 16 == 0
-        for tensor in (page_table, request_indices, complete_blocks)
+        for tensor in (request_indices, complete_blocks)
     ):
         raise ValueError("CuTe QSA stream metadata must be contiguous and aligned")
     selected = torch.empty((rows, _TOPK), dtype=torch.int32, device=query.device)

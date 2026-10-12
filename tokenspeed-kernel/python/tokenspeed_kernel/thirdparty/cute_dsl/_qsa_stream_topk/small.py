@@ -590,8 +590,9 @@ class GuardScore(WarpScore):
                         encoded_second = local_scores[second_id]
                         if lane < self.keep:
                             candidates[row, split * self.keep + lane] = encoded_first
+                            # The split index supplies the high bits at merge.
                             candidate_ids[row, split * self.keep + lane] = (
-                                cutlass.Uint16(start + first_id)
+                                cutlass.Uint16(first_id)
                             )
                         maximum = encoded_second
                         if lane >= self.keep and encoded_first > maximum:
@@ -1136,5 +1137,9 @@ class GuardMerge(Merge32):
                 index = cutlass.Int32(selected[tidx] & cutlass.Int64(0xFFFFFFFF))
                 if cutlass.const_expr(self.compact_ids):
                     if not use_fallback:
-                        index = cutlass.Int32(candidate_ids[row, index])
+                        index = (
+                            index // self.keep
+                        ) * self.partial_count + cutlass.Int32(
+                            candidate_ids[row, index]
+                        )
                 output[row, tidx] = index

@@ -1970,8 +1970,8 @@ def qwen4_exp_qsa_block_topk(
             streaming keeps its running set inside each CTA; small query
             grids may use split scoring within this budget.
         solution: ``"stream"`` uses fused grouped scoring or bounded split
-            scoring and selection. Matching Blackwell layouts use CuTe DSL;
-            other layouts use portable Triton. ``"logits"`` materializes the
+            scoring and selection. NVIDIA uses CuTe DSL; other vendors use
+            portable Triton. ``"logits"`` materializes the
             ``[rows, num_blocks]`` FP32 scores and radix-selects them.
         persistent_topk_workspace: Optional caller-owned CUDA uint8 workspace
             of at least 1 MiB. The ``"logits"`` solution uses it for the
@@ -2017,22 +2017,11 @@ def qwen4_exp_qsa_block_topk(
             persistent_topk_workspace=persistent_topk_workspace,
             enable_pdl=enable_pdl,
         )
-    from tokenspeed_kernel.ops.attention.qsa.cute_dsl import (
-        can_use_cute_dsl_qwen4_exp_qsa_block_topk,
-        cute_dsl_qwen4_exp_qsa_block_topk,
-    )
+    if _is_nvidia:
+        from tokenspeed_kernel.ops.attention.qsa.cute_dsl import (
+            cute_dsl_qwen4_exp_qsa_block_topk,
+        )
 
-    if can_use_cute_dsl_qwen4_exp_qsa_block_topk(
-        query,
-        key_cache,
-        page_table,
-        request_indices,
-        complete_blocks,
-        page_size=page_size,
-        block_topk=block_topk,
-        queries_per_request=queries_per_request,
-        max_partial_bytes=max_partial_bytes,
-    ):
         return cute_dsl_qwen4_exp_qsa_block_topk(
             query,
             key_cache,

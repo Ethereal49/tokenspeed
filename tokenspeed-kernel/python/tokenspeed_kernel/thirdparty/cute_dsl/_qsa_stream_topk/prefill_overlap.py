@@ -179,7 +179,9 @@ class OverlapPrefillTopK(PrefillTopK):
         else:
             offset = candidate - running_count
             bits = self._float_bits(score_buffers[score_stage, row_in_group, offset])
-            block_id = cutlass.Int32(score_offsets[score_stage, row_in_group, offset])
+            block_id = tile_base + cutlass.Int32(
+                score_offsets[score_stage, row_in_group, offset]
+            )
         return bits, block_id
 
     @cute.jit
@@ -1309,6 +1311,9 @@ class OverlapPrefillTopK(PrefillTopK):
             subtile = cutlass.Int32(0)
             while subtile < num_subtiles:
                 score_handle = score_producer.acquire_and_advance()
+                # Compact offsets are local to a 64K window. A score stage
+                # cannot span windows, even when cutoff filtering keeps few.
+                stage_base = (subtile * _MMA_M) & cutlass.Int32(-65536)
                 cutoff_bits = cute.make_rmem_tensor((_QUERY_GROUP // 2,), cutlass.Int32)
                 for query_row in cutlass.range_constexpr(_QUERY_GROUP // 2):
                     cutoff = cutlass.Int32(0)
@@ -1404,9 +1409,13 @@ class OverlapPrefillTopK(PrefillTopK):
                         count = score_counts[score_handle.index, query_row]
                         if count > max_count:
                             max_count = count
-                    flush = max_count > self.stream_tile - _MMA_M
+                    flush = (
+                        max_count > self.stream_tile - _MMA_M
+                        or subtile % (65536 // _MMA_M) == 0
+                    )
                 if warpgroup_idx == 0 and warpgroup_tidx == 0:
-                    score_last[score_handle.index] = cutlass.Int32(
+                    # Low bit marks the last stage; remaining bits hold its base.
+                    score_last[score_handle.index] = stage_base | cutlass.Int32(
                         subtile >= num_subtiles
                     )
                 score_handle.commit()
@@ -1446,8 +1455,9 @@ class OverlapPrefillTopK(PrefillTopK):
                             (self.query_group, 256), stride=(self.stream_tile, 1)
                         ),
                     )
-                    tile_base = cutlass.Int32(0)
-                    is_last = score_last[score_handle.index] != 0
+                    stage_info = score_last[score_handle.index]
+                    tile_base = stage_info & cutlass.Int32(-2)
+                    is_last = (stage_info & cutlass.Int32(1)) != 0
                     tile_valid = score_counts[score_handle.index, row_in_group]
 
                     do_select = complete > _TOPK and tile_valid > 0
