@@ -813,6 +813,7 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
     executor.config = SimpleNamespace(
         max_num_seqs=2,
         data_parallel_size=1,
+        query_shard_size=1,
         chunked_prefill_size=7,
         context_len=context_len,
         physical_context_len=context_len,

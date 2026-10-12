@@ -29,7 +29,33 @@ __all__ = [
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_mxfp4",
+    "rmsnorm_quantize_fp8_group32",
 ]
+
+
+def rmsnorm_quantize_fp8_group32(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    override: str | None,
+    solution: str | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Normalize BF16 [M,K] rows and quantize them with exact group-32 scales.
+
+    Returns the BF16 normalized rows, E4M3 codes and canonical uint8 UE8M0
+    scales [M,K/32]. Quantization preserves the 1e-4 amax floor and the BF16
+    normalization boundary. Multiple GEMMs can share the codes and scales.
+    """
+    kernel = select_kernel(
+        "quantization",
+        "rmsnorm_fp8_group32_ue8m0",
+        format_signature(x=dense_tensor_format(x.dtype)),
+        traits={},
+        override=override,
+        solution=solution,
+    )
+    return kernel(x, weight, eps)
 
 
 def _quantize_fp8_roundtrip(
