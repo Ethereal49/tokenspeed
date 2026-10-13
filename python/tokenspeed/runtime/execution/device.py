@@ -58,9 +58,7 @@ hold each piece:
   needs is ``server_args`` or an object this builder already owns.
 - ``encoder_model_facts`` — a startup-only callable for EPD admission,
   resolved past its gate because a text-only model has no vision tower.
-- ``cache_engine`` — the Host-only coordinator. It retains a CPU buffer view,
-  scalar geometry, and the L3 client, never a Device layout or model executor.
-- ``DeviceHandle`` — the running handle, and the loop's only Device capability.
+- ``DeviceHandle`` — the running handle, and the only piece the loop stores.
 
 Startup steps that need a real device object (the layerwise step counter,
 the peer's KV description) happen INSIDE the builder, so no such object ever
@@ -86,13 +84,11 @@ import torch
 from tokenspeed_kernel.platform import current_platform
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from tokenspeed.runtime.cache.hicache import HiCacheEngine
 from tokenspeed.runtime.cache.l2.sizing import (
     NO_POOL,
     RetractionPoolRequest,
     tail_lcm_blocks_per_request,
 )
-from tokenspeed.runtime.cache.transfer.ops import CacheShutdownFailure
 from tokenspeed.runtime.engine.scheduler_utils import cache_ops_from_plan
 from tokenspeed.runtime.epd.recv_pool import recv_pool_bytes
 from tokenspeed.runtime.execution.types import (
@@ -236,7 +232,6 @@ class DeviceBuild:
         transfer: The PD transfer peer's control face — bootstrap
             register/abort, event polling — or None outside PD.
         handle: The running handle; the loop's only reach into the device.
-        cache_engine: Host-only L2-completion/L3 coordinator, safe to retain.
         encoder_model_facts: Zero-argument callable extracting the facts EPD
             admission needs (``EncoderModelFacts``). A callable, not a value:
             reading the vision tower's dtype raises on a text-only model, so
@@ -248,7 +243,6 @@ class DeviceBuild:
     specs: DeviceSpecs
     transfer: Any
     handle: "DeviceHandle"
-    cache_engine: HiCacheEngine
     encoder_model_facts: Any
 
 
@@ -364,7 +358,10 @@ class DeviceHandle:
         its boundary, an owner's move off the block it just published; the
         source may be re-granted by this very plan, so the copy precedes the
         zeroing), then page zeroing (the new owner's
-        sanitization), then the Device-bound copies (``LoadBackOp`` and
+        sanitization), then the L3 prefetches (``PrefetchOp``: a waiting
+        request's Host pages filled from L3 on a CPU lane -- no stream, no
+        Device page, acknowledged after the replica converges on the landed
+        prefix), then the Device-bound copies (``LoadBackOp`` and
         ``RestoreOp``, ordered behind the zeroing: a load-back lands on
         zeroed pages, a restore overwrites its destinations whole), the
         transfer peer's remote streams, and finally the ``ForwardBatch``. The
@@ -454,6 +451,10 @@ class DeviceHandle:
             else None
         )
         if l2 is not None:
+            # The L3 prefetches: CPU work on the executor's own lane, started
+            # here on the control plane -- they touch no stream and no Device
+            # page, so they neither wait on the zeroing nor hold up the FIFO.
+            l2.submit_prefetches(cache_ops)
             # Behind the zeroing: the loads' destinations were zeroed on the
             # default stream, so that is the prerequisite they order after.
             self._l2_submissions.append(
@@ -554,9 +555,10 @@ class DeviceHandle:
     def poll_cache_results(self) -> list:
         """Collect completed Host cache ops (both tiers); never blocks.
 
-        Returns completed Host-write metadata plus load/snapshot/restore ACKs.
-        ``HiCacheEngine`` gates write ACKs on optional L3 persistence before
-        ``CacheOpHooks`` replica-intersects them and the loop advances.
+        Yields the scheduler's ACK kinds -- ``WriteBackDoneEvent``,
+        ``LoadBackDoneEvent``, ``PrefetchDoneEvent`` (once the hooks
+        converged the op), ``SnapshotDoneEvent``, ``RestoreDoneEvent`` --
+        for ``CacheOpHooks`` to replica-intersect and the loop to advance.
 
         Stays on the control plane deliberately: completion is CUDA event
         queries plus queue drains (serialized against the data-plane submit
@@ -587,14 +589,79 @@ class DeviceHandle:
         )
         return l2.poll_results()
 
-    def shutdown_cache(self) -> list:
-        """Join Device submissions and return final Host writes for persistence.
+    def consume_l3_backup_poll_failure(self) -> bool:
+        """Whether an L3 backup future failed since the last consume.
+
+        ``poll_cache_results`` must not raise that failure:
+        ``CacheOpHooks.poll_ready_events`` still has to enter replica
+        collectives. A rank-local raise hangs peers in those waits.
+        """
+
+        l2 = self._l2
+        if l2 is None:
+            return False
+        consume = getattr(l2, "consume_backup_poll_failure", None)
+        if consume is None:
+            return False
+        return bool(consume())
+
+    def query_l3_storage(self, pages) -> list[bool] | None:
+        """Probe immutable L3 objects without exposing the Host-cache tier."""
+
+        l2 = self._l2
+        if l2 is None:
+            return None
+        return l2.l3_exists(pages)
+
+    def l3_prefetch_progress(self) -> dict[int, tuple[bool, int]]:
+        """This rank's in-flight L3 prefetches: op id to ``(done, landed_pages)``.
+
+        Read on the control plane each round by ``L3CacheHooks``, which
+        MIN-reduces the vector across the replica; the op-id set is mirrored.
+        """
+
+        l2 = self._l2
+        if l2 is None:
+            return {}
+        return l2.l3_prefetch_progress()
+
+    def complete_l3_prefetch(self, op_id: int, landed_pages: int) -> None:
+        """Record a prefetch op's replica-converged landed prefix.
+
+        The next ``poll_cache_results`` yields its one ``PrefetchDoneEvent``.
+        """
+
+        l2 = self._l2
+        if l2 is None:
+            raise RuntimeError("L3 prefetch completed without a Host cache executor")
+        l2.complete_l3_prefetch(op_id, landed_pages)
+
+    def delete_l3_namespace(self) -> bool:
+        """Delete L3 objects under the current prefix. Device/Host stay intact.
+
+        Returns True when L2/L3 is unset or the store reports the prefix
+        is gone. Call this before ``ClearCache``; a False must leave
+        every rank's Device/Host indexes untouched. In-flight prefetches
+        are drained first: the lane may still be writing their Host pages.
+        """
+
+        if self._l2 is None:
+            return True
+        return self._l2.delete_l3_namespace()
+
+    def set_l3_weight_version(self, weight_version: str) -> None:
+        """Publish subsequent Host pages under the new checkpoint identity."""
+
+        if self._l2 is not None:
+            self._l2.set_l3_weight_version(weight_version)
+
+    def shutdown_cache(self) -> None:
+        """Join every queued data-plane submission, then close the Host cache.
 
         A cache plan, a PD transfer or a page copy the last round queued is
         settled by the next round's execute or poll; at shutdown there is no
         next round, so they are joined here and the first failure re-raised
-        after the Host copies retire. A failure carries their final metadata
-        so the Host-only coordinator can persist it before closing L3.
+        after the Host cache (L2/L3, pool) is closed.
         """
         errors = []
         for submissions in (
@@ -608,14 +675,10 @@ class DeviceHandle:
                     future.result()
                 except BaseException as exc:  # noqa: BLE001 — surface after close
                     errors.append(exc)
-        final_results = (
-            self._thread.run(self._l2.shutdown) if self._l2 is not None else []
-        )
+        if self._l2 is not None:
+            self._thread.run(self._l2.shutdown)
         if errors:
-            if self._l2 is None:
-                raise errors[0]
-            raise CacheShutdownFailure(final_results) from errors[0]
-        return final_results
+            raise errors[0]
 
     def run_idle_forward(self, dp_metadata: DpForwardMetadata) -> None:
         """Run a zero-token forward so this DP rank joins the round's collectives.
@@ -1409,7 +1472,6 @@ def build_device_side(
         logger.info(
             NO_POOL.describe(host_lcm_block_bytes=0, blob_bytes=0, l2_tier=False)
         )
-    l3_engine = None
     if server_args.enable_kvstore and server_args.kvstore_storage_backend is not None:
         # L3 under the L2 tier.
         from tokenspeed.runtime.cache.l3.backend import (
@@ -1499,18 +1561,15 @@ def build_device_side(
                 if draft_layers:
                     eagle3_layers_to_capture = [int(layer) for layer in draft_layers]
 
-        l3_model = server_args.model
-        l3_model_overrides = dict(model_config.model_override_args)
-        l3_skip_softmax_threshold = float(server_args.skip_softmax_threshold)
         attention_backend_name = attention.attention_backend_name
         draft_attention_backend_name = attention.draft_attention_backend_name
 
         def prefix_for_weight_version(weight_version: str) -> str:
             return storage_key_prefix(
-                l3_model,
+                server_args.model,
                 revision=checkpoint_id,
                 weight_version=weight_version,
-                model_overrides=l3_model_overrides,
+                model_overrides=dict(model_config.model_override_args),
                 cache_signature=cache_signature,
                 pipeline_rank=pipeline_rank,
                 attn_tp_size=attn_tp_size,
@@ -1521,21 +1580,14 @@ def build_device_side(
                 runtime_compat=L3_RUNTIME_COMPAT,
                 attention_backend=attention_backend_name,
                 draft_attention_backend=draft_attention_backend_name,
-                skip_softmax_threshold=l3_skip_softmax_threshold,
+                skip_softmax_threshold=float(server_args.skip_softmax_threshold),
                 eagle3_layers_to_capture=eagle3_layers_to_capture,
             )
 
-        from tokenspeed.runtime.cache.l3.engine import L3CacheEngine
-        from tokenspeed.runtime.cache.l3.executor import L3HostStore
-
-        l3_engine = L3CacheEngine(
-            L3HostStore(
-                storage_backend,
-                host_cache_executor.host_storage.host_buffer_view(),
-                key_prefix=prefix_for_weight_version(server_args.weight_version),
-                rank=attn_tp_rank,
-            ),
-            host_cache_executor.block_owners,
+        host_cache_executor.attach_l3_storage(
+            storage_backend,
+            key_prefix=prefix_for_weight_version(server_args.weight_version),
+            rank=attn_tp_rank,
             prefix_for_weight_version=prefix_for_weight_version,
             prefetch_timeout_base_s=server_args.kvstore_prefetch_timeout_base_s,
             prefetch_timeout_per_page_s=server_args.kvstore_prefetch_timeout_per_page_s,
@@ -1623,7 +1675,6 @@ def build_device_side(
     return DeviceBuild(
         specs=specs,
         transfer=kv_transfer,
-        cache_engine=HiCacheEngine(l3_engine),
         encoder_model_facts=encoder_model_facts,
         handle=DeviceHandle(
             executor,

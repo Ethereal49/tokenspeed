@@ -91,7 +91,6 @@ class CacheOpHooks:
         self,
         device,
         *,
-        cache_engine,
         speculative_algorithm: str | None,
         attn_tp_rank: int,
         attn_tp_size: int,
@@ -101,7 +100,6 @@ class CacheOpHooks:
         global_rank: int,
     ) -> None:
         self._device = device
-        self._cache_engine = cache_engine
         # Replica-wide skip/intersect is the general path, not DFLASH-only.
         # The argument stays required so EventLoop wiring remains explicit.
         self._speculative_algorithm = speculative_algorithm
@@ -128,10 +126,10 @@ class CacheOpHooks:
     def count_plan_ops(self, execution_plan) -> None:
         """Count the cache ops this plan will put in flight.
 
-        ``DeviceHandle.execute`` submits Device copies from the same plan
-        (write-backs and snapshot stores ahead of zeroing, loads and restores
-        behind it); ``L3CacheHooks.submit_plan`` submits Host-only prefetches.
-        Both use the same adapter (``scheduler_utils.cache_ops_from_plan``). An L2 batch
+        ``DeviceHandle.execute`` submits them, from the same plan (write-backs
+        and snapshot stores ahead of the page zeroing, L3 prefetches on their
+        own lane, load-backs and restores behind the zeroing), through the
+        same adapter (``scheduler_utils.cache_ops_from_plan``). An L2 batch
         carries one ticket per ``op_ids`` entry; each request of a snapshot
         store, restore or prefetch batch is one ticket, acknowledged on its
         own. Call this with the SAME plan and only when ``execute`` will run:
@@ -159,9 +157,7 @@ class CacheOpHooks:
         if self._num_open == 0:
             # No rank has a ticket in flight or a completion to commit.
             return []
-        cache_results = self._cache_engine.process_results(
-            self._device.poll_cache_results()
-        )
+        cache_results = self._device.poll_cache_results()
         self._num_inflight -= len(cache_results)
         for event in cache_results:
             payload = cache_event_to_payload(event)
@@ -173,7 +169,7 @@ class CacheOpHooks:
         # while others return, deadlocking the group. Agree on work and on
         # backup failure via a two-int MAX all_reduce on each replica group.
         local_has_work = bool(self._num_inflight != 0 or self._pending_payloads)
-        local_backup_failed = self._cache_engine.consume_backup_poll_failure()
+        local_backup_failed = self._device.consume_l3_backup_poll_failure()
         if self._replica_groups:
             has_work, backup_failed = self._converge_poll_state(
                 local_has_work, local_backup_failed

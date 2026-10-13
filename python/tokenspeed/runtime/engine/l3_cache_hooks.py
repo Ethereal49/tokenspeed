@@ -26,15 +26,15 @@ Two touch points, both replica-wide decisions and nothing else:
   (``_register_l3_storage_hits``), MIN-reduced across the replica so every
   mirrored scheduler registers the same keys;
 * each round, the in-flight L3 prefetch ops -- a waiting request's Host pages
-  being filled by the Host-only L3 lane, before the request is admitted --
+  being filled from L3 by the device's lane, before the request is admitted --
   are MIN-reduced across the replica (done flag and landed prefix), and a
-  converged op is completed on the L3 engine, which then acknowledges it once as
+  converged op is completed on the device, which then acknowledges it once as
   ``PrefetchDoneEvent(op_id, landed_pages)`` through the ordinary cache poll.
 
 Only the L3-to-Host leg can miss, and it runs before admission, so nothing is
 ever retracted or skipped because of L3: a short landing is a shorter Host
-hit. The scheduler and L3CacheEngine are explicit dependencies; no live loop
-state or Device capability is needed. ``l3_engine=None`` disables L3 work while preserving ordinary
+hit. The scheduler and DeviceHandle are explicit dependencies; no live loop
+state is needed. ``device=None`` disables L3 work while preserving ordinary
 request admission.
 """
 
@@ -58,7 +58,7 @@ class L3CacheHooks:
     def __init__(
         self,
         scheduler,
-        l3_engine,
+        device,
         *,
         attn_tp_size: int,
         attn_tp_cpu_group,
@@ -66,7 +66,7 @@ class L3CacheHooks:
         pp_cpu_group,
     ) -> None:
         self._scheduler = scheduler
-        self._l3 = l3_engine
+        self._device = device
         # Same replica order as L2 completion tracking. DP ranks have different
         # requests and never participate in these per-prefix decisions.
         self._replica_groups = [
@@ -77,13 +77,6 @@ class L3CacheHooks:
             )
             if size > 1 and group is not None
         ]
-
-    def submit_plan(self, execution_plan) -> None:
-        """Submit Host-only prefetches independently of the Device FIFO."""
-        if self._l3 is not None:
-            from tokenspeed.runtime.engine.scheduler_utils import cache_ops_from_plan
-
-            self._l3.submit_prefetches(cache_ops_from_plan(execution_plan))
 
     def submit_requests(self, specs) -> None:
         """Register reusable L3 pages, then submit specs through the scheduler."""
@@ -105,7 +98,7 @@ class L3CacheHooks:
         and --disable-kvstore admit still goes through this helper.
         """
 
-        if not specs or self._l3 is None:
+        if not specs or self._device is None:
             return
         hashes = []
         seen: set[str] = set()
@@ -153,14 +146,14 @@ class L3CacheHooks:
         its done flag and, once done, the pages it landed -- a prefix length,
         so the replica MIN is the common prefix every rank holds. A rank whose
         lane raised reports done with nothing landed. An op converged done is
-        completed on the L3 engine with the replica's landed count; the device
+        completed on the device with the replica's landed count; the device
         acknowledges it once on the next cache poll. With no op in flight
         anywhere the round makes no collective.
         """
 
-        if self._l3 is None:
+        if self._device is None:
             return
-        progress = self._l3.prefetch_progress()
+        progress = self._device.l3_prefetch_progress()
         if not progress:
             return
         op_ids = sorted(progress)
@@ -173,7 +166,7 @@ class L3CacheHooks:
             done, landed = reduced[2 * index], reduced[2 * index + 1]
             if not done:
                 continue
-            self._l3.complete_prefetch(op_id, landed)
+            self._device.complete_l3_prefetch(op_id, landed)
             if landed < progress[op_id][1]:
                 logger.warning(
                     f"L3 prefetch {op_id}: a replica peer landed {landed} pages, this "
@@ -190,7 +183,7 @@ class L3CacheHooks:
         """
 
         try:
-            exists = self._l3.exists(pages)
+            exists = self._device.query_l3_storage(pages)
         except Exception:
             logger.exception(
                 "L3 existence probe failed; treating keys as misses so replica "

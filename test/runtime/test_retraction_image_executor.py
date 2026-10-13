@@ -50,7 +50,6 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 import tokenspeed.runtime.cache.l2.executor as executor_module  # noqa: E402
 import tokenspeed.runtime.cache.transfer.lanes as lanes_module  # noqa: E402
-from tokenspeed.runtime.cache.hicache import HiCacheEngine
 from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor  # noqa: E402
 from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest  # noqa: E402
 from tokenspeed.runtime.cache.transfer.lanes import (  # noqa: E402
@@ -397,7 +396,6 @@ def test_constructor_requires_a_tier_and_resolves_the_pool_against_the_layout():
 def test_count_plan_ops_counts_each_request_of_a_snapshot_or_restore_batch():
     hooks = CacheOpHooks(
         SimpleNamespace(),
-        cache_engine=HiCacheEngine(None),
         speculative_algorithm=None,
         attn_tp_rank=0,
         attn_tp_size=1,
@@ -573,18 +571,13 @@ def test_both_store_legs_ride_the_write_stream_under_one_fence():
     assert slot_state.exports[0][1].data_ptr() == executor.blob_arena[1].data_ptr()
     assert slot_state.exports[1][1].data_ptr() == executor.blob_arena[2].data_ptr()
     # Three ACK kinds, each released by its own event.
-    assert HiCacheEngine(None).process_results(executor.poll_results()) == []
+    assert executor.poll_results() == []
     snapshot_finish.query.return_value = True
-    assert _acks(
-        HiCacheEngine(None).process_results(executor.poll_results())
-    ) == _snapshot_done(7, 8)
+    assert _acks(executor.poll_results()) == _snapshot_done(7, 8)
     ordered_finish.query.return_value = True
     pinned_finish.query.return_value = True
-    assert sorted(
-        int(e.op_id)
-        for e in HiCacheEngine(None).process_results(executor.poll_results())
-    ) == [11, 12]
-    assert HiCacheEngine(None).process_results(executor.poll_results()) == []
+    assert sorted(int(e.op_id) for e in executor.poll_results()) == [11, 12]
+    assert executor.poll_results() == []
     del events
 
 
@@ -608,9 +601,7 @@ def test_slot_state_only_image_round_trips_through_empty_ops():
     fence_stream.wait_event.assert_called_once_with(finish)
     assert [slot for slot, _, _, _ in slot_state.exports] == [2]
     assert slot_state.exports[0][1].data_ptr() == executor.blob_arena[1].data_ptr()
-    assert _acks(
-        HiCacheEngine(None).process_results(executor.poll_results())
-    ) == _snapshot_done(1)
+    assert _acks(executor.poll_results()) == _snapshot_done(1)
 
     tracker = executor._load_trackers[0][0]
     with (
@@ -627,9 +618,7 @@ def test_slot_state_only_image_round_trips_through_empty_ops():
     assert [(slot, rid) for slot, _, _, rid in slot_state.imports] == [(5, "r2")]
     assert slot_state.imports[0][1].data_ptr() == executor.blob_arena[1].data_ptr()
     tracker.begin_load.assert_not_called()
-    assert _acks(
-        HiCacheEngine(None).process_results(executor.poll_results())
-    ) == _restore_done(2)
+    assert _acks(executor.poll_results()) == _restore_done(2)
 
 
 def test_a_failed_snapshot_leg_still_fences_the_launched_ordered_rows():
@@ -730,11 +719,9 @@ def test_restore_reads_both_tiers_imports_the_slot_and_acks_once():
     # A restore arms no layerwise fence: the round's load trackers see no load.
     tracker.begin_load.assert_not_called()
     tracker.set_consumers.assert_called_once_with(-1)
-    assert HiCacheEngine(None).process_results(executor.poll_results()) == []
+    assert executor.poll_results() == []
     finish.query.return_value = True
-    assert _acks(
-        HiCacheEngine(None).process_results(executor.poll_results())
-    ) == _restore_done(9)
+    assert _acks(executor.poll_results()) == _restore_done(9)
 
 
 def test_load_backs_start_before_restores_on_the_load_stream():
@@ -901,7 +888,7 @@ def test_kvp_ranks_store_their_owned_subsets_on_both_legs():
         )
         # Slot state is per rank: every rank exports its own and ACKs every op.
         assert [slot for slot, _, _, _ in slot_state.exports] == [1]
-        acks = _acks(HiCacheEngine(None).process_results(executor.poll_results()))
+        acks = _acks(executor.poll_results())
         assert ("SnapshotDoneEvent", 5) in acks
         assert sorted(
             op_id for kind, op_id in acks if kind == "WriteBackDoneEvent"
@@ -940,22 +927,15 @@ def test_kvp_rank_backs_up_and_prefetches_only_the_host_pages_it_owns():
             )
         ((pending_finish, ack),) = executor._completions._pending
         assert pending_finish is finish
-        assert (ack.op_ids, ack.host_pages) == ([11], [owned_page])
+        assert (ack.op_ids, ack.backup_pages) == ([11], [owned_page])
         # The prefetch of the same two pages fetches only this rank's one; the
         # peer's page counts as landed here so the replica MIN is the owners'.
-        from tokenspeed.runtime.cache.l3.engine import L3CacheEngine
-
-        store = Mock(rank=0)
-        store.prefetch.return_value = [True]
-        engine = L3CacheEngine(
-            store,
-            executor.block_owners,
-            prefix_for_weight_version=lambda v: v,
-            prefetch_timeout_base_s=10.0,
-            prefetch_timeout_per_page_s=0.0,
-            prefetch_batch_pages=4,
-        )
-        engine.submit_prefetches(
+        executor.l3_store = Mock()
+        executor.l3_store.prefetch.return_value = [True]
+        executor._l3_prefetch_timeout_base_s = 10.0
+        executor._l3_prefetch_timeout_per_page_s = 0.0
+        executor._l3_prefetch_batch_pages = 4
+        executor.submit_prefetches(
             [
                 PrefetchOp(
                     op_id=12,
@@ -970,13 +950,13 @@ def test_kvp_rank_backs_up_and_prefetches_only_the_host_pages_it_owns():
             ]
         )
         for _ in range(200):
-            progress = engine.prefetch_progress()
+            progress = executor.l3_prefetch_progress()
             if progress[12][0]:
                 break
             time.sleep(0.01)
         assert progress[12] == (True, 2)
-        store.prefetch.assert_called_once_with([owned_page])
-        engine.shutdown()
+        executor.l3_store.prefetch.assert_called_once_with([owned_page])
+        executor._l3_prefetch_lane.shutdown(wait=True)
 
 
 @pytest.mark.parametrize("backend", ["dma", "auto"])
@@ -1181,7 +1161,7 @@ def _round_trip_two_ranks(io_backend, executors):
             )
     torch.cuda.synchronize()
     for executor in executors.values():
-        acks = _acks(HiCacheEngine(None).process_results(executor.poll_results()))
+        acks = _acks(executor.poll_results())
         assert ("SnapshotDoneEvent", 1) in acks and ("SnapshotDoneEvent", 3) in acks
         assert [op_id for kind, op_id in acks if kind == "WriteBackDoneEvent"] == [21]
 
@@ -1204,10 +1184,7 @@ def _round_trip_two_ranks(io_backend, executors):
             prerequisite_stream=stream,
         )
     torch.cuda.synchronize()
-    assert [
-        _acks(HiCacheEngine(None).process_results(executor.poll_results()))
-        for executor in executors.values()
-    ] == [
+    assert [_acks(executor.poll_results()) for executor in executors.values()] == [
         _restore_done(2, 4),
         _restore_done(2, 4),
     ]

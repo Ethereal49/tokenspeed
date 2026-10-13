@@ -34,7 +34,6 @@ import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 import torch
@@ -47,8 +46,6 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed_scheduler import Cache  # noqa: E402
 
-from tokenspeed.runtime.cache.hicache import HiCacheEngine  # noqa: E402
-from tokenspeed.runtime.cache.transfer.ops import HostWriteBackCompletion  # noqa: E402
 from tokenspeed.runtime.engine import cache_hooks as cache_hooks_module  # noqa: E402
 from tokenspeed.runtime.engine import (  # noqa: E402
     scheduler_utils as scheduler_utils_module,
@@ -113,7 +110,7 @@ class _Device:
         results, self.results = self.results, []
         return results
 
-    def consume_backup_poll_failure(self) -> bool:
+    def consume_l3_backup_poll_failure(self) -> bool:
         failed = self.backup_failed
         self.backup_failed = False
         return failed
@@ -121,7 +118,6 @@ class _Device:
 
 def _hooks(
     device,
-    cache_engine,
     speculative_algorithm,
     attn_tp_size,
     attn_tp_cpu_group,
@@ -130,7 +126,6 @@ def _hooks(
 ) -> CacheOpHooks:
     return CacheOpHooks(
         device,
-        cache_engine=cache_engine,
         speculative_algorithm=speculative_algorithm,
         attn_tp_rank=0,
         attn_tp_size=attn_tp_size,
@@ -144,14 +139,6 @@ def _hooks(
 def _single_rank_hooks(device) -> CacheOpHooks:
     return _hooks(
         device,
-        cache_engine=SimpleNamespace(
-            process_results=lambda results: results,
-            consume_backup_poll_failure=(
-                device.consume_backup_poll_failure
-                if device is not None
-                else lambda: False
-            ),
-        ),
         speculative_algorithm=None,
         attn_tp_size=1,
         attn_tp_cpu_group=None,
@@ -302,42 +289,6 @@ def test_poll_returns_completed_events_and_settles_inflight(fake_cache_ops) -> N
     assert hooks._pending_payloads == {}
 
 
-def test_host_copy_keeps_tickets_open_until_l3_persistence_finishes(
-    fake_cache_ops,
-) -> None:
-    device = _Device()
-    l3 = SimpleNamespace(
-        submit_backup=Mock(),
-        poll_results=Mock(return_value=[]),
-        consume_backup_poll_failure=Mock(return_value=False),
-    )
-    hooks = _hooks(
-        device,
-        cache_engine=HiCacheEngine(l3),
-        speculative_algorithm=None,
-        attn_tp_size=1,
-        attn_tp_cpu_group=None,
-        pp_size=1,
-        pp_cpu_group=None,
-    )
-    hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7, 8])]))
-    completion = HostWriteBackCompletion((7, 8), ((0, 1, "hash", 0),))
-    device.results = [completion]
-
-    # Retired D2H copies start persistence; their tickets still need Store ACKs.
-    assert hooks.poll_ready_events() == []
-    l3.submit_backup.assert_called_once_with(completion)
-    assert hooks.poll_ready_events() == []
-    assert hooks._num_inflight == hooks._num_open == 2
-    assert l3.poll_results.call_count == 2
-
-    l3.poll_results.return_value = [_writeback_done_event(7), _writeback_done_event(8)]
-    assert [e.op_id for e in hooks.poll_ready_events()] == [7, 8]
-    assert hooks._num_inflight == hooks._num_open == 0
-    assert hooks.poll_ready_events() == []
-    assert l3.poll_results.call_count == 3
-
-
 def test_pp_peer_missing_writeback_keeps_payload_pending(
     fake_cache_ops, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -345,14 +296,6 @@ def test_pp_peer_missing_writeback_keeps_payload_pending(
     pp_group = object()
     hooks = _hooks(
         device,
-        cache_engine=SimpleNamespace(
-            process_results=lambda results: results,
-            consume_backup_poll_failure=(
-                device.consume_backup_poll_failure
-                if device is not None
-                else lambda: False
-            ),
-        ),
         speculative_algorithm=None,
         attn_tp_size=1,
         attn_tp_cpu_group=None,
@@ -388,14 +331,6 @@ def test_pp_agreed_writeback_emits_event(
     pp_group = object()
     hooks = _hooks(
         device,
-        cache_engine=SimpleNamespace(
-            process_results=lambda results: results,
-            consume_backup_poll_failure=(
-                device.consume_backup_poll_failure
-                if device is not None
-                else lambda: False
-            ),
-        ),
         speculative_algorithm=None,
         attn_tp_size=1,
         attn_tp_cpu_group=None,
@@ -434,14 +369,6 @@ def test_gather_order_is_attention_tp_then_pp(
     pp_group = object()
     hooks = _hooks(
         device,
-        cache_engine=SimpleNamespace(
-            process_results=lambda results: results,
-            consume_backup_poll_failure=(
-                device.consume_backup_poll_failure
-                if device is not None
-                else lambda: False
-            ),
-        ),
         speculative_algorithm=None,
         attn_tp_size=2,
         attn_tp_cpu_group=tp_group,
@@ -482,14 +409,6 @@ def test_empty_tp_intersection_still_gathers_pp(
     pp_group = object()
     hooks = _hooks(
         device,
-        cache_engine=SimpleNamespace(
-            process_results=lambda results: results,
-            consume_backup_poll_failure=(
-                device.consume_backup_poll_failure
-                if device is not None
-                else lambda: False
-            ),
-        ),
         speculative_algorithm=None,
         attn_tp_size=2,
         attn_tp_cpu_group=tp_group,
@@ -534,14 +453,6 @@ def test_replica_runs_collectives_only_while_a_ticket_is_open(
     pp_group = object()
     hooks = _hooks(
         device,
-        cache_engine=SimpleNamespace(
-            process_results=lambda results: results,
-            consume_backup_poll_failure=(
-                device.consume_backup_poll_failure
-                if device is not None
-                else lambda: False
-            ),
-        ),
         speculative_algorithm=None,
         attn_tp_size=1,
         attn_tp_cpu_group=None,
@@ -582,14 +493,6 @@ def test_tickets_stay_open_until_the_replica_commits_them(
     pp_group = object()
     hooks = _hooks(
         device,
-        cache_engine=SimpleNamespace(
-            process_results=lambda results: results,
-            consume_backup_poll_failure=(
-                device.consume_backup_poll_failure
-                if device is not None
-                else lambda: False
-            ),
-        ),
         speculative_algorithm=None,
         attn_tp_size=1,
         attn_tp_cpu_group=None,
@@ -634,14 +537,6 @@ def test_replica_backup_failure_raises_after_poll_all_reduce(
     pp_group = object()
     hooks = _hooks(
         device,
-        cache_engine=SimpleNamespace(
-            process_results=lambda results: results,
-            consume_backup_poll_failure=(
-                device.consume_backup_poll_failure
-                if device is not None
-                else lambda: False
-            ),
-        ),
         speculative_algorithm=None,
         attn_tp_size=1,
         attn_tp_cpu_group=None,
@@ -741,7 +636,6 @@ def test_tp_pp_grid_counts_stay_equal_and_all_ranks_stop_polling_together(
         device = _Device()
         hooks = CacheOpHooks(
             device,
-            cache_engine=HiCacheEngine(None),
             speculative_algorithm=None,
             attn_tp_rank=rank % 2,
             attn_tp_size=2,

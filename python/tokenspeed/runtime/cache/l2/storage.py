@@ -22,7 +22,6 @@
 
 from __future__ import annotations
 
-from tokenspeed.runtime.cache.transfer.host_buffer import HostBufferView
 from tokenspeed.runtime.cache.transfer.layout import CacheTransferLayout
 
 
@@ -82,21 +81,6 @@ class HostCacheStorage:
             self.host_buffer_bytes,
             dtype=torch.uint8,
             pin_memory=True,
-        )
-
-    def host_buffer_view(self) -> HostBufferView:
-        """Export only CPU storage and scalar geometry, without the Device layout."""
-        if self.host_buffer.device.type != "cpu":
-            raise ValueError("the Host buffer must reside on CPU")
-        return HostBufferView(
-            host_buffer=self.host_buffer,
-            num_host_lcm_blocks=self.num_host_lcm_blocks,
-            host_lcm_block_bytes=self.host_lcm_block_bytes,
-            block_bytes=self.host_cache_block_bytes,
-            packing=tuple(
-                group.cache_blocks_per_lcm_block for group in self.layout.groups
-            ),
-            group_ids=tuple(group.group_id for group in self.layout.groups),
         )
 
     def host_block_offset(self, group_index: int, block_id: int) -> int:

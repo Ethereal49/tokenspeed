@@ -152,8 +152,7 @@ def _handler(*, dp_size: int = 1):
     handler._pending_internal_ops = deque()
     handler._internal_op_completer = None
     handler._device = mock.Mock()
-    handler._l3 = mock.Mock()
-    handler._l3.delete_namespace.return_value = True
+    handler._device.delete_l3_namespace.return_value = True
     handler._device.update_weights.return_value = (True, "ok")
     return handler
 
@@ -197,7 +196,7 @@ class TestSameRoundGate(unittest.TestCase):
         handler.can_clear_cache_fn.assert_called_once_with()
         handler.clear_cache_fn.assert_called_once_with()
         handler._device.update_weights.assert_called_once_with(req)
-        handler._l3.set_weight_version.assert_called_once_with("v2")
+        handler._device.set_l3_weight_version.assert_called_once_with("v2")
         replies = _replies(handler)
         self.assertEqual(len(replies), 1)
         self.assertIsInstance(replies[0], UpdateWeightsFromDistributedReqOutput)
@@ -261,7 +260,7 @@ class TestSameRoundGate(unittest.TestCase):
             handler.process_requests([req])
 
         handler._device.update_weights.assert_called_once_with(req)
-        handler._l3.set_weight_version.assert_not_called()
+        handler._device.set_l3_weight_version.assert_not_called()
         self.assertEqual(handler.server_args.weight_version, "v1")
         reply = _replies(handler)[0]
         self.assertFalse(reply.success)
@@ -528,7 +527,7 @@ class TestMooncakeOp(unittest.TestCase):
 
         handler.clear_cache_fn.assert_called_once_with()
         handler._device.update_weights.assert_called_once_with(req)
-        handler._l3.set_weight_version.assert_called_once_with("12")
+        handler._device.set_l3_weight_version.assert_called_once_with("12")
         self.assertEqual(handler.server_args.weight_version, "12")
         # The default is resolved at the point of use; the request is not
         # rewritten on its way to the device.
@@ -545,7 +544,7 @@ class TestMooncakeOp(unittest.TestCase):
         handler.process_requests([req])
 
         handler._device.update_weights.assert_called_once_with(req)
-        handler._l3.set_weight_version.assert_called_once_with("12")
+        handler._device.set_l3_weight_version.assert_called_once_with("12")
         self.assertIsNone(req.weight_version)
 
     def test_explicit_weight_version_wins(self):
@@ -554,7 +553,7 @@ class TestMooncakeOp(unittest.TestCase):
 
         handler.process_requests([req])
 
-        handler._l3.set_weight_version.assert_called_once_with("ckpt-12")
+        handler._device.set_l3_weight_version.assert_called_once_with("ckpt-12")
 
     def test_unflushed_load_keeps_the_namespace(self):
         handler = _handler()
@@ -564,7 +563,7 @@ class TestMooncakeOp(unittest.TestCase):
 
         handler.clear_cache_fn.assert_not_called()
         handler._device.update_weights.assert_called_once_with(req)
-        handler._l3.set_weight_version.assert_not_called()
+        handler._device.set_l3_weight_version.assert_not_called()
         self.assertEqual(handler.server_args.weight_version, "v1")
 
     def test_l3_rejects_unflushed_version_switch(self):

@@ -27,11 +27,12 @@ from collections.abc import Sequence
 from typing import Any
 
 from tokenspeed.runtime.cache.l3.backend import KvStoreStorage, storage_object_key
-from tokenspeed.runtime.cache.transfer.ops import HostPage
 
 logger = logging.getLogger(__name__)
 
-StoragePage = HostPage
+StoragePage = tuple[
+    int, int, str, int
+]  # group_index, host_block_id, content_hash, page_offset
 
 
 class L3HostStore:

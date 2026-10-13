@@ -205,9 +205,8 @@ class StorageKeyTest(unittest.TestCase):
         capture = mock.Mock(return_value="prefix")
         namespace = dict(
             storage_key_prefix=capture,
-            l3_model="org/model",
-            l3_model_overrides={},
-            l3_skip_softmax_threshold=0.0,
+            server_args=SimpleNamespace(model="org/model", skip_softmax_threshold=0.0),
+            model_config=SimpleNamespace(model_override_args={}),
             checkpoint_id="checkpoint",
             cache_signature="layout",
             pipeline_rank=0,

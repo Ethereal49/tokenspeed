@@ -830,12 +830,6 @@ Its responsibilities:
   The way back is one `SnapshotRestoreOperation` whose rows name their Host
   tier; its L2-tier destinations are republished at the ACK
   (`CompleteSnapshotRestore`) exactly as a prefix load-back's are.
-* **L3 ownership.** `HostCacheExecutor` owns Device/Host copies and emits
-  `HostWriteBackCompletion` after D2H. `HiCacheEngine` coordinates those
-  completions with `L3CacheEngine`, which owns the Store, prefetch/backup
-  lanes and namespace lifecycle. Only a completed PUT becomes a write ACK;
-  failure still converges replica-wide before raising. L3 retains a
-  `HostBufferView` with CPU bytes and scalar geometry, not the Device layout.
 * **L3 under flat KV.** Host L2 is one compact pinned byte buffer indexed by
   CacheBlock IDs. Optional L3 (Mooncake Store) sits *below* that buffer, not
   beside GPU pages: after D2H, the runtime `batch_put_from`s each packed
