@@ -48,7 +48,7 @@ def _value_layout(
 
 @gluon.constexpr_function
 def _e4m3_value_output_layout(BLOCK_H: gl.constexpr):
-    """Return TileLang FullCol's ordinary-register output ownership."""
+    """Assign each lane two adjacent 16-column groups in ordinary registers."""
 
     return gl.DistributedLinearLayout(
         reg_bases=[[0, 1], [0, 2], [0, 16]],
@@ -178,16 +178,25 @@ def _dsa_e4m3_value_4x128(
     acc1,
     acc2,
     acc3,
+    alpha,
+    probs,
     p_layout: gl.constexpr,
     v_layout: gl.constexpr,
     acc_layout: gl.constexpr,
     output_layout: gl.constexpr,
     BLOCK_H: gl.constexpr,
+    smem_dtype: gl.constexpr,
 ):
-    """Update blocked outputs through one phase-local MFMA accumulator."""
+    """Rescale the running outputs and add four phase-local value products."""
 
     phase: gl.constexpr = 128
     fp8_max: gl.constexpr = 448.0
+    alpha_out = gl.convert_layout(alpha, gl.SliceLayout(1, output_layout))
+    acc0 *= alpha_out[:, None]
+    acc1 *= alpha_out[:, None]
+    acc2 *= alpha_out[:, None]
+    acc3 *= alpha_out[:, None]
+    probs_smem.store((probs * fp8_max).to(smem_dtype))
     probs_dot = probs_smem.load(p_layout)
 
     v0 = kv_smem.slice(0, phase, 0).permute([1, 0]).load(v_layout)
@@ -214,6 +223,73 @@ def _dsa_e4m3_value_4x128(
     value_tile = gl.convert_layout(value_tile, output_layout, assert_trivial=True)
     acc3 += value_tile * (1.0 / fp8_max)
     return acc0, acc1, acc2, acc3
+
+
+@gluon.jit
+def _dsa_online_softmax(scores, valid, mask_h, m_i, l_i, scale):
+    """Update the shared online softmax, including empty selected rows."""
+
+    scores = gl.where(valid[None, :] & mask_h[:, None], scores * scale, -float("inf"))
+    m_new = gl.maximum(m_i, gl.max(scores, axis=1))
+    safe_m_new = gl.where(m_new > -float("inf"), m_new, 0.0)
+    alpha = gl.exp(m_i - safe_m_new)
+    probs = gl.exp(scores - safe_m_new[:, None])
+    l_new = alpha * l_i + gl.sum(probs, axis=1)
+    return probs, alpha, m_new, l_new
+
+
+@gluon.jit
+def _dsa_e4m3_store_output(
+    out,
+    acc0,
+    acc1,
+    acc2,
+    acc3,
+    l_i,
+    o_base,
+    stride_o_h,
+    hg_offset,
+    num_heads,
+    output_layout: gl.constexpr,
+    BLOCK_H: gl.constexpr,
+):
+    """Normalize and store four output phases, keeping empty rows exactly zero."""
+
+    l_i_out = gl.convert_layout(l_i, gl.SliceLayout(1, output_layout))
+    safe_l_i = gl.where(l_i_out > 0.0, l_i_out, 1.0)
+    valid = l_i_out[:, None] > 0.0
+    offs_h = hg_offset + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, output_layout))
+    offs_v = gl.arange(0, 128, layout=gl.SliceLayout(0, output_layout))
+    o_row = o_base + offs_h[:, None].to(tl.int64) * stride_o_h
+    mask = (offs_h < num_heads)[:, None]
+    acc0 = gl.where(valid, acc0 / safe_l_i[:, None], 0.0)
+    acc1 = gl.where(valid, acc1 / safe_l_i[:, None], 0.0)
+    acc2 = gl.where(valid, acc2 / safe_l_i[:, None], 0.0)
+    acc3 = gl.where(valid, acc3 / safe_l_i[:, None], 0.0)
+    gl.amd.cdna4.buffer_store(
+        stored_value=acc0.to(out.dtype.element_ty),
+        ptr=out,
+        offsets=(o_row + offs_v[None, :].to(tl.int64)).to(tl.int32),
+        mask=mask,
+    )
+    gl.amd.cdna4.buffer_store(
+        stored_value=acc1.to(out.dtype.element_ty),
+        ptr=out,
+        offsets=(o_row + (128 + offs_v[None, :]).to(tl.int64)).to(tl.int32),
+        mask=mask,
+    )
+    gl.amd.cdna4.buffer_store(
+        stored_value=acc2.to(out.dtype.element_ty),
+        ptr=out,
+        offsets=(o_row + (256 + offs_v[None, :]).to(tl.int64)).to(tl.int32),
+        mask=mask,
+    )
+    gl.amd.cdna4.buffer_store(
+        stored_value=acc3.to(out.dtype.element_ty),
+        ptr=out,
+        offsets=(o_row + (384 + offs_v[None, :]).to(tl.int64)).to(tl.int32),
+        mask=mask,
+    )
 
 
 @gluon.jit
@@ -285,7 +361,7 @@ def _dsa_dense_mfma_kv_kernel(
         instr_shape=[16, 16, instr_k],
         transposed=True,
         warps_per_cta=([1, 4] if COLUMN_PARALLEL else [4, 1]),
-        # TileLang's FullCol value product assigns two adjacent 16-column
+        # The phased value product assigns two adjacent 16-column
         # matrix tiles to each wave. Keep every other path's tile shape intact.
         tiles_per_warp=([1, 2] if PHASED_E4M3 else [1, 1]),
     )
@@ -535,11 +611,9 @@ def _dsa_dense_mfma_kv_kernel(
     )
     valid_mma = split_has_tiles & (offs_tile_mma < valid_len) & (topk_pos_mma >= 0)
     if PHASED_E4M3:
-        # Reuse the score-column index load for the KV gather. The barrier
-        # makes these indices visible before the gather reads shared memory.
+        # Reuse the score-column index load for the KV gather.
         smem_topk = gl.allocate_shared_memory(gl.int32, [TILE_K], layout=sh_topk)
         smem_topk.store(topk_pos_mma)
-        gl.barrier()
         topk_pos_klora = smem_topk.load(gl.SliceLayout(0, blk_klora))
     valid_klora = (
         split_has_tiles & (offs_tile_klora < valid_len) & (topk_pos_klora >= 0)
@@ -591,8 +665,6 @@ def _dsa_dense_mfma_kv_kernel(
                 other=0.0,
             ).to(smem_dtype)
             smem_krope.index(0).store(k_rope)
-        if PHASED_E4M3:
-            gl.barrier()
     else:
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             dest=smem_klora.index(0),
@@ -718,35 +790,17 @@ def _dsa_dense_mfma_kv_kernel(
             scores = gl.amd.cdna4.mfma(q_rope_dot, k_rope_t_dot, scores)
         if not PHASED_E4M3:
             scores = gl.convert_layout(scores, mfma_s)
-        scores = scores * scale
-
         offs_h_mma = hg_offset + gl.arange(
             0,
             BLOCK_H,
             layout=softmax_scalar_layout,
         )
         mask_h_mma = offs_h_mma < num_heads
-        scores = gl.where(
-            valid_mma[None, :] & mask_h_mma[:, None], scores, -float("inf")
+        probs, alpha, m_new, l_new = _dsa_online_softmax(
+            scores, valid_mma, mask_h_mma, m_i, l_i, scale
         )
 
-        m_j = gl.max(scores, axis=1)
-        m_new = gl.maximum(m_i, m_j)
-        safe_m_new = gl.where(m_new > -float("inf"), m_new, 0.0)
-        alpha = gl.exp(m_i - safe_m_new)
-        probs = gl.exp(scores - safe_m_new[:, None])
-        l_new = alpha * l_i + gl.sum(probs, axis=1)
-
         if PHASED_E4M3:
-            alpha_out = gl.convert_layout(alpha, gl.SliceLayout(1, blk_out_phase))
-            acc0 *= alpha_out[:, None]
-            acc1 *= alpha_out[:, None]
-            acc2 *= alpha_out[:, None]
-            acc3 *= alpha_out[:, None]
-            # Match TileLang's 16x64 probability handoff. The first store has
-            # no predecessor, while every later store follows the KV-refill
-            # barrier below, which already closes the preceding PV reads.
-            smem_probs.store((probs * 448.0).to(smem_dtype))
             acc0, acc1, acc2, acc3 = _dsa_e4m3_value_4x128(
                 smem_probs,
                 klora_smem_cur,
@@ -754,11 +808,14 @@ def _dsa_dense_mfma_kv_kernel(
                 acc1,
                 acc2,
                 acc3,
+                alpha,
+                probs,
                 dot_p_a,
                 dot_v_b,
                 mfma_acc,
                 blk_out_phase,
                 BLOCK_H,
+                smem_dtype,
             )
         else:
             alpha_acc = gl.convert_layout(alpha, gl.SliceLayout(1, mfma_acc))
@@ -766,8 +823,7 @@ def _dsa_dense_mfma_kv_kernel(
             probs_dot = gl.convert_layout(probs.to(smem_dtype), dot_p_a)
             if FP8_INPUTS:
                 # Do not keep both K and V dot operands live across score calculation
-                # and softmax. TileLang consumes those matrix phases separately;
-                # loading V here gives native E4M3 the same short operand lifetime.
+                # and softmax. Loading V here keeps the operand lifetime short.
                 v_lora_dot = klora_smem_cur.permute([1, 0]).load(dot_v_b)
             acc = gl.amd.cdna4.mfma(probs_dot, v_lora_dot, acc)
 
@@ -776,9 +832,8 @@ def _dsa_dense_mfma_kv_kernel(
         if FP8_INPUTS:
             # The E4M3-FP8 copy is blocking, so loading into an alternate
             # buffer before this tile's matrix work cannot overlap anything.
-            # Refill the consumed tile instead, matching SGLang's single-stage
-            # TileLang schedule and keeping the load operands out of the live
-            # range of the score/value accumulators.
+            # Refill the consumed tile instead, keeping load operands out of
+            # the live range of the score/value accumulators.
             next_base = (tile_start + tile_idx + 1) * TILE_K
             next_offs_klora = next_base + local_offs_klora
             next_offs_krope = next_base + local_offs_krope
@@ -805,7 +860,6 @@ def _dsa_dense_mfma_kv_kernel(
             valid_mma_next = (next_offs_mma < valid_len) & (topk_pos_mma_next >= 0)
             if PHASED_E4M3:
                 smem_topk.store(topk_pos_mma_next)
-                gl.barrier()
                 topk_pos_klora_next = smem_topk.load(gl.SliceLayout(0, blk_klora))
             valid_klora_next = (next_offs_klora < valid_len) & (
                 topk_pos_klora_next >= 0
@@ -822,8 +876,6 @@ def _dsa_dense_mfma_kv_kernel(
                 D_V + offs_r_krope[:, None]
             ).to(tl.int64)
 
-            if not PHASED_E4M3:
-                gl.barrier()
             k_lora_next = gl.load(
                 kv + klora_offs_next,
                 mask=valid_klora_next[None, :],
@@ -837,7 +889,6 @@ def _dsa_dense_mfma_kv_kernel(
                     other=0.0,
                 ).to(smem_dtype)
                 smem_krope.index(0).store(k_rope_next)
-            gl.barrier()
         if not FP8_INPUTS:
             cur_buf = next_buf
         valid_mma = valid_mma_next
@@ -870,33 +921,17 @@ def _dsa_dense_mfma_kv_kernel(
         scores = gl.amd.cdna4.mfma(q_rope_dot, k_rope_t_dot, scores)
     if not PHASED_E4M3:
         scores = gl.convert_layout(scores, mfma_s)
-    scores = scores * scale
-
     offs_h_mma = hg_offset + gl.arange(
         0,
         BLOCK_H,
         layout=softmax_scalar_layout,
     )
     mask_h_mma = offs_h_mma < num_heads
-    scores = gl.where(valid_mma[None, :] & mask_h_mma[:, None], scores, -float("inf"))
-
-    m_j = gl.max(scores, axis=1)
-    m_new = gl.maximum(m_i, m_j)
-    safe_m_new = gl.where(m_new > -float("inf"), m_new, 0.0)
-    alpha = gl.exp(m_i - safe_m_new)
-    probs = gl.exp(scores - safe_m_new[:, None])
-    l_new = alpha * l_i + gl.sum(probs, axis=1)
+    probs, alpha, m_new, l_new = _dsa_online_softmax(
+        scores, valid_mma, mask_h_mma, m_i, l_i, scale
+    )
 
     if PHASED_E4M3:
-        alpha_out = gl.convert_layout(alpha, gl.SliceLayout(1, blk_out_phase))
-        acc0 *= alpha_out[:, None]
-        acc1 *= alpha_out[:, None]
-        acc2 *= alpha_out[:, None]
-        acc3 *= alpha_out[:, None]
-        # The first probability store has no predecessor; later stores follow
-        # the prior iteration's KV-refill barrier, which closes its PV reads.
-        smem_probs.store((probs * 448.0).to(smem_dtype))
-        gl.barrier()
         acc0, acc1, acc2, acc3 = _dsa_e4m3_value_4x128(
             smem_probs,
             klora_smem_cur,
@@ -904,11 +939,14 @@ def _dsa_dense_mfma_kv_kernel(
             acc1,
             acc2,
             acc3,
+            alpha,
+            probs,
             dot_p_a,
             dot_v_b,
             mfma_acc,
             blk_out_phase,
             BLOCK_H,
+            smem_dtype,
         )
     else:
         alpha_acc = gl.convert_layout(alpha, gl.SliceLayout(1, mfma_acc))
@@ -925,48 +963,19 @@ def _dsa_dense_mfma_kv_kernel(
     else:
         o_base = token_idx.to(tl.int64) * stride_o_t
     if PHASED_E4M3:
-        l_i_out = gl.convert_layout(l_new, gl.SliceLayout(1, blk_out_phase))
-        safe_l_i_out = gl.where(l_i_out > 0.0, l_i_out, 1.0)
-        output_valid = l_i_out[:, None] > 0.0
-        acc0 = gl.where(output_valid, acc0 / safe_l_i_out[:, None], 0.0)
-        acc1 = gl.where(output_valid, acc1 / safe_l_i_out[:, None], 0.0)
-        acc2 = gl.where(output_valid, acc2 / safe_l_i_out[:, None], 0.0)
-        acc3 = gl.where(output_valid, acc3 / safe_l_i_out[:, None], 0.0)
-
-        offs_h_o = hg_offset + gl.arange(
-            0, BLOCK_H, layout=gl.SliceLayout(1, blk_out_phase)
-        )
-        offs_v_o = gl.arange(0, 128, layout=gl.SliceLayout(0, blk_out_phase))
-        mask_h_o = offs_h_o < num_heads
-        o_row = o_base + offs_h_o[:, None].to(tl.int64) * stride_o_h
-
-        out0 = acc0.to(out.dtype.element_ty)
-        gl.amd.cdna4.buffer_store(
-            stored_value=out0,
-            ptr=out,
-            offsets=(o_row + offs_v_o[None, :].to(tl.int64)).to(tl.int32),
-            mask=mask_h_o[:, None],
-        )
-        out1 = acc1.to(out.dtype.element_ty)
-        gl.amd.cdna4.buffer_store(
-            stored_value=out1,
-            ptr=out,
-            offsets=(o_row + (128 + offs_v_o[None, :]).to(tl.int64)).to(tl.int32),
-            mask=mask_h_o[:, None],
-        )
-        out2 = acc2.to(out.dtype.element_ty)
-        gl.amd.cdna4.buffer_store(
-            stored_value=out2,
-            ptr=out,
-            offsets=(o_row + (256 + offs_v_o[None, :]).to(tl.int64)).to(tl.int32),
-            mask=mask_h_o[:, None],
-        )
-        out3 = acc3.to(out.dtype.element_ty)
-        gl.amd.cdna4.buffer_store(
-            stored_value=out3,
-            ptr=out,
-            offsets=(o_row + (384 + offs_v_o[None, :]).to(tl.int64)).to(tl.int32),
-            mask=mask_h_o[:, None],
+        _dsa_e4m3_store_output(
+            out,
+            acc0,
+            acc1,
+            acc2,
+            acc3,
+            l_new,
+            o_base,
+            stride_o_h,
+            hg_offset,
+            num_heads,
+            blk_out_phase,
+            BLOCK_H,
         )
     else:
         l_i_acc = gl.convert_layout(l_new, gl.SliceLayout(1, mfma_acc))
@@ -1538,7 +1547,7 @@ def _run_dense_kv(
         NATIVE_E5M2=(
             q.dtype == torch.float8_e5m2 and kv_cache.dtype == torch.float8_e5m2
         ),
-        # Match SGLang's TileLang E4M3 path: each QK and PV matrix phase owns
+        # Each E4M3 QK and PV matrix phase owns
         # only 128 latent columns instead of materializing 512-wide operands.
         PHASED_E4M3=native_e4m3,
         COLUMN_PARALLEL=(

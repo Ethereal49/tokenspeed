@@ -1732,11 +1732,20 @@ def test_dsa_decode_glm53_flash_bf16_split_matrix(tokens: int) -> None:
     not (is_cdna4() or is_cdna5()),
     reason="GLM-5.3-Flash graph replay requires AMD CDNA4 or CDNA5",
 )
-@pytest.mark.parametrize("tokens", (16, 64))
-@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float8_e4m3fn))
+@pytest.mark.parametrize("tokens", (1, 16, 64))
+@pytest.mark.parametrize(
+    ("q_dtype", "kv_dtype"),
+    (
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn),
+        (torch.bfloat16, torch.float8_e4m3fn),
+        (torch.float8_e4m3fn, torch.bfloat16),
+    ),
+)
 def test_dsa_decode_glm53_flash_graph_tracks_live_lengths(
     tokens: int,
-    dtype: torch.dtype,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
 ) -> None:
     device = "cuda"
     num_heads = 16
@@ -1747,10 +1756,10 @@ def test_dsa_decode_glm53_flash_graph_tracks_live_lengths(
     generator = _generator(device, 1220 + tokens)
     q = _randn_bf16(
         (tokens, num_heads, kv_lora_rank), device=device, generator=generator
-    ).to(dtype)
+    ).to(q_dtype)
     kv_cache = _randn_bf16(
         (num_slots, kv_lora_rank), device=device, generator=generator
-    ).to(dtype)
+    ).to(kv_dtype)
     topk_slots = torch.full((tokens, topk), -1, device=device, dtype=torch.int32)
     topk_lens = torch.empty(tokens, device=device, dtype=torch.int32)
     graph_out = torch.empty(
@@ -1786,7 +1795,9 @@ def test_dsa_decode_glm53_flash_graph_tracks_live_lengths(
     with torch.cuda.graph(graph):
         invoke(graph_out)
 
-    for visible in (0, 1, 13, 63, 64, 65, 449, 526, 1961, 2048, 2051):
+    # Revisit a long row after short/empty rows to exercise shared-buffer reuse
+    # and online-softmax state under the same captured launch.
+    for visible in (0, 1, 13, 63, 64, 65, 449, 526, 1961, 2048, 2051, 0, 65, 2051):
         topk_slots.fill_(-1)
         topk_lens.fill_(visible)
         selected = torch.arange(visible, device=device, dtype=torch.int32)
@@ -1801,7 +1812,7 @@ def test_dsa_decode_glm53_flash_graph_tracks_live_lengths(
         ref = _dsa_reference(
             q,
             kv_cache,
-            torch.empty((num_slots, 0), dtype=q.dtype, device=device),
+            torch.empty((num_slots, 0), dtype=kv_cache.dtype, device=device),
             topk_slots,
             topk_lens,
             softmax_scale,

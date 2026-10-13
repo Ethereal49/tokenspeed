@@ -536,6 +536,13 @@ the launch and compile shape; device-resident selected lengths skip unused
 tiles and mask live rows across graph replays. Other dtypes, RoPE shapes, and
 packed KV layouts retain their existing paths.
 
+Phased and full-width matrix products share tile partitioning, selection
+masking, online softmax, and split reduction. Separate helpers contain the
+four-phase score/value products and normalized output stores; the kernel
+retains one schedule instead of duplicating those shared operations. Ordinary
+shared-memory stores and loads use compiler-inferred synchronization, including
+the selected-index and single-buffer KV handoffs.
+
 ### DeepSeek V4 attention
 
 The gfx950 and gfx1250 packages provide MXFP4 index selection. Gfx950 also
