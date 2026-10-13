@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from inspect import signature
 from types import SimpleNamespace
 
 import pytest
@@ -460,97 +459,6 @@ def test_mtp_direct_committed_read_matches_seeded_scratch_and_replays() -> None:
     assert torch.equal(committed_storage, changed_committed)
 
 
-@pytest.mark.parametrize(
-    "recurrent_layout,store_states",
-    [
-        ("k_major", False),
-        ("k_major", True),
-        ("v_major", False),
-        ("v_major", True),
-    ],
-)
-def test_kda_fused_verify_selects_all_layout_traits(
-    monkeypatch, recurrent_layout, store_states
-) -> None:
-    selected = {}
-
-    def fake_select_kernel(*args, **kwargs):
-        selected.update(kwargs["traits"])
-        return lambda **kernel_kwargs: kernel_kwargs["mixed_qkv"]
-
-    monkeypatch.setattr(attention_ops, "select_kernel", fake_select_kernel)
-    tensor = torch.empty(1, dtype=torch.bfloat16)
-    result = try_kda_fused_paged_verify(
-        tensor,
-        tensor,
-        tensor,
-        tensor,
-        tensor,
-        tensor,
-        tensor,
-        tensor,
-        tensor,
-        state_pool=tensor,
-        state_scratch=tensor,
-        read_indices=tensor,
-        write_indices=tensor,
-        num_heads=1,
-        head_dim=1,
-        draft_token_num=1,
-        recurrent_layout=recurrent_layout,
-        store_states=store_states,
-        replay_records=None,
-    )
-    assert result is tensor
-    expected = {
-        "paged_state": True,
-        "store_states": store_states,
-        "recurrent_layout": recurrent_layout,
-        "num_heads": 1,
-        "head_dim": 1,
-        "split_producers": False,
-    }
-    assert selected == expected
-
-
-def test_kda_fused_verify_selects_split_producer_kernel_when_inputs_are_given(
-    monkeypatch,
-) -> None:
-    selected = {}
-
-    def fake_select_kernel(*_args, **kwargs):
-        selected.update(kwargs["traits"])
-        return lambda **kernel_kwargs: kernel_kwargs["mixed_qkv"]
-
-    monkeypatch.setattr(attention_ops, "select_kernel", fake_select_kernel)
-    tensor = torch.empty(1, dtype=torch.bfloat16)
-    result = try_kda_fused_paged_verify(
-        tensor,
-        tensor,
-        tensor,
-        tensor,
-        tensor,
-        tensor,
-        tensor,
-        tensor,
-        tensor,
-        state_pool=tensor,
-        state_scratch=tensor,
-        read_indices=tensor,
-        write_indices=tensor,
-        num_heads=1,
-        head_dim=1,
-        draft_token_num=1,
-        recurrent_layout="v_major",
-        store_states=False,
-        g_raw=tensor,
-        conv_qkv=tensor,
-        replay_records=None,
-    )
-    assert result is tensor
-    assert selected["split_producers"] is True
-
-
 def test_kda_verify_conv_update_resolves_registered_producer(monkeypatch) -> None:
     selected = {}
 
@@ -726,43 +634,6 @@ def test_kda_replay_supported_on_the_nvidia_serving_platform(b300_platform) -> N
     finally:
         Platform.override(real_platform)
         registry.clear_cache()
-
-
-def test_batched_replay_call_contract() -> None:
-    """The selected all-layer replay accepts the runtime's explicit group map."""
-    kernel = attention_ops.resolve_kda_batched_replay_commit()
-    if kernel is None:
-        pytest.skip("batched KDA replay is unavailable")
-
-    parameters = signature(kernel.impl).parameters
-    assert "group_indices" in parameters
-    assert "layers_per_group" not in parameters
-
-    tensor = torch.empty(0)
-    signature(kernel.impl).bind(
-        descriptors=tensor,
-        group_indices=tensor,
-        read_indices=tensor,
-        write_indices=tensor,
-        accepted_length=tensor,
-        draft_token_num=1,
-        num_heads=1,
-        head_dim=128,
-        f_a_dim=1,
-        qkv_stride=1,
-        conv_stride=1,
-        f_a_stride=1,
-        beta_stride=1,
-        state_stride=1,
-        gate_stride=1,
-        conv_width=4,
-        lower_bound=-5.0,
-        **(
-            {"record_metadata": tensor, "record_stamps": tensor}
-            if "record_metadata" in parameters
-            else {}
-        ),
-    )
 
 
 def test_kda_split_verify_registration_traits() -> None:

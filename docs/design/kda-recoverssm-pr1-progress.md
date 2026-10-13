@@ -10,9 +10,23 @@
 > separate from these invalid timing runs.
 
 
-Status: implementation in progress. The T4/two-accepted-token attention matrix
-improves, but B32 with one accepted token still regresses by 3.5%. The full
-performance gate has not passed.
+Status: candidate `9b24cc49` is integrated into `kda-recoverssm-pr1` and
+pushed to `byshiue`. A separate frozen worktree retains the validated source.
+The candidate preserves main verify arithmetic at every tested batch size.
+Before the test-scope cleanup recorded below, 214 repository tests passed,
+with 24 platform skips. All 69 actual-input layers and 276 actual-weight
+gate cases match exactly. Full repository hooks pass. Full-model correctness and all 20 calibrated
+attention settings pass. The complete ten-pair E2E campaign fails C=8
+throughput: ratio 0.94104, simultaneous 95% interval [0.89237, 0.99237].
+Three metrics pass and eight are inconclusive. The failed metric makes this
+campaign ineligible for an additional batch. PR1 remains incomplete.
+
+The previous candidate `27c1dbe3` passed correctness and the calibrated
+attention matrix, but failed four metrics in the complete ten-pair E2E
+campaign. That failure remains recorded and is not eligible for an extra
+batch. The new source requires fresh performance samples and all original
+gates before acceptance. Earlier results below apply only to their named
+source. Integration is complete; the failed E2E performance gate remains open.
 
 ## Branch and commits
 
@@ -43,7 +57,7 @@ Baseline and candidate use the same allocation, container and dependencies.
 Main is a separate unchanged worktree. Local launchers, allocation details
 and raw results are in ignored `outputs/pr1/`.
 
-## Implementation milestones
+## Initial implementation milestones (historical)
 
 | Milestone | Status |
 | --- | --- |
@@ -637,3 +651,606 @@ Corrected raw measurements and launchers are in
 `outputs/pr1/disjoint-stamped/`. The earlier timing directory contains an
 invalidation notice. The frozen-source correctness rerun completed with
 **145 passed, 24 skipped**, and its source manifest remained unchanged.
+
+
+### Independent-process matrix and full-model validation
+
+The corrected harness completed ten paired starts with all 20 cells in each
+process. Eighteen cells pass the simultaneous confidence-interval rule.
+B8/T1 and B16/T1 fail: their latency-ratio intervals lie above 1.0, despite
+remaining within the 2% uncertainty margin. These failures remain recorded in
+`outputs/pr1/disjoint-stamped/matrix-statistics-10.json`.
+
+A separate T1 A/B/B/A diagnostic found that preceding T4 cells change the
+absolute timing substantially. The B8 candidate difference decreases from
+about +0.13% to -0.01% when each cell has its own process. B16 decreases from
+about +0.06% to +0.01%. This diagnosis does not invalidate or pass the failed
+cells. A new protocol repeats all 20 cells, with ten paired fresh processes
+per cell. It does not rerun only the failed cells. Its protocol and complete
+raw records are retained under `outputs/pr1/isolated-matrix/`.
+
+Full-model validation uses real Kimi-K3 NVFP4 weights at TP8. One startup
+failed before inference because the worktrees lacked native CUDA libraries.
+Both worktrees now reference the same libraries, with identical source files
+and recorded binary hashes. This was an environment failure, not a completed
+correctness test. Startup and validation are being repeated.
+
+The AIME 2026 corpus is fixed to `math-ai/aime26` revision
+`79037aebdb6580008fb960d17cb21fd3099083e3`, with 30 questions, identical tokenized
+prompts, greedy sampling and a fixed final-box integer parser. No AIME result
+is claimed until both arms complete. The deterministic serving corpus checks
+exact output tokens and per-round acceptance with the existing host logging
+option. Detailed acceptance logging is disabled for performance measurements.
+
+The E2E protocol uses ten independent starts per arm, alternating order within
+matched pairs, C4/8/16/32, and the same graph settings and continuation inputs.
+Median and p99 TPOT and throughput share simultaneous 95% intervals across
+all 12 gated metrics. Diagnostic and correctness starts are not timing samples.
+No full-model or E2E gate is marked complete at this stage.
+
+
+### Packed-table descriptor reuse
+
+A real TP8 trace of `43b59d91` found a descriptor upload on every decode
+round. The scheduler allocates new packed page-table storage each round.
+Absolute table pointers therefore changed even when the table layout did not.
+Across 52 rounds, the trace contains 52 pageable 96-byte host-to-device copies
+and 52 corresponding device-to-device copies.
+
+Commit `60eaa6d1` stores table offsets relative to the first table and passes
+the current base tensor to the shared planner. The descriptor cache now
+depends on layout and source-page vectors. A runtime regression test moves
+the packed storage, checks that no descriptor upload occurs, and verifies
+source pages, destination pages and accepted counts. It fails on the prior
+implementation and passes on this commit.
+
+Frozen-source validation passes **146 tests, with 24 skipped**: 113 kernel
+tests, 21 runtime tests and 12 benchmark API tests. Full repository hooks
+pass. The source manifest SHA-256 is
+`b02ea7c8d32972230b60b276acc25c1fd37cde404c5eacd68eb66f051f16225f`.
+
+The earlier isolated-cell matrix stopped before completion when the real-model
+trace exposed this issue. Its partial data is retained and is not acceptance
+evidence. The final matrix starts again with the new commit, ten independent
+paired processes per cell, and all 20 cells. Both source manifests are checked
+before and after every process.
+
+The baseline AIME run completed with **29/30 correct and zero HTTP errors**.
+The earlier candidate also scored 29/30, but that result belongs to `43b59d91`.
+The final candidate must complete its own run with the same frozen prompts,
+generation limit and parser before the paired accuracy gate can pass.
+
+A separate B32/T4/A1 compiler-resource diagnostic on `60eaa6d1` reports no
+spill slots in the eight captured Triton kernels. Verify uses 165 registers
+per thread and recurrent commit uses 96. CUDA driver occupancy limits are
+18.75% and 31.25%, respectively; these are theoretical limits, not achieved
+occupancy measurements. Full component profiling and the E2E gates remain open.
+
+
+The final TP8 startup reports a 256 MiB execution workspace per GPU in both
+arms. At the fixed 0.80 memory-utilization setting, main allocates 800 LCM
+parents (17,716,838,400 cache bytes), while PR1 allocates 790
+(17,495,654,400 cache bytes). This ten-parent capacity difference is retained
+in the comparison. Both use the configured maximum concurrency of 32; the
+complete serving matrix must still validate that concurrency.
+
+
+### Final-source AIME and commit trace
+
+The paired AIME gate passes for `60eaa6d1`: both main and PR1 score
+**29/30**, with zero HTTP errors. All 30 questions use the same frozen
+prompts, sampling settings, token limit and final-box parser. Per-question
+results are retained. The incorrect questions differ: main misses question
+15, while PR1 has no parsed answer for question 6. This passes the declared
+count-based accuracy gate; it does not establish identical token sequences.
+The separate deterministic serving comparisons remain required.
+
+A TP0 diagnostic trace of the final candidate contains 52 decode rounds:
+3,588 layer verify calls and 52 calls each to the shared planner, recurrent
+recovery and convolution commit. There are two 96-byte pageable host-to-device
+copies and two 96-byte device-to-device copies across the entire trace, down
+from 52 of each on `43b59d91`. The trace includes prefill and decode; it does
+not claim zero descriptor refreshes when table geometry changes. Raw traces
+for all eight ranks are retained. Profiled durations are not performance-gate
+samples.
+
+
+### Exact serving comparison: failed gate
+
+The MTP3 CUDA-graph comparison fails on all five frozen serial corpus cases:
+output token IDs and per-round acceptance counts differ from main. The first
+output difference follows 31 to 98 matching tokens. The ten-turn agentic replay
+also diverges. These failures are retained; the AIME score does not override
+them. Standard-decode, eager and E2E performance acceptance remain pending.
+
+The unchanged-baseline controls pass. All five corpus cases have identical
+output token IDs and acceptance counts across independent server starts and
+within one server. The serving mismatch is therefore a PR1 regression under
+the tested configuration. The numerical-envelope
+document explicitly excludes quantized checkpoints from `rl-bitwise`; switching
+that flag is not a supported fix for this NVFP4 setup. No prompt, threshold or
+model configuration has been changed in response to the failure.
+
+
+A separate diagnostic worktree now checks arithmetic boundaries without
+changing the frozen performance source. It preserves main's BF16 gate
+projection and uses distinct reduction layouts for verify and FP32 replay.
+The diagnostic gates, replay decay, correction and accepted recurrent state
+match the reference bit for bit over 128 rounds at B1, B4 and B16. Two missing
+contractions caused the state drift: the local projection reduction and the
+SiLU multiplication fused with correction subtraction. Record production now
+receives pre-SiLU V and preserves both contractions.
+
+Expanded diagnostics found one near-zero verify output mismatch in each of
+B2 and B3, with maximum absolute error 1.1641532182693481e-10. The existing
+kernel-output tolerances remain unchanged. The accepted-state comparison is
+strengthened to exact equality. Full-model token and acceptance gates remain
+exact. The regression suite now passes; the serving gates remain pending.
+Performance measurements of `60eaa6d1` cannot validate subsequent numerical
+fixes.
+
+
+The complete isolated-cell attention matrix for `60eaa6d1` passes all 20
+cells with ten independent pairs per cell. All 400 process results are
+retained. This performance result does not override the exact serving
+failure. The numerical fix starts a new frozen-source matrix under the same
+protocol; no earlier timing samples enter its acceptance statistics.
+
+
+### Frozen arithmetic correction
+
+Signed commit `694e7bc5` preserves main's arithmetic boundaries. Full repository
+hooks pass. Validation reports **161 passed, 24 skipped**: 128 kernel tests,
+21 runtime tests and 12 benchmark API tests. All 12 long-round composition
+cases have zero accepted-state error. The added gate tests cover both one
+recurrent layer and the complete 69-layer tiling calculation.
+
+The source manifest SHA-256 is
+`77ad825db3c0d4ddfae504b3ebfc612a5f243da9e701b0245715d4f74d2aec69`.
+The correction remains isolated in a clean worktree. Its MTP3 CUDA-graph
+serving comparison also fails all five corpus cases and all ten agentic turns.
+The five corpus cases match only 4, 29, 31, 25 and 27 initial output tokens.
+The new attention matrix stopped after 70 of 400 processes. These partial
+measurements do not provide acceptance statistics. Follow-up correctness and
+E2E controllers stopped on the serving failure.
+
+The next diagnostic captures the unchanged baseline's first eager verify
+window and accepted state. It will compare actual model inputs layer by layer
+against the frozen correction. Instrumented capture runs are not acceptance
+evidence. Scheduler page zero is explicitly reserved as the kernel null page;
+inspection does not support a null-page convention mismatch.
+
+
+### Actual-input verify diagnosis
+
+A diagnostic eager baseline capture retained the first verify window and
+accepted endpoint for all 69 recurrent layers. Replaying the original verify
+kernel reproduces every captured output exactly. Source `694e7bc5` produces
+identical convolution, gate and accepted-state values, but differs in 12 BF16
+verify elements, with maximum absolute error `4.76837158203125e-7`.
+
+A separate correction preserves the four-warp tile's local projection FMA
+operand order and token loop. The original one-warp expansion remains in
+place. The captured first-window outputs and accepted states then match
+exactly. Independent 128-round diagnostics at B1/2/3/4/8/16/32 also report
+zero output and accepted-state error. These are diagnostic results. Full
+repository checks, frozen-source suites and real-model gates must still run
+before this correction can be integrated.
+
+
+### Frozen verify correction
+
+Signed commit `65b82d94` passes all repository hooks and 161 tests, with
+24 platform skips. The final source manifest is
+`c735f43cd8f72b082a93d5d9a3e743a2e365a04b5cbbd993101c2dda48165571`.
+Its actual-input replay has zero verify-output, accepted-state, convolution
+and gate error across all 69 captured layers.
+
+The formal MTP3 CUDA-graph corpus now passes all five cases. Every output
+token and per-round accepted count matches the recorded baseline. The paired
+round counts are 79, 67, 99, 76 and 95. Agentic, standard-decode, eager, AIME
+and performance gates are still in progress. The correction remains isolated
+until all required validation completes.
+
+The ten-turn MTP3 CUDA-graph agentic comparison also passes. Inputs, output
+tokens, accepted counts and cached-token counts match on every turn. The
+initial corrected server completed normally. Standard-decode, eager, AIME
+and the complete performance gates remain pending.
+
+The paired standard-decode CUDA-graph comparison passes all five corpus
+cases and all ten agentic turns. Output tokens, input tokens and cached-token
+counts match. Both servers completed normally. Fresh MTP3 eager comparisons
+are in progress; AIME and performance acceptance remain open.
+
+MTP3 eager also passes all five corpus cases and all ten agentic turns.
+Output tokens and per-round accepted counts match exactly. Agentic input
+and cached-token counts also match. Both eager servers completed normally.
+All three required serving configurations now pass the exact comparisons.
+The candidate AIME evaluation and complete performance gates remain open.
+
+### Verify-correction performance failure
+
+The complete frozen-source attention matrix for `65b82d94` contains ten
+independent matched pairs for all 20 cells (400 processes). All four T=1
+cells pass. All 16 T=4 cells fail with significant latency regressions:
+ratios range from 1.068225 to 1.513437. No second batch is allowed for a
+significant failure. Formal E2E measurements have not started.
+
+Component profiling continues to locate the regression. A separate worktree
+will preserve the corrected arithmetic while testing layout and resource
+changes. The frozen source and all failed measurements remain unchanged.
+The AIME evaluation continues independently.
+
+The frozen `65b82d94` AIME evaluation passes the paired count gate: main
+and candidate each answer 29 of 30 questions correctly. All required
+full-model correctness comparisons pass for this source. Its attention
+performance failure still prevents acceptance and formal E2E timing.
+
+### Producer layout optimization
+
+Signed candidate `27c1dbe3` preserves the corrected replay arithmetic while
+reducing producer overhead. Packed value rows reduce register use. Replay
+loads the checkpoint directly and converts only projection partials for the
+required reduction order. Large-row gate production combines the two required
+dot accumulations in one launch. Small-batch verification stays unchanged.
+
+All repository hooks pass. Frozen-source validation passes 207 tests, with
+24 platform skips. All 69 actual-input layers and 276 actual-weight gate
+cases match exactly. The tracked Python source manifest is
+`d27aab33c4afc6776a2a4563f34b950c99178d862d4be1f3b91bbb461e9dd0eb`.
+
+Fresh full-model correctness and the complete attention matrix are running.
+Diagnostic timings are excluded from acceptance statistics. Formal E2E
+timing must wait for both gates. The candidate remains isolated.
+
+The frozen `27c1dbe3` MTP3 CUDA-graph comparison passes all five corpus
+cases and all ten agentic turns. Output tokens, per-round accepted counts,
+input counts and cached-token counts match the baseline. Standard-decode
+validation has started. Attention statistics and E2E acceptance remain open.
+
+Standard-decode CUDA-graph validation for `27c1dbe3` passes all five corpus
+cases and all ten agentic turns. Output tokens, input counts and cached-token
+counts match. MTP3 eager validation is now running.
+
+MTP3 eager validation for `27c1dbe3` passes all five corpus cases and all ten
+agentic turns. Output tokens and per-round accepted counts match exactly.
+Agentic input and cached-token counts also match. All three serving
+configurations pass their complete comparisons. AIME and the commit trace
+are now running; performance acceptance remains pending.
+
+The frozen `27c1dbe3` AIME evaluation passes the paired count gate. Main and
+candidate each answer 29 of 30 questions correctly, with zero HTTP errors.
+Main misses question 15. The candidate answers question 15 correctly but
+has no parsed final answer for question 28. This is a count-based accuracy
+pass, not identical AIME token sequences.
+
+The TP0 diagnostic trace contains 55 decode rounds, 3,795 verify launches and
+55 launches each for shared planning, recurrent recovery and convolution
+commit. Record metadata preparation also runs 55 times. The complete trace
+contains one pageable H2D and one D2D copy of 96 bytes; these copies do not
+repeat each round. All formal full-model correctness gates now pass.
+The complete attention matrix and formal E2E measurements remain pending.
+
+### Frozen layout-candidate timing result
+
+The complete `27c1dbe3` matrix contains ten independent matched pairs for
+all 20 cells (400 processes). All 16 T4 cells pass, with latency ratios from
+0.755111 to 0.977715. Three T1 cells pass. B4/T1 fails the significant
+regression rule: ratio 1.000033330, simultaneous interval
+[1.000012136, 1.000054524]. This remains a failure despite its small size.
+No second acceptance batch is eligible. Formal E2E timing has not started.
+
+Seven B4/T1 paired medians differ by one 32 ns median step; three pairs tie.
+The compiler hashes and resources are identical between arms. Nsight records
+345 identical fused-decode kernel calls per arm. A fixed ten-pair A/A
+calibration now checks the original timing method using one unchanged source.
+Calibration samples are diagnostic only; the failed matrix remains intact.
+
+### Timing-resolution calibration
+
+The complete B4/T1 Nsight records contain identical kernel sequences, launch
+geometry, resources and copy sequences: 345 kernels and 345 copies per arm.
+A fixed ten-pair A/A control on unchanged main produces two 32 ns differences
+and eight ties. Its interval includes 1; this control does not fail. The
+individual event times have 32 ns granularity.
+
+Before collecting longer-window data, the calibration fixed 64 consecutive
+graph replays per event window and 50 windows per process. State resets before
+each window and persists through its 64 replays. Divide each raw window by 64,
+then use the process median. This improves per-replay event-step resolution
+to 0.5 ns. All raw window times and normalized observations are retained.
+
+The ten-pair A/A calibration for this fixed method gives ratio 0.9999955013
+and interval [0.9999585714, 1.0000324325], including 1. Both apparent speedups
+and slowdowns matter for this two-sided calibration check.
+
+A fresh complete 400-process attention campaign is now registered in
+`outputs/pr1/window64-matrix/PROTOCOL.md`. It uses the same source, cells,
+independent-start count, bootstrap and regression rules. It reuses no timing
+from the original failed matrix or the calibration. The original failure
+remains recorded. Source-identical component profiles and the full-model
+correctness certificate remain valid. E2E data collection has not started.
+
+
+### Complete calibrated attention result
+
+The fresh 400-process matrix passes all 20 cells with ten independent paired
+starts. No second batch is needed. All four T1 simultaneous intervals contain
+1. The sixteen T4 latency ratios range from 0.755991 to 0.978508, corresponding
+to 2.15% through 24.40% lower latency. The B4/T1 ratio is 0.999984958 with
+interval [0.999933734, 1.000036185]. Statistics and failure thresholds are
+unchanged. The original single-event failure and both A/A controls remain
+recorded; they do not enter these acceptance statistics.
+
+All 40 component profiles and both occupancy reports describe the same frozen
+source. At B32/T4/A1, verify uses 121 registers per thread with 22.24% achieved
+occupancy; recovery uses 96 registers with 29.47% achieved occupancy. Both
+kernels have zero spills. Full-model correctness remains passed. Memory
+reporting and the formal E2E matrix are the remaining validation work.
+
+
+### Memory inventory and E2E placement
+
+The B32/T4/A4 synthetic 69-layer memory inventory is complete for both arms.
+Baseline reserves 199,179,264 bytes and allocates 5,796 additional descriptor
+bytes outside that return value. The candidate reserves its complete
+305,382,788-byte inventory. Both include 61,046,784 convolution workspace
+bytes. Eager peak allocated memory above persistent tensors is 29,884,416
+bytes for baseline and 34,603,008 bytes for the candidate. Capture has the same
+extra peaks. Graph replay adds zero PyTorch allocated bytes in either arm.
+These figures exclude driver/context memory and full-model allocations.
+
+The first inventory check incorrectly assumed baseline already budgeted its
+descriptors. That report-only check was corrected after inspecting both
+preallocators. The failed check and corrected results remain recorded.
+No candidate source or performance data changed.
+
+Before collecting any E2E samples, both original serving nodes became busy.
+The pending allocation was cancelled before it ran. The full E2E campaign
+now uses a fixed pair of idle GB300 nodes in one NVL72 group, with the same
+node pair for both arms and subsequent lease renewals. Only harness hostnames
+changed; source, dependencies, workload, server flags and statistics did not.
+The original harness and client manifest are preserved. Placement preflight
+checks both devices and software versions before the first server start.
+
+
+### E2E request-arrival diagnostic
+
+The first formal baseline start stopped after six C4 batches and the first
+C8 warmup batch. At C8, seven requests reported 51,840 cached tokens instead
+of the required 51,328; one retained the required parent hit. Identical
+continuations can reuse pages published by earlier requests in the same
+batch when arrivals are staggered. All requests and the failed start remain
+recorded. No candidate performance start ran, and there is no valid paired
+performance result.
+
+A separate baseline diagnostic compares preencoded concurrent requests and
+the batch API, with three repeats at each C4/8/16/32 condition. It checks
+cache hits without changing model source, prompts, output limits or statistical
+thresholds. Diagnostic samples never enter acceptance statistics.
+
+
+### Fixed-cache E2E campaign
+
+Three baseline diagnostic repeats pass the original hit count at C4/8/16
+when JSON is preencoded. C32 still reports extra prefix hits in all three
+repeats. The batch API returns HTTP 400 for the tested batched input.
+Admission-time prefix matching and the 8,192-token prefill budget explain
+why simultaneous arrival alone cannot fix all four concurrency conditions.
+
+A separate fixed maximum-prefix control passes all 12 conditions: three
+repeats at each C4/8/16/32. Prime the first 51,841 tokens of the unchanged
+51,936-token continuation, then require exactly 51,840 cached tokens for
+every request. That is the final complete prefix page, so later admissions
+cannot reuse a longer prompt prefix. JSON bodies and hashes are prepared
+before the batch timer. Server settings and actual continuation tokens do
+not change. This explicitly changes the priming boundary from 51,328 to
+51,840; the original campaign remains failed, not retroactively passed.
+
+A new complete campaign is registered in
+`outputs/pr1/tp8/FIXEDCACHE-E2E-PROTOCOL.md`. It collects ten new paired
+independent starts, with the same alternation, three rounds, one warmup and
+five measured batches per round and concurrency, 256 output tokens, bootstrap
+and regression thresholds. The complete harness is hash-guarded. Original
+and diagnostic samples are excluded. The scope is one real-content agentic
+continuation with a fixed near-full prefix hit, not all cache-hit lengths.
+
+### Frozen candidate: fixed-cache E2E result
+
+All ten paired independent starts completed. The fixed-cache invariant held
+for every recorded request. The predeclared joint bootstrap reports three
+passes, five inconclusive metrics and four failures. The failed metrics are:
+
+| Concurrency | Metric | Candidate/main ratio | Simultaneous 95% interval |
+| --- | --- | --- | --- |
+| 8 | Mean throughput | 0.958973 | [0.929559, 0.989318] |
+| 16 | Median TPOT | 1.045993 | [1.030554, 1.061663] |
+| 32 | p99 TPOT | 1.098598 | [1.004012, 1.202094] |
+| 32 | Mean throughput | 0.977379 | [0.955869, 0.999373] |
+
+This is a failed acceptance gate. A second batch is not eligible because
+there are significant regressions. Keep all raw measurements and the full
+report at `outputs/pr1/tp8/fixedcache-e2e-statistics-10.json`.
+
+The resource report covers all starts: baseline cache capacity is 801 parent
+blocks; candidate capacity is 792. Both arms have zero measured preemptions.
+GPU memory at readiness is 229717 MiB per GPU for baseline and 229633 MiB for
+candidate; these are readiness snapshots, not runtime peaks. The candidate's
+larger persistent replay workspace is accounted for before cache sizing.
+
+Output sequences and acceptance distributions differ at concurrent batches.
+Diagnostic grouping by identical output sequence still shows additional
+latency in some cells. This grouping is not an acceptance statistic and does
+not exclude any sample from the failed gate. Collect paired CPU/GPU traces
+before assigning the cause. Keep the tested candidate frozen and make any
+fix in a separate worktree. Final integration and documentation cleanup remain
+pending.
+
+### Exact verify reduction candidate
+
+Frozen candidate `9b24cc49e5a115e08ef7bd52dc06de090d4aeece` preserves
+main's verify normalization and rounded-product reduction at concurrent
+batches. It keeps packed value rows and explicitly reduces four adjacent
+products before the 32 partial sums. The non-128-dimensional prepared-QK
+path retains its general reduction; seven boundary cases cover that path.
+
+All 12 multi-round producer cases now require bitwise verify equality at
+every batch size, with no relaxation of accepted-state equality. Complete
+validation reports 214 passed and 24 platform skips. All 69 actual-input
+layers and 276 actual gate cases are exact. The full repository pre-commit
+command passes. The signed source is clean and frozen.
+
+Eight independent tuning cases at B4/8/16/32 and A1/4 report latency ratios
+0.77122 through 0.99441. These are diagnostic observations, not acceptance
+statistics. The earlier simple-layout and larger-tile experiments are also
+retained under `outputs/pr1/e2e-fix/`.
+
+The new full-model correctness campaign and complete source-specific
+attention campaign have started on separate GPU allocations. The attention
+protocol is `outputs/pr1/exact-reduction-matrix/PROTOCOL.md`. The new E2E
+protocol preserves the fixed-cache workload and original statistical gates.
+It requires fresh paired starts and must not reuse source27 timing samples.
+The candidate is not yet accepted or integrated into the PR1 branch.
+
+## Exact reduction candidate: completed acceptance campaign
+
+Candidate `9b24cc49` passes the five fixed-input and ten-turn agentic checks
+in MTP3 graph, standard graph and MTP3 eager configurations. Output tokens
+and acceptance counts match the corresponding baseline exactly. AIME remains
+29/30 for both versions; generated tokens are not required to match in that
+task. The TP0 trace has 41 rounds and 41 launches of each commit component.
+
+All 20 attention settings pass across 400 fresh processes. Each T=1 interval
+contains one. T=4 latency ratios range from 0.76964 to 0.99518. Forty component
+traces and two occupancy reports are complete. These measurements exclude
+prefill, model projections, sampling and communication.
+
+The full ten-pair E2E result is **FAIL**, with one failed metric, three passed
+metrics and eight inconclusive metrics. C=8 throughput is 5.90% lower; the upper
+bound of its simultaneous confidence interval is below one. All starts completed,
+all requests had 51,840 cached tokens, and no measured request was preempted.
+No failed sample was replaced. No extra batch is eligible under the protocol.
+
+At C=8, mean reported acceptance length is 3.60755 for main and 3.49061 for
+the candidate. Mean TTFT is similar. Output-sequence frequencies differ, and
+requests with the most common shared output also have longer mean candidate
+TPOT. These are diagnostic observations, not proof of a cause. Separate C=8
+CPU/GPU traces are complete. Both contain 49 rounds; candidate KDA verify
+and recovery are faster in these traces, while the whole TP0 GPU span is
+slightly longer. This is diagnostic evidence, not an acceptance override. Formal statistics
+and all raw requests are retained under `outputs/pr1/tp8/` with the
+`exact-reduction` prefix. Integration, cleanup and publication remain pending.
+
+Admission analysis retains all 150 C=8 measured batches per arm. The 6+2
+prefill pattern occurs 20 times in main and 78 times in the candidate; 5+3
+occurs 85 and 42 times. Both implementations produce different first tokens
+for the two-request group in the observed 6+2 batches. Candidate mean batch
+time is lower within both dominant patterns. These conditional observations
+do not prove why admission differs and cannot reverse the failed gate.
+The bounded next investigation is recorded in the local diagnostic report.
+All owned GPU allocations are released; no tests remain running.
+
+## Fixed-send-order C8 diagnostic
+
+At the user's request, the PR1 branch was fast-forwarded to `9b24cc49` and pushed to `byshiue`. This does not change the failed E2E acceptance verdict.
+
+Three fresh-start pairs used one client thread to send requests 0 through 7 in order, retaining eight outstanding requests. Each arm completed 45 measured batches, 360 requests, with exact cache checks and no preemptions. Mean accepted length was 3.63208333 for baseline and 3.51652778 for candidate. Mean acceptance rate was 87.75083333% versus 83.92608333%, a difference of -3.82475 percentage points.
+
+Shared prefill groups had identical reported means across arms: 5+3 gave length 3.65 and rate 88.36375%; 6+2 gave length 3.3925 and rate 79.80250%. The candidate had 22 of 45 batches in 6+2, versus 5 of 45 for baseline. Fixed client send order did not fix engine receive order or prefill grouping. This diagnostic supports further investigation of admission and batch-sensitive prefill behavior; it does not establish a fused-kernel arithmetic defect or override the E2E gate.
+
+Local evidence: `outputs/pr1/tp8/ordered-c8-report.md`, `ordered-c8-summary.json`, and `ordered-c8-request-comparison.csv`. All owned GPU resources were released after the diagnostic.
+
+### Completed C8 ingress-boundary diagnostic
+
+One fresh instrumented start per immutable arm, 15 C8 batches / 120 measured
+requests each. Exact request groups match across IPC drain, TP broadcast,
+request-handler return, scheduler submission and prefill in all 30 batches.
+All eight requests are physically received before first scheduler submission
+in 13/30 batches, but the prefetched next snapshot is only submitted in the
+next round. Thus physical receipt does not mean current scheduler visibility.
+
+The instrumented pair has 6+2 in 4/15 batches for each arm; the previous
+uninstrumented 5/45 vs 22/45 frequency difference does not reproduce. More
+three-way groups appear with instrumentation. All five shared grouping
+patterns have matching mean reported acceptance statistics across arms.
+This confirms the grouping mechanism but does not identify the cause of the
+prior frequency shift. Further timing isolation is needed before attributing
+it to a kernel. No scheduler policy or model code was changed.
+
+All case/source checks completed; GPU resources were released. Evidence:
+`outputs/pr1/tp8/ingress-c8-findings.md` and `ingress-c8-analysis.json`.
+Original E2E C8 failure remains unchanged; this is diagnostic evidence only.
+
+### Prime overlap explains the C8 ingress gap
+
+A reverse-order instrumented pair (candidate then baseline), 15 measured C8
+batches per arm, confirms that every batch waits for a queued decode of the
+already-finished one-token prime request. The extra decode was dispatched
+before final prime prefill completion in all 30 batches. Its commit occupies
+98.19% (candidate) / 99.23% (baseline) of the approximately 18 ms ingress gap.
+A native scheduler 0.1.27 CPU replay independently confirms scheduling ahead
+of the finish event even when max_new_tokens=1.
+
+Candidate frontend IPC begins 1.410 ms earlier relative to prime completion;
+its eight-request IPC span is 1.038 ms shorter. Together with the measured
+commit phase, this gives arrivals 1.606 ms more head start before receiving
+resumes. The current pair has 6+2 in 12/15 candidate vs 0/15 baseline batches.
+The grouping boundary remains identical from IPC drain through prefill in
+all 30 batches. This locates an overlap/arrival-timing mechanism. The precise
+host-side source and historical group-frequency effect remain unisolated,
+particularly because the earlier instrumented pair had 4/15 vs 4/15.
+
+The prime HTTP response is not an engine-idle barrier. A further controlled
+diagnostic can separate C8 arrival from prime's unfinished overlapping work.
+No production policy/code changed; original E2E C8 failure remains unchanged.
+Resources released; source/native and harness hashes passed. Evidence:
+`outputs/pr1/tp8/commit-c8-findings.md`, `commit-c8-wait-analysis.json`, and
+`replay_one_token_overlap.json`.
+
+### Controlled C8 admission aligns both implementations
+
+Two fresh-start pairs used reversed arm order, a prime-drain barrier, fixed
+logical request order, and fixed prefill groups 5+3, 6+2 and 8. Each arm ran
+30 measured batches / 240 requests, plus separate warmups. Every input/cache
+check passed, all samples were retained, and no preemptions occurred.
+
+All 240 paired requests have exactly matching final output tokens and live
+per-round accepted-width sequences. All 30 paired batches have matching
+prefill/decode membership, input lengths and CUDA-graph shape sequences.
+Both arms report mean accepted length/rate of 3.65/88.36375% for 5+3,
+3.3925/79.80250% for 6+2, and 3.70/89.86% for 8. Per-request differences
+are zero in this controlled workload.
+
+From first prefill dispatch to last live commit, pooled candidate throughput
+changes are +0.407% (5+3), -0.437% (6+2), and +0.597% (8). Each pair has
+the same sign per group. These are descriptive controlled-execution timings
+with trace overhead, not ordinary HTTP latency or a new E2E acceptance gate.
+Two fresh pairs do not establish a population-level performance claim.
+
+This supports an admission/group-frequency explanation of the earlier
+aggregate acceptance difference, with no candidate-only arithmetic mismatch
+observed here. It does not prove universal bitwise equivalence or isolate
+the precise host-side cause of the historical arrival-timing shift. No
+production scheduler or kernel code changed. Original natural-arrival C8
+E2E failure remains unchanged. Source/native/harness checks passed, the
+controller exited successfully, and owned GPU resources were released.
+
+Evidence: `outputs/pr1/tp8/ALIGNED-C8-PROTOCOL.md`, `aligned-c8-findings.md`,
+`aligned-c8-analysis.json`, and `aligned-c8-request-comparison.csv`.
+
+### PR1 unit-test scope cleanup
+
+At the user's request, remove PR1 API-signature/argument checks, the touched
+mock dispatch-trait checks, invalid-record rejection tests and their helper,
+and the compilation-reuse-only test. Remove the exception-only tail from
+the padded graph test. The commit-plan test now compares resolved page and
+step values without checking pointer changes or spying on descriptor copies.
+Numerical output, recovery-state, padding, graph replay and multi-round
+correctness comparisons remain. Runtime validation and kernel code are
+unchanged. This cleanup is limited to PR1-specific or PR1-updated coverage;
+pre-existing unrelated tests remain.
+
+All four edited Python test files pass syntax compilation; the diff passes
+whitespace checks. Local pytest could not start because the environment lacks
+`typing_extensions`. GPU correctness tests were not rerun for this test-only
+cleanup. The earlier GPU results describe the pre-cleanup test suite.
