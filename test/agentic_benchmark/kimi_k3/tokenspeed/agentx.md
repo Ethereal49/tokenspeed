@@ -111,9 +111,4 @@ acceptance policy and spreadsheet updates belong to the external experiment
 tools. Exit zero means native replay/validation succeeded, not that a run passed
 an additional comparison audit. Smoke is not a formal performance measurement.
 
-Run CPU lifecycle tests, then a real GPU smoke for each selected layout:
-
-```bash
-python -m unittest discover -s test/agentic_benchmark/tests \
-  -p test_k3_inferencex_agentx.py -v
-```
+Run a GPU smoke for each selected layout before starting a formal benchmark.
