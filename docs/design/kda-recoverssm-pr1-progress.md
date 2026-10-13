@@ -1240,17 +1240,18 @@ Evidence: `outputs/pr1/tp8/ALIGNED-C8-PROTOCOL.md`, `aligned-c8-findings.md`,
 
 ### PR1 unit-test scope cleanup
 
-At the user's request, remove PR1 API-signature/argument checks, the touched
-mock dispatch-trait checks, invalid-record rejection tests and their helper,
-and the compilation-reuse-only test. Remove the exception-only tail from
+At the user's request, remove the PR1-added benchmark API-argument check,
+invalid-record rejection tests and their helper, and the compilation-reuse-only
+test. Remove the exception-only tail from
 the padded graph test. The commit-plan test now compares resolved page and
 step values without checking pointer changes or spying on descriptor copies.
 Numerical output, recovery-state, padding, graph replay and multi-round
 correctness comparisons remain. Runtime validation and kernel code are
-unchanged. This cleanup is limited to PR1-specific or PR1-updated coverage;
-pre-existing unrelated tests remain.
+unchanged. The three pre-existing main tests removed in `01afefe5` are restored
+with their PR1 argument updates intact. The cleanup now removes only PR1-added
+checks; pre-existing tests remain.
 
-All four edited Python test files pass syntax compilation; the diff passes
+The edited Python test files pass syntax compilation; the diff passes
 whitespace checks. Local pytest could not start because the environment lacks
 `typing_extensions`. GPU correctness tests were not rerun for this test-only
 cleanup. The earlier GPU results describe the pre-cleanup test suite.
