@@ -31,10 +31,13 @@ from __future__ import annotations
 import ast
 import os
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+import torch
 
 # CPU-only tests scheduled in runtime-1gpu because they import the full runtime.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -44,6 +47,8 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed_scheduler import Cache  # noqa: E402
 
+from tokenspeed.runtime.cache.hicache import HiCacheEngine  # noqa: E402
+from tokenspeed.runtime.cache.transfer.ops import HostWriteBackCompletion  # noqa: E402
 from tokenspeed.runtime.engine import cache_hooks as cache_hooks_module  # noqa: E402
 from tokenspeed.runtime.engine import (  # noqa: E402
     scheduler_utils as scheduler_utils_module,
@@ -297,6 +302,42 @@ def test_poll_returns_completed_events_and_settles_inflight(fake_cache_ops) -> N
     assert hooks._pending_payloads == {}
 
 
+def test_host_copy_keeps_tickets_open_until_l3_persistence_finishes(
+    fake_cache_ops,
+) -> None:
+    device = _Device()
+    l3 = SimpleNamespace(
+        submit_backup=Mock(),
+        poll_results=Mock(return_value=[]),
+        consume_backup_poll_failure=Mock(return_value=False),
+    )
+    hooks = _hooks(
+        device,
+        cache_engine=HiCacheEngine(l3),
+        speculative_algorithm=None,
+        attn_tp_size=1,
+        attn_tp_cpu_group=None,
+        pp_size=1,
+        pp_cpu_group=None,
+    )
+    hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7, 8])]))
+    completion = HostWriteBackCompletion((7, 8), ((0, 1, "hash", 0),))
+    device.results = [completion]
+
+    # Retired D2H copies start persistence; their tickets still need Store ACKs.
+    assert hooks.poll_ready_events() == []
+    l3.submit_backup.assert_called_once_with(completion)
+    assert hooks.poll_ready_events() == []
+    assert hooks._num_inflight == hooks._num_open == 2
+    assert l3.poll_results.call_count == 2
+
+    l3.poll_results.return_value = [_writeback_done_event(7), _writeback_done_event(8)]
+    assert [e.op_id for e in hooks.poll_ready_events()] == [7, 8]
+    assert hooks._num_inflight == hooks._num_open == 0
+    assert hooks.poll_ready_events() == []
+    assert l3.poll_results.call_count == 3
+
+
 def test_pp_peer_missing_writeback_keeps_payload_pending(
     fake_cache_ops, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -484,9 +525,11 @@ def test_empty_tp_intersection_still_gathers_pp(
     assert ("WriteBackDoneEvent", 7) in hooks._pending_payloads
 
 
-def test_idle_replica_max_reduces_then_gathers_when_peer_has_work(
+def test_replica_runs_collectives_only_while_a_ticket_is_open(
     fake_cache_ops, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Without an L3 store the open-ticket count mirrors across the replica, so
+    an idle replica polls nothing, and a committed op closes its ticket."""
     device = _Device()
     pp_group = object()
     hooks = _hooks(
@@ -505,33 +548,36 @@ def test_idle_replica_max_reduces_then_gathers_when_peer_has_work(
         pp_size=2,
         pp_cpu_group=pp_group,
     )
-
-    reduce_groups: list = []
-    gather_groups: list = []
+    collectives: list = []
 
     def _all_reduce(tensor, *, op, group) -> None:
         del op
-        reduce_groups.append(group)
+        collectives.append("reduce")
         tensor[0] = 1
 
     def _all_gather_object(output, obj, *, group) -> None:
-        gather_groups.append(group)
+        del group
+        collectives.append("gather")
         output[0] = list(obj)
-        output[1] = [{"kind": "WriteBackDoneEvent", "op_id": 3}]
+        output[1] = list(obj)
 
     _install_collectives(
         monkeypatch, all_reduce=_all_reduce, all_gather_object=_all_gather_object
     )
 
-    assert hooks.poll_ready_events() == []
-    assert reduce_groups == [pp_group]
-    assert gather_groups == [pp_group]
-    assert hooks._pending_payloads == {}
+    assert hooks.poll_ready_events() == [] and collectives == []
+    hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])]))
+    device.results = [_writeback_done_event(7)]
+    assert [e.op_id for e in hooks.poll_ready_events()] == [7]
+    assert collectives == ["reduce", "gather"]
+    assert hooks.poll_ready_events() == [] and collectives == ["reduce", "gather"]
 
 
-def test_idle_replica_skips_gather_only_after_unanimous_max_reduce(
+def test_tickets_stay_open_until_the_replica_commits_them(
     fake_cache_ops, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A completion seen here keeps its ticket open (and the replica polling)
+    until every peer has it; a batch closes ticket by ticket."""
     device = _Device()
     pp_group = object()
     hooks = _hooks(
@@ -550,23 +596,34 @@ def test_idle_replica_skips_gather_only_after_unanimous_max_reduce(
         pp_size=2,
         pp_cpu_group=pp_group,
     )
-
-    reduce_groups: list = []
+    collectives: list = []
+    peer_ready: list = []
 
     def _all_reduce(tensor, *, op, group) -> None:
-        del tensor, op
-        reduce_groups.append(group)
+        del op, group
+        collectives.append("reduce")
+        tensor[0] = 1
 
     def _all_gather_object(output, obj, *, group) -> None:
-        del output, obj, group
-        raise AssertionError("idle replica must not gather")
+        del group
+        collectives.append("gather")
+        output[0] = list(obj)
+        output[1] = [p for p in obj if p["op_id"] in peer_ready]
 
     _install_collectives(
         monkeypatch, all_reduce=_all_reduce, all_gather_object=_all_gather_object
     )
-
+    hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7, 8])]))
+    device.results = [_writeback_done_event(7), _writeback_done_event(8)]
+    assert hooks.poll_ready_events() == []  # the peer has neither yet
     assert hooks.poll_ready_events() == []
-    assert reduce_groups == [pp_group]
+    assert collectives == ["reduce", "gather"] * 2
+    peer_ready.append(7)
+    assert [e.op_id for e in hooks.poll_ready_events()] == [7]
+    peer_ready.append(8)
+    assert [e.op_id for e in hooks.poll_ready_events()] == [8]
+    collectives.clear()
+    assert hooks.poll_ready_events() == [] and collectives == []
 
 
 def test_replica_backup_failure_raises_after_poll_all_reduce(
@@ -617,3 +674,115 @@ def test_replica_backup_failure_raises_after_poll_all_reduce(
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+class _GridGroup:
+    """A CPU group of the simulated grid: a barrier-backed rendezvous whose
+    collectives time out (and fail the test) if any member skips them."""
+
+    def __init__(self, members: list[int]) -> None:
+        self.members = members
+        self.slots: dict[int, object] = {}
+        self.barrier = threading.Barrier(len(members), timeout=10)
+
+
+def test_tp_pp_grid_counts_stay_equal_and_all_ranks_stop_polling_together(
+    fake_cache_ops, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Four independent hooks (attention TP 2 x PP 2) count the same plans while
+    completions reach each rank in different rounds; every round commits the
+    same ops with the same open count everywhere, and once all tickets close
+    no rank enters a collective, so none waits on a peer that skipped."""
+    tp_groups = {0: _GridGroup([0, 1]), 1: _GridGroup([2, 3])}
+    pp_groups = {0: _GridGroup([0, 2]), 1: _GridGroup([1, 3])}
+    local = threading.local()
+    collectives = {rank: 0 for rank in range(4)}
+
+    def _rendezvous(group: _GridGroup, value):
+        rank = local.rank
+        collectives[rank] += 1
+        group.slots[rank] = value
+        group.barrier.wait()
+        gathered = [group.slots[member] for member in group.members]
+        group.barrier.wait()
+        return gathered
+
+    def _all_reduce(tensor, *, op, group) -> None:
+        del op
+        gathered = _rendezvous(group, tensor.clone())
+        tensor.copy_(torch.stack(gathered).max(dim=0).values)
+
+    def _all_gather_object(output, obj, *, group) -> None:
+        output[:] = _rendezvous(group, list(obj))
+
+    _install_collectives(
+        monkeypatch, all_reduce=_all_reduce, all_gather_object=_all_gather_object
+    )
+
+    # Ticket -> (event kind, round in which each rank sees it complete).
+    arrivals = {
+        7: ("WriteBackDoneEvent", [1, 3, 2, 1]),
+        8: ("WriteBackDoneEvent", [2, 1, 4, 2]),
+        20: ("SnapshotDoneEvent", [1, 1, 1, 5]),
+        21: ("SnapshotDoneEvent", [3, 2, 1, 1]),
+    }
+    plan = SimpleNamespace(
+        cache=[_FakeWriteBackOp(op_ids=[7, 8]), _FakeSnapshotBatch([20, 21])]
+    )
+    num_rounds = 9
+    committed = {rank: [] for rank in range(4)}
+    open_counts = {rank: [] for rank in range(4)}
+    collectives_at_close: dict[int, int] = {}
+    errors: list = []
+    round_barrier = threading.Barrier(4, timeout=30)
+
+    def _run(rank: int) -> None:
+        local.rank = rank
+        device = _Device()
+        hooks = CacheOpHooks(
+            device,
+            cache_engine=HiCacheEngine(None),
+            speculative_algorithm=None,
+            attn_tp_rank=rank % 2,
+            attn_tp_size=2,
+            attn_tp_cpu_group=tp_groups[rank // 2],
+            pp_size=2,
+            pp_cpu_group=pp_groups[rank % 2],
+            global_rank=rank,
+        )
+        try:
+            hooks.count_plan_ops(plan)
+            for round_idx in range(num_rounds):
+                device.results = [
+                    _cache_event(kind, op_id)
+                    for op_id, (kind, rounds) in arrivals.items()
+                    if rounds[rank] == round_idx
+                ]
+                committed[rank].append(
+                    sorted(event.op_id for event in hooks.poll_ready_events())
+                )
+                open_counts[rank].append(hooks._num_open)
+                if round_idx == 5:
+                    collectives_at_close[rank] = collectives[rank]
+                round_barrier.wait()
+        except Exception as exc:  # BrokenBarrierError on a skipped collective
+            errors.append((rank, exc))
+            round_barrier.abort()
+
+    threads = [threading.Thread(target=_run, args=(rank,)) for rank in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    for rank in range(1, 4):
+        assert committed[rank] == committed[0]
+        assert open_counts[rank] == open_counts[0]
+    assert sorted(op for ops in committed[0] for op in ops) == [7, 8, 20, 21]
+    # Each ticket commits once every rank has it: the latest arrival among ranks.
+    assert committed[0][4] == [8] and committed[0][5] == [20]
+    assert committed[0][3] == [7, 21]
+    assert open_counts[0][5:] == [0] * (num_rounds - 5)
+    # The last ticket closed in round 5; rounds 6-8 entered no collective anywhere.
+    assert collectives == collectives_at_close
