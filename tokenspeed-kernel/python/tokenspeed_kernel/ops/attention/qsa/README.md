@@ -71,9 +71,15 @@ and short-context linear bins reduce selection traffic and histogram overhead.
 `max_partial_bytes` bounds global scratch for both CuTe and Triton, excluding
 the selected-id output. If split scratch exceeds the budget, a supported grouped
 CuTe layout uses CTA-local streaming; kernel selection excludes other CuTe layouts.
-Portable Triton assigns one program per query row, scans its complete key
-range and writes final ids directly. Its exact running top-k stays inside the
-program; no partial or merge buffer is allocated, even with a zero budget.
+Portable Triton groups a divisor of the explicitly supplied request-run width,
+up to four queries, to reuse each K tile. Ragged runs use group size one in the
+same kernel. Each row keeps its own frontier and exact packed FP32-score/id
+running top-k; a group stops at its longest frontier and writes final ids
+directly. The monotone cutoff skips tile selection when no new key can qualify.
+Head-dimension tiles of 32 bound shared memory, and split comparison pairs reduce
+sorting layout conversions. Sorted tiles are padded after sorting, and groups
+with at most top-k complete blocks return all ids without scoring. No partial
+or merge buffer is allocated, even with a zero budget.
 Query count, request count, page-table width, Q strides and live frontiers remain
 runtime arguments. Split geometry uses power-of-two capacity buckets to bound
 the tuned kernels' compilation cache. PDL waits precede asynchronous Q copies
@@ -136,7 +142,23 @@ trimmed grids favor CuTe by a few microseconds, and individual short-context
 layouts can favor logits beyond the threshold. Explicit paths remain available
 for those workloads.
 
-Output-only Triton trades split parallelism for zero scratch. At 1024 rows and
-131072 KV tokens it measured 11.1 ms versus 11.2 ms for the previous split
-implementation, removing 32 MiB of scratch. Tiny grids lose key-range
-parallelism; automatic selection keeps them on logits when its matrix fits.
+The portable Triton optimization uses the same measurement method with 50
+samples per seed, pairing both versions and the other backends on each GPU.
+Across 149 shapes, including multiple requests, small request-run widths,
+padded capacities and full frontiers, it improves by 1.71–9.95x with a 3.60x
+median and no measured regression. All Triton cases allocate only their output.
+For the model's grouped layout, shared memory drops from 133 KiB to 33 KiB,
+registers from 255 to 210 per thread, and local-memory spills disappear.
+
+| Query rows / live KV tokens | Triton before | Triton | CuTe stream | Logits |
+| --- | ---: | ---: | ---: | ---: |
+| 1 / 32768 | 415.7 | 141.3 | 10.2 | 12.3 |
+| 512 / 65536 | 3142.7 | 444.4 | 100.4 | 112.6 |
+| 1024 / 131072 | 11097.6 | 1736.7 | 167.9 | 221.2 |
+| 8192 / 8192 | 3661.8 | 454.7 | 118.8 | 135.2 |
+| 16384 / 32768 | 34591.8 | 4739.7 | 700.4 | 798.7 |
+| 16384 / 262144 | 350049.3 | 46774.8 | 3816.4 | 5894.2 |
+
+Times are microseconds. CuTe or logits remains fastest in every measured shape;
+automatic path thresholds are unchanged. Triton provides a faster portable
+zero-scratch fallback, while tiny grids still lack key-range parallelism.

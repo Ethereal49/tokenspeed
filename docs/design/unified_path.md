@@ -840,8 +840,9 @@ running selections in selector registers, with double-buffered score
 candidates overlapping selection and MMA across tiles. Small grids may split
 the key range into bounded global scratch. The caller's partial-workspace
 budget bounds that scratch. Grouped CuTe and portable Triton streaming only
-allocate their output; each Triton program scans one row's complete key range
-and keeps its running top-k locally, with no split/merge buffers. Candidate pruning must
+allocate their output; each Triton program scans a group contained in an explicit
+uniform request run and keeps each row's running top-k locally, with no split/merge
+buffers. Ragged runs use group size one in the same kernel. Candidate pruning must
 prove that discarded scores cannot enter the top-k, or perform a full-score
 fallback. Each row retains its complete-block frontier. Query count, request
 count, page-table width and Q strides remain runtime values; split geometry is

@@ -1662,16 +1662,17 @@ def test_qwen4_exp_qsa_commit_verify_layers_rejects_bad_args(
 
 @pytest.mark.parametrize("budget", [0, 1 << 20])
 @pytest.mark.parametrize("topk", [64, 512, 2048])
+@pytest.mark.parametrize("queries_per_request", [None, 4])
 def test_portable_stream_allocates_only_output_and_refreshes_graph(
-    device, monkeypatch, budget, topk
+    device, monkeypatch, budget, topk, queries_per_request
 ):
     torch.manual_seed(311)
-    rows, blocks = 4, 512
+    rows, blocks = 4, 4096
     query = torch.randn(rows, 5, 32, device=device, dtype=torch.bfloat16)[:, :4]
     keys = torch.randn(blocks, 1, 32, device=device, dtype=query.dtype)
-    table = torch.arange(8, device=device, dtype=torch.int32)[None]
+    table = torch.arange(blocks // 64, device=device, dtype=torch.int32)[None]
     requests = torch.zeros(rows, device=device, dtype=torch.int32)
-    complete = torch.tensor([0, 50, 128, blocks], device=device, dtype=torch.int32)
+    complete = torch.tensor([0, 50, 513, blocks], device=device, dtype=torch.int32)
 
     def invoke():
         return qwen4_exp_qsa_block_topk(
@@ -1682,7 +1683,7 @@ def test_portable_stream_allocates_only_output_and_refreshes_graph(
             complete,
             page_size=64,
             block_topk=topk,
-            queries_per_request=None,
+            queries_per_request=queries_per_request,
             max_partial_bytes=budget,
             max_logits_bytes=256 << 20,
             path="stream",
@@ -1706,7 +1707,7 @@ def test_portable_stream_allocates_only_output_and_refreshes_graph(
     with torch.cuda.graph(graph):
         actual = invoke()
     assert allocations == [actual.numel() * actual.element_size()]
-    for frontiers in ([0, 50, 128, blocks], [blocks, 128, 50, 0]):
+    for frontiers in ([0, 50, 513, blocks], [blocks, 513, 50, 0]):
         complete.copy_(torch.tensor(frontiers, device=device, dtype=torch.int32))
         query.normal_()
         keys.normal_()
@@ -1719,7 +1720,10 @@ def test_portable_stream_allocates_only_output_and_refreshes_graph(
             assert sorted(actual[row][actual[row] >= 0].tolist()) == sorted(expected)
 
 
-def test_portable_stream_reuses_compile_across_rows_capacities_and_strides(device):
+@pytest.mark.parametrize("queries_per_request", [None, 4])
+def test_portable_stream_reuses_compile_across_rows_capacities_and_strides(
+    device, queries_per_request
+):
     torch.manual_seed(317)
     query_storage = torch.randn(12, 5, 128, device=device, dtype=torch.bfloat16)
     keys = torch.randn(1024, 1, 128, device=device, dtype=query_storage.dtype)
@@ -1727,7 +1731,7 @@ def test_portable_stream_reuses_compile_across_rows_capacities_and_strides(devic
     requests = torch.zeros(12, device=device, dtype=torch.int32)
     complete = torch.full_like(requests, 512)
 
-    def invoke(rows, pages, feature_stride):
+    def invoke(rows, pages, feature_stride, width):
         return qwen4_exp_qsa_block_topk(
             (
                 query_storage[:rows, :4, :64]
@@ -1740,7 +1744,7 @@ def test_portable_stream_reuses_compile_across_rows_capacities_and_strides(devic
             complete[:rows],
             page_size=64,
             block_topk=64,
-            queries_per_request=None,
+            queries_per_request=width,
             max_partial_bytes=0,
             max_logits_bytes=256 << 20,
             path="stream",
@@ -1751,10 +1755,142 @@ def test_portable_stream_reuses_compile_across_rows_capacities_and_strides(devic
         )
 
     # Triton distinguishes unit and non-unit runtime strides; warm each class.
-    invoke(3, 8, 1)
-    invoke(3, 8, 2)
+    first_rows = 3 if queries_per_request is None else 4
+    invoke(first_rows, 8, 1, queries_per_request)
+    invoke(first_rows, 8, 2, queries_per_request)
     with assert_no_triton_compile(_qwen4_exp_qsa_stream_block_topk_kernel):
-        for rows, pages in ((7, 11), (9, 13), (12, 16)):
+        shapes = (
+            ((7, 11), (9, 13), (12, 16))
+            if queries_per_request is None
+            else ((8, 11), (12, 13), (12, 16))
+        )
+        for rows, pages in shapes:
             for feature_stride in (1, 2):
-                selected = invoke(rows, pages, feature_stride)
+                width = None if queries_per_request is None else rows
+                selected = invoke(rows, pages, feature_stride, width)
                 assert bool(((selected >= 0) & (selected < 512)).all())
+
+
+@pytest.mark.parametrize("queries_per_request", [None, 3, 6, 8])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_portable_stream_request_groups_and_frontiers(
+    device, queries_per_request, dtype
+):
+    torch.manual_seed(331)
+    width = queries_per_request or 8
+    rows, blocks, topk = 3 * width, 4096, 512
+    query = torch.randn(rows, 5, 128, device=device, dtype=dtype)[:, :4]
+    keys = torch.randn(3 * blocks, 1, 128, device=device, dtype=dtype)
+    # Persistent row strides and permuted physical pages exercise address
+    # calculation independently of each group's request id.
+    table_storage = torch.full((3, 81), -1, device=device, dtype=torch.int32)
+    table = table_storage[:, : blocks // 64]
+    table.copy_(torch.randperm(3 * blocks // 64, device=device).reshape_as(table))
+    requests = torch.tensor([2, 0, 1], device=device, dtype=torch.int32)
+    requests = requests.repeat_interleave(width)
+    if queries_per_request is None:
+        requests = requests[torch.randperm(rows, device=device)]
+    complete = torch.tensor(
+        [0, 64, 512, 575, 2049, blocks], device=device, dtype=torch.int32
+    ).repeat((rows + 5) // 6)[:rows]
+    actual = qwen4_exp_qsa_block_topk(
+        query,
+        keys,
+        table,
+        requests,
+        complete,
+        page_size=64,
+        block_topk=topk,
+        queries_per_request=queries_per_request,
+        max_partial_bytes=0,
+        max_logits_bytes=0,
+        path="stream",
+        persistent_topk_workspace=None,
+        enable_pdl=False,
+        solution="triton",
+        override=None,
+    )
+    scores = _block_topk_reference_scores(
+        query, keys, table, requests, complete, 64, blocks
+    )
+    for row in range(rows):
+        ids = actual[row]
+        count = min(int(complete[row]), topk)
+        assert int((ids >= 0).sum()) == count
+        assert torch.unique(ids[ids >= 0]).numel() == count
+        selected_scores = scores[row][ids.clamp_min(0).long()].masked_fill(
+            ids < 0, -float("inf")
+        )
+        torch.testing.assert_close(
+            selected_scores.sort(descending=True).values,
+            scores[row].topk(topk).values,
+            rtol=1e-5,
+            atol=1e-4,
+        )
+
+
+def test_portable_stream_preserves_ties_and_ids_above_65535(device):
+    rows, blocks, topk = 8, 65664, 512
+    query = torch.zeros(rows, 4, 32, device=device, dtype=torch.bfloat16)
+    keys = torch.zeros(blocks, 1, 32, device=device, dtype=query.dtype)
+    table = torch.arange(blocks // 64, device=device, dtype=torch.int32)[None]
+    requests = torch.zeros(rows, device=device, dtype=torch.int32)
+    frontiers = [0, 512, 513, 65535, 65536, 65537, blocks - 1, blocks]
+    complete = torch.tensor(frontiers, device=device, dtype=torch.int32)
+    actual = qwen4_exp_qsa_block_topk(
+        query,
+        keys,
+        table,
+        requests,
+        complete,
+        page_size=64,
+        block_topk=topk,
+        queries_per_request=8,
+        max_partial_bytes=0,
+        max_logits_bytes=0,
+        path="stream",
+        persistent_topk_workspace=None,
+        enable_pdl=False,
+        solution="triton",
+        override=None,
+    )
+    for row, frontier in enumerate(frontiers):
+        count = min(frontier, topk)
+        assert int((actual[row] >= 0).sum()) == count
+        expected = torch.arange(frontier - count, frontier, device=device)
+        torch.testing.assert_close(
+            actual[row][actual[row] >= 0].long().sort().values, expected
+        )
+
+
+def test_portable_stream_keeps_fp32_boundary_precision(device):
+    rows, blocks, topk = 4, 4096, 512
+    query = torch.zeros(rows, 5, 32, device=device)[:, :4]
+    query[:, 0, 0] = 1
+    keys = torch.zeros(blocks, 1, 32, device=device)
+    # These distinct scores share FP16/TF32 bins around the selection boundary.
+    keys[:, 0, 0] = 1 + torch.arange(blocks, device=device) * 2**-22
+    table = torch.arange(blocks // 64, device=device, dtype=torch.int32)[None]
+    requests = torch.zeros(rows, device=device, dtype=torch.int32)
+    frontiers = [600, 1024, 3073, blocks]
+    complete = torch.tensor(frontiers, device=device, dtype=torch.int32)
+    actual = qwen4_exp_qsa_block_topk(
+        query,
+        keys,
+        table,
+        requests,
+        complete,
+        page_size=64,
+        block_topk=topk,
+        queries_per_request=4,
+        max_partial_bytes=0,
+        max_logits_bytes=0,
+        path="stream",
+        persistent_topk_workspace=None,
+        enable_pdl=False,
+        solution="triton",
+        override=None,
+    )
+    for row, frontier in enumerate(frontiers):
+        expected = torch.arange(frontier - topk, frontier, device=device)
+        torch.testing.assert_close(actual[row].long().sort().values, expected)
