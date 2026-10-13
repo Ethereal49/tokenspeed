@@ -348,6 +348,20 @@ grid depends on SM count, query-group count and capacity, never live lengths.
 Longer frontiers need more device-loop iterations, not a new graph or a
 device-to-host read.
 
+The QSA model marks its layout as independent of the immediate Q/K producer:
+layout preparation precedes compression, and compression waits before its
+outgoing trigger. The logits scorer may preload request ids, complete-block
+counts and the first tile's page table before waiting for Q/K. Generic callers
+must supply that independence contract explicitly; otherwise the scorer waits
+before reading metadata. Streaming selection retains its entry wait.
+Persistent CUDA top-k follows the same explicit PDL setting and may preload
+independent lengths and initialize its histogram before waiting for scores.
+Length copies/casts remove that preload guarantee. Small non-cluster PDL grids
+use a one-block register budget when their row count fits the SM count; larger
+grids retain the two-block budget. These are precompiled launch-bounds variants
+of the same algorithm, selected from captured shapes without reading device
+lengths. The compiler determines actual register allocation and occupancy.
+
 ### `for_graph_replay` is for graph-mechanics asymmetries only
 
 `for_graph_replay=True` means a graph is in play — live replay AND the base

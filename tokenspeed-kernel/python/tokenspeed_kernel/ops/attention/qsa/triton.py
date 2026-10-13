@@ -1637,11 +1637,10 @@ def _qwen4_exp_qsa_score_blocks_kernel(
     BLOCK_D: tl.constexpr,
     QUERY_GROUP_SIZE: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
+    METADATA_INDEPENDENT: tl.constexpr,
 ):
-    if ENABLE_PDL:
+    if ENABLE_PDL and not METADATA_INDEPENDENT:
         tl.extra.cuda.gdc_wait()
-        # Successors may prepare now; their waits still protect these outputs.
-        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0) * QUERY_GROUP_SIZE
     tile = tl.program_id(1)
     # Every group stays within one request, but each query keeps its own
@@ -1650,6 +1649,21 @@ def _qwen4_exp_qsa_score_blocks_kernel(
     query_offsets = tl.arange(0, QUERY_GROUP_SIZE)
     complete = tl.load(complete_blocks + row + query_offsets).to(tl.int64)
     max_complete = tl.minimum(tl.max(complete, axis=0), num_blocks)
+    # The model prepares indices before compression; only Q/K need its wait.
+    # Other callers retain the entry wait when metadata has a live producer.
+    first_block_ids = tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    first_valid = first_block_ids < max_complete
+    first_pages = tl.load(
+        page_table + request * stride_pt_b + first_block_ids // page_size,
+        mask=first_valid,
+        other=0,
+    ).to(tl.int64)
+    first_slots = first_pages * page_size + first_block_ids % page_size
+    if ENABLE_PDL and METADATA_INDEPENDENT:
+        tl.extra.cuda.gdc_wait()
+    if ENABLE_PDL:
+        # Successors may prepare now; their waits still protect these outputs.
+        tl.extra.cuda.gdc_launch_dependents()
     # The grid stays bounded during graph replay. Each CTA walks only its
     # valid tiles, reusing Q when a request outgrows the launch width.
     if tile * BLOCK_N < max_complete:
@@ -1670,12 +1684,15 @@ def _qwen4_exp_qsa_score_blocks_kernel(
             valid = block_ids < max_complete
             columns = block_ids // page_size
             offsets = block_ids % page_size
-            pages = tl.load(
-                page_table + request * stride_pt_b + columns,
-                mask=valid,
-                other=0,
-            ).to(tl.int64)
-            slots = pages * page_size + offsets
+            if start == tile * BLOCK_N:
+                slots = first_slots
+            else:
+                pages = tl.load(
+                    page_table + request * stride_pt_b + columns,
+                    mask=valid,
+                    other=0,
+                ).to(tl.int64)
+                slots = pages * page_size + offsets
             keys = tl.load(
                 key_cache
                 + slots[None, :] * stride_k_n
@@ -1854,6 +1871,7 @@ def _qwen4_exp_qsa_block_topk_logits(
     queries_per_request: int | None,
     persistent_topk_workspace: torch.Tensor | None,
     enable_pdl: bool,
+    metadata_independent: bool,
 ) -> torch.Tensor:
     """Materialized path: score valid blocks to FP32, then radix-select.
 
@@ -1916,6 +1934,7 @@ def _qwen4_exp_qsa_block_topk_logits(
         BLOCK_D=triton.next_power_of_2(query.shape[2]),
         QUERY_GROUP_SIZE=query_group_size,
         ENABLE_PDL=use_pdl,
+        METADATA_INDEPENDENT=metadata_independent,
         num_warps=4,
         num_stages=2,
         **pdl_kwargs,
@@ -1940,6 +1959,9 @@ def _qwen4_exp_qsa_block_topk_logits(
             lengths=complete_blocks,
             workspace=persistent_topk_workspace,
             max_seq_len=num_blocks,
+            enable_pdl=use_pdl,
+            lengths_independent=metadata_independent,
+            q_len_per_req=1,
         )
         return selected
     return triton_topk_from_logits(
@@ -1961,6 +1983,7 @@ def qwen4_exp_qsa_block_topk(
     solution: str,
     persistent_topk_workspace: torch.Tensor | None,
     enable_pdl: bool,
+    metadata_independent: bool,
 ) -> torch.Tensor:
     """Select the highest-scoring compressed blocks for each query row.
 
@@ -1988,8 +2011,12 @@ def qwen4_exp_qsa_block_topk(
             of at least 1 MiB. The ``"logits"`` solution uses it for the
             length-aware persistent radix top-k when that kernel is available;
             otherwise selection falls back to portable Triton.
-        enable_pdl: Wait for query/cache/metadata producers and release
-            successor setup early between scoring and selection on NVIDIA GPUs.
+        enable_pdl: Wait for producers and release successor setup early
+            between scoring and selection on NVIDIA GPUs.
+        metadata_independent: Request indices, complete-block counts and page
+            tables are ready independently of the preceding kernel. The logits
+            scorer uses this guarantee to prefetch indices before waiting for
+            Q/K; the streaming solution keeps its conservative entry wait.
 
     Returns:
         Int32 block ids shaped ``[rows, block_topk]``; invalid entries are
@@ -2027,6 +2054,7 @@ def qwen4_exp_qsa_block_topk(
             queries_per_request=queries_per_request,
             persistent_topk_workspace=persistent_topk_workspace,
             enable_pdl=enable_pdl,
+            metadata_independent=metadata_independent,
         )
     return _qwen4_exp_qsa_block_topk_stream(
         query,

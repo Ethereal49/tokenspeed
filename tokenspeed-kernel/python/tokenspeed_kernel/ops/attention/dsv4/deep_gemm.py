@@ -291,7 +291,15 @@ def _decode_topk(
                 "persistent top-k kernel is unavailable"
             )
         persistent_topk(
-            logits.contiguous(), lengths, out, workspace, topk, logits.shape[1]
+            logits.contiguous(),
+            lengths,
+            out,
+            workspace,
+            topk,
+            logits.shape[1],
+            enable_pdl=False,
+            lengths_independent=False,
+            q_len_per_req=1,
         )
         return out
     _trtllm_decode_topk(logits.contiguous(), lengths, out, topk)

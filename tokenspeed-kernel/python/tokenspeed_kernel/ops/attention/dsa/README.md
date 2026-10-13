@@ -191,3 +191,17 @@ owned entries. Empty tiles still write negative-infinite logits, including
 when lengths or ownership change during graph replay. Partially valid tiles
 keep the per-entry mask and global forced-window policy. This avoids redundant
 arithmetic without changing the launch grid, logits capacity or Top-K scan.
+
+### Persistent CUDA top-k dependencies
+
+`ragged_decode_topk` requires explicit `enable_pdl` and
+`lengths_independent` arguments. With PDL, independent lengths and histogram
+initialization may precede the score dependency wait; scores and output stores
+remain protected, including empty and short rows. A length copy or cast makes
+the converted lengths producer-owned and disables that preload. Cluster and
+single-CTA launches both honor the PDL flag.
+
+For non-cluster PDL grids with no more rows than SMs, the launcher selects a
+one-block register budget to reduce packing of waiting CTAs. Larger grids keep
+the two-block budget. Launch bounds guide register allocation; they are not a
+hard limit on resident CTAs. Both variants use the same radix algorithm.

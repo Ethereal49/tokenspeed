@@ -1103,10 +1103,11 @@ struct PersistentTopKParams {
   uint32_t top_k;
   uint32_t max_seq_len;
   uint32_t q_len_per_req;
+  bool lengths_independent;
 };
 
-template <int TopK, int Level>
-__global__ void __launch_bounds__(kThreadsPerBlock, 2)
+template <int TopK, int Level, bool kUsePDL, int kMinBlocksPerSm>
+__global__ void __launch_bounds__(kThreadsPerBlock, kMinBlocksPerSm)
     persistent_topk_kernel(PersistentTopKParams params) {
   static_assert(TopK == 512 || TopK == 1024 || TopK == 2048);
   static_assert(Level >= 0 && Level <= 2);
@@ -1114,14 +1115,22 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
   const uint32_t row = blockIdx.x;
   if (row >= params.num_rows) return;
 
+  if constexpr (kUsePDL) {
+    if (!params.lengths_independent) {
+      tokenspeed::device::PDLWaitPrimary<true>();
+    }
+  }
   const uint32_t seq_len =
       dsa_topk_row_seq_len(params.lengths, row, params.q_len_per_req);
   int32_t* row_output = params.output + row * params.top_k;
   if (seq_len <= static_cast<uint32_t>(TopK)) {
+    // Empty and short rows still participate in the dependency chain.
+    tokenspeed::device::PDLWaitPrimary<kUsePDL>();
     for (uint32_t i = threadIdx.x; i < static_cast<uint32_t>(TopK);
          i += kThreadsPerBlock) {
       row_output[i] = i < seq_len ? static_cast<int32_t>(i) : -1;
     }
+    tokenspeed::device::PDLTriggerSecondary<kUsePDL>();
     return;
   }
 
@@ -1142,21 +1151,22 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
   };
 
   if constexpr (Level == 0) {
-    Register2::forward<false>(problem, &smem);
+    Register2::forward<kUsePDL>(problem, &smem);
   } else if constexpr (Level == 1) {
-    Register4::forward<false>(problem, &smem);
+    Register4::forward<kUsePDL>(problem, &smem);
   } else {
     if (seq_len <= kRegister4MaxSeqLen) {
-      Register4::forward<false>(problem, &smem);
+      Register4::forward<kUsePDL>(problem, &smem);
     } else {
-      Streaming::forward<false>(problem, &smem);
+      Streaming::forward<kUsePDL>(problem, &smem);
     }
   }
+  tokenspeed::device::PDLTriggerSecondary<kUsePDL>();
 }
 
 template <int TopK, bool kUsePDL, typename Cluster>
-__device__ __forceinline__ void cluster_topk_body(
-    PersistentTopKParams params, void* smem) {
+__device__ __forceinline__ void cluster_topk_body(PersistentTopKParams params,
+                                                  void* smem) {
   static_assert(TopK == 512 || TopK == 1024 || TopK == 2048);
   using Register4 = impl::TopKRegister<4>;
   using Streaming = impl::TopKStreaming;
@@ -1165,6 +1175,11 @@ __device__ __forceinline__ void cluster_topk_body(
   if (row >= params.num_rows) return;
   const uint32_t rank = blockIdx.y;
   const uint32_t worker_rank = row % Cluster::kClusterSize;
+  if constexpr (kUsePDL) {
+    if (!params.lengths_independent) {
+      tokenspeed::device::PDLWaitPrimary<true>();
+    }
+  }
   const uint32_t seq_len =
       dsa_topk_row_seq_len(params.lengths, row, params.q_len_per_req);
   int32_t* row_output = params.output + row * params.top_k;
@@ -1197,7 +1212,7 @@ __device__ __forceinline__ void cluster_topk_body(
   } else if (seq_len <= kClusterFloor) {
     if (rank == worker_rank) Streaming::forward<kUsePDL>(problem, smem);
   } else {
-    Cluster::forward<kUsePDL>(problem, smem);
+    Cluster::template forward<kUsePDL>(problem, smem);
     // Cluster::forward's last DSMEM consumer is already preceded by a
     // cluster-wide barrier. Once it returns, each CTA only completes local or
     // global-memory writes, and kernel completion provides the launch-wide
@@ -1211,7 +1226,7 @@ __device__ __forceinline__ void cluster_topk_body(
   tokenspeed::device::PDLTriggerSecondary<kUsePDL>();
 }
 
-template <int TopK, uint32_t kClusterHistBits, bool kUsePDL = false>
+template <int TopK, uint32_t kClusterHistBits, bool kUsePDL>
 __global__ void __launch_bounds__(kThreadsPerBlock, 2)
     __cluster_dims__(1, kClusterSize, 1)
         cluster_topk_kernel(PersistentTopKParams params) {
@@ -1219,27 +1234,26 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
   using Register4 = impl::TopKRegister<4>;
   using Streaming = impl::TopKStreaming;
   using Cluster = impl::TopKCluster<kClusterSize, kClusterHistBits>;
-  __shared__ impl::MaxSmem<typename Register4::Smem,
-                           typename Streaming::Smem, typename Cluster::Smem>
+  __shared__ impl::MaxSmem<typename Register4::Smem, typename Streaming::Smem,
+                           typename Cluster::Smem>
       smem;
   cluster_topk_body<TopK, kUsePDL, Cluster>(params, &smem);
 }
 
-template <int TopK, uint32_t kClusterHistBits, bool kUsePDL = false>
-__global__ void __launch_bounds__(kThreadsPerBlock, 1)
-    __cluster_dims__(1, 8, 1)
-        cluster8_register4_topk_kernel(PersistentTopKParams params) {
+template <int TopK, uint32_t kClusterHistBits, bool kUsePDL>
+__global__ void __launch_bounds__(kThreadsPerBlock, 1) __cluster_dims__(1, 8, 1)
+    cluster8_register4_topk_kernel(PersistentTopKParams params) {
   static_assert(kClusterHistBits == 9 || kClusterHistBits == 10);
   using Register4 = impl::TopKRegister<4>;
   using Streaming = impl::TopKStreaming;
   using Cluster = impl::TopKCluster<8, kClusterHistBits, 4>;
-  __shared__ impl::MaxSmem<typename Register4::Smem,
-                           typename Streaming::Smem, typename Cluster::Smem>
+  __shared__ impl::MaxSmem<typename Register4::Smem, typename Streaming::Smem,
+                           typename Cluster::Smem>
       smem;
   cluster_topk_body<TopK, kUsePDL, Cluster>(params, &smem);
 }
 
-template <int TopK, uint32_t kClusterHistBits, bool kUsePDL = false>
+template <int TopK, uint32_t kClusterHistBits, bool kUsePDL>
 __global__ void __launch_bounds__(kThreadsPerBlock, 2)
     __cluster_dims__(1, 16, 1)
         cluster16_topk_kernel(PersistentTopKParams params) {
@@ -1247,8 +1261,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
   using Register4 = impl::TopKRegister<4>;
   using Streaming = impl::TopKStreaming;
   using Cluster = impl::TopKCluster<16, kClusterHistBits>;
-  __shared__ impl::MaxSmem<typename Register4::Smem,
-                           typename Streaming::Smem, typename Cluster::Smem>
+  __shared__ impl::MaxSmem<typename Register4::Smem, typename Streaming::Smem,
+                           typename Cluster::Smem>
       smem;
   cluster_topk_body<TopK, kUsePDL, Cluster>(params, &smem);
 }

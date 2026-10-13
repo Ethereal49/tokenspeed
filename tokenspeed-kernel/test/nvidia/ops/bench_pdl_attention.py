@@ -139,6 +139,7 @@ def _qsa(rows, solution):
             solution=solution,
             persistent_topk_workspace=None,
             enable_pdl=pdl_enabled(),
+            metadata_independent=True,
         )
         slots = qwen4_exp_qsa_selected_slots(
             selected,
