@@ -67,6 +67,7 @@ validate_config() {
     [[ -f "$SCRIPT_DIR/agentx.sh" ]] || { echo "Missing client script: $SCRIPT_DIR/agentx.sh" >&2; exit 2; }
     source "$SCRIPT_DIR/agentx.sh"
     validate_agentx_config
+    validate_agentx_values RUN_ROOT
     [[ "$CLIENT_PYTHON" = "$CLIENT_ROOT/venv/bin/python" ]] || { echo "CLIENT_PYTHON must use CLIENT_ROOT/venv" >&2; exit 2; }
     for config in "${CONFIGS[@]}"; do
         [[ -f "$SCRIPT_DIR/configs/$config.sh" ]] || { echo "Missing server config: $SCRIPT_DIR/configs/$config.sh" >&2; exit 2; }

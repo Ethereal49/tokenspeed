@@ -262,6 +262,11 @@ class SlurmTests(unittest.TestCase):
                 "AIPERF_UNSAFE_OVERRIDE must be true or false",
             ),
             ("CONFIG_NAMES", "   ", "CONFIG_NAMES must select at least one config"),
+            (
+                "RUN_ROOT",
+                str(self.root / "run with spaces"),
+                "RUN_ROOT must not contain whitespace",
+            ),
         ):
             with self.subTest(key=key):
                 result = subprocess.run(
