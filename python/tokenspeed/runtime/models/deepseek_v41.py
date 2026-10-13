@@ -79,7 +79,12 @@ from tokenspeed_kernel.ops.attention.dsv41 import (
     rope_inplace,
     rope_pad_query,
 )
-from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32, grouped_bf16_projection
+from tokenspeed_kernel.ops.gemm import (
+    dsv4_linear_fp32,
+    fp8_linear,
+    grouped_bf16_projection,
+    prepare_fp8_linear,
+)
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
@@ -234,6 +239,7 @@ class _V41Fp8Config(Mxfp8Config):
 class _ReferenceFp8LinearMethod(Fp8LinearMethod):
     def __init__(self, quant_config: Mxfp8Config):
         super().__init__(quant_config)
+        self.fp8_linear_plan = None
         # Hopper has no tensor-core kernel for 32-wide FP8 blocks; its FP8 GEMMs
         # rescale on CUDA cores every 32 K and trail the plain BF16 GEMM at
         # every shape. So load the codes straight into a BF16 weight and fold
@@ -300,6 +306,7 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         if not self.load_as_bf16:
             super().process_weights_after_loading(layer)
+            self.prepare_linear(layer)
             return
         scale = layer.weight_scale_inv.data.view(torch.float8_e8m0fnu).to(
             torch.bfloat16
@@ -308,11 +315,45 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
         layer.register_parameter("weight_scale_inv", None)
         layer.quant_method = UnquantizedLinearMethod()
 
+    @torch.no_grad()
+    def prepare_linear(self, layer: nn.Module) -> None:
+        if self.load_as_bf16:
+            return
+        plan = prepare_fp8_linear(layer.weight, layer.weight_scale_inv, [1, 32])
+        if self.fp8_linear_plan is None:
+            self.fp8_linear_plan = plan
+            return
+        cached = self.fp8_linear_plan.prepared_weight_scales
+        updated = plan.prepared_weight_scales
+        if cached is None and updated is None:
+            return
+        if (
+            cached is None
+            or updated is None
+            or cached.shape != updated.shape
+            or cached.dtype != updated.dtype
+            or cached.device != updated.device
+        ):
+            raise ValueError(
+                "V4.1 prepared FP8 scales changed layout, dtype, or device"
+            )
+        # A captured linear keeps the original buffer address across refits.
+        cached.copy_(updated)
+
     def apply(
         self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None
     ) -> torch.Tensor:
         if x.shape[0] == 0:
             return x.new_empty((*x.shape[:-1], layer.weight.shape[0]))
+        if x.is_cuda and x.dtype in (torch.bfloat16, torch.float16):
+            return fp8_linear(
+                self.fp8_linear_plan,
+                x.reshape(-1, x.shape[-1]),
+                layer.weight,
+                layer.weight_scale_inv,
+                bias=bias,
+                out_dtype=x.dtype,
+            ).view(*x.shape[:-1], layer.weight.shape[0])
         codes, scales = v41_quantize_fp8(x)
         return super().apply(layer, codes, bias, scales, x.dtype)
 
@@ -2194,6 +2235,12 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         for module in self.modules():
             if isinstance(module, MoELayer):
                 module.process_weights_after_loading(module)
+            elif isinstance(module, LinearBase) and isinstance(
+                module.quant_method, _ReferenceFp8LinearMethod
+            ):
+                # The target and DSpark share this hook. Refresh in place after
+                # a complete weight update; captured graphs retain the buffer.
+                module.quant_method.prepare_linear(module)
 
     def post_quant_warmup(self) -> None:
         for module in self.modules():

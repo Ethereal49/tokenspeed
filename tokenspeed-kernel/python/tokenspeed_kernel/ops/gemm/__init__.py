@@ -46,8 +46,10 @@ from tokenspeed_kernel.ops.gemm.flashinfer import (
     flashinfer_joint_bf16_supported,
     gemm_fp8_nt_groupwise,
     has_flashinfer_cute_dsl_nvfp4_a16,
+    has_flashinfer_mxfp8,
     prepare_flashinfer_fp8_blockscale_weight_scales,
     prepare_nvfp4_a16_weights,
+    swizzle_mxfp8_scale,
     use_flashinfer_fp8_blockscale_prepacked,
 )
 from tokenspeed_kernel.ops.gemm.kimi3 import (
@@ -64,6 +66,7 @@ from tokenspeed_kernel.ops.gemm.linear_attnres_partials import (
     linear_attnres_partials_available,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.ops.quantization.triton import _quantize_fp8_group32_swizzled
 from tokenspeed_kernel.platform import Platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
@@ -1125,32 +1128,65 @@ def bmm(
 
 
 # ---------------------------------------------------------------------------
-# Prepared FP8 block-scale linear (prepacked FlashInfer path)
+# Prepared FP8 block-scale linear
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class _PreparedFp8LinearPlan:
+    """Derived scales for one fixed-shape layer; no execution state."""
+
     block_size: list[int]
-    prepared_weight_scales: torch.Tensor
+    prepared_weight_scales: torch.Tensor | None
 
 
+@torch.no_grad()
 def prepare_fp8_linear(
     weight: torch.Tensor,
     weight_scales: torch.Tensor,
     block_size: list[int],
 ) -> _PreparedFp8LinearPlan:
-    """Prepare an FP8 block-scale weight for the prepacked FlashInfer path.
+    """Create derived scale layouts without choosing an execution backend.
 
-    Converts canonical ``[N // 128, K // 128]`` weight scales into the
-    prepacked MN-major layout once so per-token calls can reuse them.
+    Args:
+        weight: E4M3 weight matrix ``[N, K]``.
+        weight_scales: Canonical FP32 ``[N/128, K/128]`` scales for 128x128,
+            or UE8M0 uint8 ``[N, K/32]`` scales for 1x32. Left unchanged.
+        block_size: Logical weight-scale block shape, [128, 128] or [1, 32].
+
+    Returns:
+        A new plan for this fixed-shape layer. Its owner manages scale refresh
+        after weight updates, copying into existing buffers to preserve CUDA
+        Graph addresses. A 1x32 plan without native layout support still
+        permits canonical execution.
     """
-    return _PreparedFp8LinearPlan(
-        block_size=list(block_size),
-        prepared_weight_scales=prepare_flashinfer_fp8_blockscale_weight_scales(
-            weight_scales
-        ),
-    )
+    if block_size == [128, 128]:
+        prepared = prepare_flashinfer_fp8_blockscale_weight_scales(weight_scales)
+    elif block_size == [1, 32]:
+        if (
+            weight.ndim != 2
+            or weight.dtype != _fp8_dtype
+            or weight.shape[1] % 32
+            or weight_scales.dtype != torch.uint8
+            or weight_scales.shape != (weight.shape[0], weight.shape[1] // 32)
+            or weight_scales.device != weight.device
+        ):
+            raise ValueError("1x32 FP8 linear requires canonical UE8M0 weight scales")
+        prepared = (
+            swizzle_mxfp8_scale(weight_scales, *weight.shape)
+            if has_flashinfer_mxfp8()
+            and weight.is_cuda
+            and min(weight.shape) >= 128
+            and weight.stride(-1) == 1
+            else None
+        )
+    else:
+        raise ValueError("Prepared FP8 linear supports 128x128 or 1x32 blocks")
+    # The 128x128 transpose can alias canonical scales when one dimension is 1.
+    # The cache must only change on a complete refresh, even in that case.
+    if prepared is not None and prepared.data_ptr() == weight_scales.data_ptr():
+        prepared = prepared.clone()
+    return _PreparedFp8LinearPlan(list(block_size), prepared)
 
 
 def fp8_linear(
@@ -1160,17 +1196,49 @@ def fp8_linear(
     weight_scales: torch.Tensor,
     *,
     out_dtype: torch.dtype,
+    input_scales: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run a prepared FP8 block-scale linear layer.
 
-    Routes through the prepacked MN-major-scale path when padding the token
-    count is cheap, the canonical FlashInfer kernel otherwise. The prepacked
-    path also covers 17 <= M <= 32, whose activation scales FlashInfer's
-    K-major mode mis-reads on SM10x.
+    Args:
+        plan: This fixed-shape layer's scale cache from prepare_fp8_linear.
+        x: Dense activation rows ``[M, K]``, or FP8 codes with input_scales.
+        weight: Original E4M3 weight matrix ``[N, K]``.
+        weight_scales: Original canonical weight scales, used by fallbacks.
+        out_dtype: Result dtype.
+        input_scales: Optional canonical scales for already quantized inputs.
+        bias: Optional output bias.
+        out: Optional caller-owned output buffer.
+
+    Returns:
+        ``[M, N]`` output. For 1x32, uses prepared FlashInfer scales when PDL
+        is enabled and no other GEMM is forced; otherwise mm receives canonical
+        scales. Dense inputs retain the reference 1e-4 amax floor and UE8M0
+        rounding on every backend. The 128x128 padding policy is preserved.
     """
+    if plan.block_size == [1, 32]:
+        return _fp8_group32_linear(
+            plan,
+            x,
+            weight,
+            weight_scales,
+            input_scales=input_scales,
+            bias=bias,
+            out_dtype=out_dtype,
+            out=out,
+        )
     m = x.shape[0]
-    if use_flashinfer_fp8_blockscale_prepacked(m):
-        return mm(
+    override = resolve_kernel_override(
+        "gemm", "mm", "flashinfer_mm_fp8_blockscale" if input_scales is None else None
+    )
+    if (
+        input_scales is None
+        and override == "flashinfer_mm_fp8_blockscale"
+        and use_flashinfer_fp8_blockscale_prepacked(m)
+    ):
+        result = mm(
             x,
             weight,
             B_scales=plan.prepared_weight_scales,
@@ -1180,14 +1248,78 @@ def fp8_linear(
             override="flashinfer_mm_fp8_blockscale",
             prepacked_scales=True,
         )
+    else:
+        result = mm(
+            x,
+            weight,
+            A_scales=input_scales,
+            B_scales=weight_scales,
+            out_dtype=out_dtype,
+            quant="mxfp8",
+            block_size=plan.block_size,
+            override=override,
+        )
+    if bias is not None:
+        result = result + bias
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
+def _fp8_group32_linear(
+    plan: _PreparedFp8LinearPlan,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scales: torch.Tensor,
+    *,
+    input_scales: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    if x.shape[0] == 0:
+        return (
+            out
+            if out is not None
+            else x.new_empty((0, weight.shape[0]), dtype=out_dtype)
+        )
+    override = resolve_kernel_override("gemm", "mm", None)
+    # Packed scales must only reach the explicitly selected native kernel.
+    native = (
+        plan.prepared_weight_scales is not None
+        and pdl_enabled()
+        and override in (None, "flashinfer_mm_mxfp8")
+    )
+    if input_scales is None:
+        quantizer = resolve_kernel_override("quantization", "fp8_with_scale", None)
+        if native and quantizer is None and x.stride(-1) == 1:
+            x, input_scales = _quantize_fp8_group32_swizzled(x)
+        else:
+            x, input_scales = quantize_fp8(
+                x,
+                granularity="token_group",
+                group_size=32,
+                scale_encoding="ue8m0",
+                enable_pdl=False,
+                override=(
+                    "gluon_quantize_fp8_group32_ue8m0_gfx950"
+                    if _platform.is_cdna4
+                    else "triton_quantize_fp8_group32_ue8m0"
+                ),
+                solution=None,
+            )
     return mm(
         x,
         weight,
-        B_scales=weight_scales,
+        A_scales=input_scales,
+        B_scales=plan.prepared_weight_scales if native else weight_scales,
         out_dtype=out_dtype,
+        out=out,
+        bias=bias,
         quant="mxfp8",
         block_size=plan.block_size,
-        override="flashinfer_mm_fp8_blockscale",
+        override="flashinfer_mm_mxfp8" if native else override,
     )
 
 
@@ -1207,6 +1339,8 @@ def fp8_linear_prepacked(
     ``flashinfer_fp8_blockscale_quantize_prepacked``; only the first
     ``num_tokens`` rows of the padded result are real.
     """
+    if plan.block_size != [128, 128]:
+        raise ValueError("fp8_linear_prepacked requires a 128x128 plan")
     result = gemm_fp8_nt_groupwise(
         values,
         weight,
@@ -1234,8 +1368,13 @@ def fp8_linear_into(
     out: torch.Tensor,
 ) -> torch.Tensor:
     """``fp8_linear`` writing into a caller-owned destination."""
-    result = fp8_linear(plan, x, weight, weight_scales, out_dtype=out_dtype)
-    if bias is not None:
-        result = result + bias
-    out.copy_(result)
-    return out
+    return fp8_linear(
+        plan,
+        x,
+        weight,
+        weight_scales,
+        input_scales=input_scales,
+        bias=bias,
+        out_dtype=out_dtype,
+        out=out,
+    )

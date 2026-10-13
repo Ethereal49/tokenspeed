@@ -2,9 +2,20 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.gemm import _online_quantize_mxfp8, mm
+from tokenspeed_kernel.ops.gemm import (
+    _online_quantize_mxfp8,
+    fp8_linear,
+    mm,
+    prepare_fp8_linear,
+)
 from tokenspeed_kernel.ops.gemm.flashinfer import swizzle_mxfp8_scale
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.ops.quantization.triton import (
+    _fp8_group32_ue8m0_quantize_swizzled,
+    _quantize_fp8_group32_swizzled,
+)
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.selection import kernel_override
+from utils import assert_no_triton_compile
 
 pytestmark = pytest.mark.skipif(
     not current_platform().is_nvidia,
@@ -264,3 +275,170 @@ def test_swizzle_mxfp8_scale_matches_flashinfer_layout(device: str) -> None:
         _, s_lin = mxfp8_quantize(x, is_sf_swizzled_layout=False)
         _, s_128 = mxfp8_quantize(x, is_sf_swizzled_layout=True)
         assert torch.equal(swizzle_mxfp8_scale(s_lin.view(m, k // 32), m, k), s_128)
+
+
+@requires_flashinfer_mxfp8
+class TestPreparedMxfp8:
+    @pytest.fixture(autouse=True)
+    def enable_pdl(self):
+        previous = pdl_enabled()
+        pdl_enabled(True)
+        try:
+            yield
+        finally:
+            pdl_enabled(previous)
+
+    @pytest.mark.parametrize(
+        "rows,width,strided",
+        [(0, 96, False), (1, 1280, True), (17, 5120, True), (129, 96, False)],
+    )
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    def test_quantization_matches_canonical(self, rows, width, strided, dtype):
+        x = torch.randn(
+            rows, width + (32 if strided else 0), device="cuda", dtype=dtype
+        )[:, :width]
+        if rows:
+            x[0, :32] = -0.0
+            x[0, 32:64] = 1e-7
+            x[0, 64:96] = 448.0 / 64
+        codes, scales = _quantize_fp8_group32_swizzled(x)
+        reference_codes, reference_scales = _online_quantize_mxfp8(
+            x, [1, 32], "ue8m0", enable_pdl=False
+        )
+        torch.testing.assert_close(
+            codes.view(torch.uint8), reference_codes.view(torch.uint8), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            scales,
+            swizzle_mxfp8_scale(reference_scales, rows, width),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_quantization_graph_and_dynamic_rows(self):
+        x = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)[:, :128]
+        _quantize_fp8_group32_swizzled(x[:17])
+        with assert_no_triton_compile(_fp8_group32_ue8m0_quantize_swizzled):
+            for rows in (1, 3, 16, 64):
+                _quantize_fp8_group32_swizzled(x[::2][:rows])
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            codes, scales = _quantize_fp8_group32_swizzled(x[:17])
+        for magnitude in (1.0, 1e-8, 0.0):
+            x.normal_().mul_(magnitude)
+            graph.replay()
+            expected_codes, expected_scales = _online_quantize_mxfp8(
+                x[:17], [1, 32], "ue8m0", enable_pdl=False
+            )
+            torch.testing.assert_close(
+                codes.view(torch.uint8),
+                expected_codes.view(torch.uint8),
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                scales, swizzle_mxfp8_scale(expected_scales, 17, 128), rtol=0, atol=0
+            )
+
+    @pytest.mark.parametrize("rows", [1, 129])
+    def test_linear_reuses_scales_without_repacking(self, monkeypatch, rows):
+        weight = torch.randn(256, 384, device="cuda").to(torch.float8_e4m3fn)
+        scales = torch.randint(120, 126, (256, 12), device="cuda", dtype=torch.uint8)
+        plan = prepare_fp8_linear(weight, scales, [1, 32])
+        x = torch.randn(rows, 384, device="cuda", dtype=torch.bfloat16)
+        bias = torch.randn(256, device="cuda", dtype=x.dtype)
+        codes, input_scales = _online_quantize_mxfp8(
+            x, [1, 32], "ue8m0", enable_pdl=False
+        )
+        expected = mm(
+            codes,
+            weight,
+            A_scales=input_scales,
+            B_scales=scales,
+            bias=bias,
+            out_dtype=x.dtype,
+            quant="mxfp8",
+            block_size=[1, 32],
+            override="flashinfer_mm_mxfp8",
+        )
+
+        def unexpected_repack(*args, **kwargs):
+            pytest.fail("prepared linear repacked scales during forward")
+
+        monkeypatch.setattr(
+            "tokenspeed_kernel.ops.gemm.flashinfer.swizzle_mxfp8_scale",
+            unexpected_repack,
+        )
+        actual = fp8_linear(plan, x, weight, scales, bias=bias, out_dtype=x.dtype)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    @pytest.mark.parametrize(
+        "backend", [None, "triton_mm_fp8_blockscale", "torch_mm_fp8_blockscale"]
+    )
+    def test_linear_canonical_fallback(self, backend):
+        weight = torch.randn(256, 128, device="cuda").to(torch.float8_e4m3fn)
+        scales = torch.full((256, 4), 123, device="cuda", dtype=torch.uint8)
+        plan = prepare_fp8_linear(weight, scales, [1, 32])
+        x = torch.randn(3, 128, device="cuda", dtype=torch.bfloat16)
+        x[0, :32] = 1e-7
+        if backend is None:
+            pdl_enabled(False)
+        # A fallback must use canonical scales even when the native cache is stale.
+        plan.prepared_weight_scales.zero_()
+        with kernel_override("gemm", "mm", backend):
+            codes, input_scales = _online_quantize_mxfp8(
+                x, [1, 32], "ue8m0", enable_pdl=False
+            )
+            expected = mm(
+                codes,
+                weight,
+                A_scales=input_scales,
+                B_scales=scales,
+                out_dtype=x.dtype,
+                quant="mxfp8",
+                block_size=[1, 32],
+            )
+            actual = fp8_linear(plan, x, weight, scales, out_dtype=x.dtype)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_linear_respects_quantizer_override(self, monkeypatch):
+        weight = torch.randn(256, 128, device="cuda").to(torch.float8_e4m3fn)
+        scales = torch.full((256, 4), 123, device="cuda", dtype=torch.uint8)
+        plan = prepare_fp8_linear(weight, scales, [1, 32])
+        x = torch.randn(3, 128, device="cuda", dtype=torch.bfloat16)
+        expected = fp8_linear(plan, x, weight, scales, out_dtype=x.dtype)
+
+        def unexpected_fused_quantizer(*args):
+            pytest.fail("linear ignored the canonical quantizer override")
+
+        monkeypatch.setattr(
+            "tokenspeed_kernel.ops.gemm._quantize_fp8_group32_swizzled",
+            unexpected_fused_quantizer,
+        )
+        with kernel_override(
+            "quantization", "fp8_with_scale", "triton_quantize_fp8_group32_ue8m0"
+        ):
+            actual = fp8_linear(plan, x, weight, scales, out_dtype=x.dtype)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("n,k", [(64, 128), (256, 96)])
+    def test_linear_without_native_cache(self, n, k):
+        weight = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn)
+        scales = torch.full((n, k // 32), 123, device="cuda", dtype=torch.uint8)
+        plan = prepare_fp8_linear(weight, scales, [1, 32])
+        assert plan.prepared_weight_scales is None
+        x = torch.randn(3, k, device="cuda", dtype=torch.bfloat16)
+        codes, input_scales = _online_quantize_mxfp8(
+            x, [1, 32], "ue8m0", enable_pdl=False
+        )
+        expected = mm(
+            codes,
+            weight,
+            A_scales=input_scales,
+            B_scales=scales,
+            out_dtype=x.dtype,
+            quant="mxfp8",
+            block_size=[1, 32],
+        )
+        actual = fp8_linear(plan, x, weight, scales, out_dtype=x.dtype)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
