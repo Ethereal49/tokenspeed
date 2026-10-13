@@ -12,6 +12,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
+
 from tokenspeed.runtime.cache.hicache import HiCacheEngine
 from tokenspeed.runtime.cache.l3.backend import resolve_l3_weight_version
 from tokenspeed.runtime.cache.transfer.host_buffer import HostBufferView
@@ -79,6 +81,7 @@ def test_device_handle_only_runs_device_copy_work_and_returns_host_metadata():
         forward_thread=thread,
         execution_stream="execution",
         default_stream="default",
+        copy_cache_pages=lambda pairs: trace.append(("copy", pairs)),
         zero_cache_pages=lambda pages: trace.append("zero"),
     )
     completion = HostWriteBackCompletion((4,), ((0, 1, "hash", 0),))
@@ -94,11 +97,24 @@ def test_device_handle_only_runs_device_copy_work_and_returns_host_metadata():
     handle = scope["DeviceHandle"](executor, host_cache_executor=host, kv_transfer=None)
     handle.execute(
         SimpleNamespace(
-            cache=[object()], pages_to_zero=[1], remote_decode=None, remote_prefill=None
+            cache=[object()],
+            pages_to_copy_arrays=lambda: {"history": [(1, 2)], "state": []},
+            pages_to_zero={"history": [1]},
+            remote_decode=None,
+            remote_prefill=None,
         ),
         None,
     )
-    assert trace == ["submit", "write", "submit", "zero", "submit", "load"]
+    assert trace == [
+        "submit",
+        "write",
+        "submit",
+        ("copy", {"history": [(1, 2)]}),
+        "submit",
+        "zero",
+        "submit",
+        "load",
+    ]
     host.submit_prefetches.assert_not_called()
     assert handle.poll_cache_results() == [completion]
     assert handle.shutdown_cache() == [completion]
@@ -202,7 +218,10 @@ def test_host_export_keeps_bytes_and_geometry_without_retaining_device_layout():
     assert view.host_block_range(1, 2) == (24, 24)
 
 
-def test_failed_device_submission_delivers_final_host_writes_before_raising():
+@pytest.mark.parametrize("submission_kind", ["host", "copy", "transfer"])
+def test_failed_device_submission_delivers_final_host_writes_before_raising(
+    submission_kind,
+):
     scope = definitions(
         ROOT / "python/tokenspeed/runtime/execution/device.py",
         {"DeviceRole", "_settle", "_resolve_role", "DeviceHandle"},
@@ -216,7 +235,12 @@ def test_failed_device_submission_delivers_final_host_writes_before_raising():
     )
     failed = Future()
     failed.set_exception(ValueError("copy submission failed"))
-    handle._l2_submissions.append(failed)
+    queues = {
+        "host": handle._l2_submissions,
+        "copy": handle._copy_submissions,
+        "transfer": handle._transfer_submissions,
+    }
+    queues[submission_kind].append(failed)
     # Execute the real EventLoop.close body against low-frequency collaborator
     # doubles, so its finally ordering is checked even when Device shutdown raises.
     path = ROOT / "python/tokenspeed/runtime/engine/event_loop.py"
@@ -246,3 +270,29 @@ def test_failed_device_submission_delivers_final_host_writes_before_raising():
         assert isinstance(exc.__cause__, ValueError)
         assert exc.final_copy_results == (completed,)
     cache.shutdown.assert_called_once_with((completed,))
+    assert not handle._l2_submissions
+    assert not handle._copy_submissions
+    assert not handle._transfer_submissions
+
+
+def test_shutdown_without_host_cache_surfaces_copy_failure_and_joins_transfers():
+    scope = definitions(
+        ROOT / "python/tokenspeed/runtime/execution/device.py",
+        {"DeviceRole", "_settle", "_resolve_role", "DeviceHandle"},
+        {"enum": enum, "deque": deque, "CacheShutdownFailure": CacheShutdownFailure},
+    )
+    handle = scope["DeviceHandle"](
+        SimpleNamespace(forward_thread=ImmediateThread([])),
+        host_cache_executor=None,
+        kv_transfer=None,
+    )
+    failed = Future()
+    failed.set_exception(IndexError("invalid copy destination"))
+    handle._copy_submissions.append(failed)
+    transfer = Mock()
+    handle._transfer_submissions.append(transfer)
+    with pytest.raises(IndexError, match="invalid copy destination"):
+        handle.shutdown_cache()
+    transfer.result.assert_called_once_with()
+    assert not handle._copy_submissions
+    assert not handle._transfer_submissions
