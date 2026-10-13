@@ -58,6 +58,7 @@ def _profile(**overrides) -> ModelProfile:
         default_attention_backend="mla",
         default_prefix_granularity=64,
         request_token_history=True,
+        is_multimodal=False,
         tokenizer_kwargs={"fix_mistral_regex": True},
         attention_instances_per_layer=1,
         numerics_envelopes=frozenset({"auto"}),
@@ -644,6 +645,7 @@ def test_attention_instances_per_layer_has_no_fallback() -> None:
         default_attention_backend=None,
         default_prefix_granularity=None,
         request_token_history=False,
+        is_multimodal=False,
         tokenizer_kwargs={},
     )
     with pytest.raises(TypeError, match="attention_instances_per_layer"):
@@ -714,7 +716,7 @@ def test_plugin_algorithm_without_a_draft_checkpoint_is_refused() -> None:
         drafter._PLUGIN_DRAFTERS.pop("FIXTURE_SPEC", None)
 
 
-def test_hybrid_dcp_accepts_builtin_groups_and_requires_history() -> None:
+def test_hybrid_kvp_accepts_builtin_groups_and_requires_history() -> None:
     from dataclasses import replace
     from test.runtime.conftest import kimi_recipe
 
@@ -723,24 +725,24 @@ def test_hybrid_dcp_accepts_builtin_groups_and_requires_history() -> None:
     recipe.attn_config = replace(
         config,
         device="cuda",
-        dcp_size=8,
-        dcp_group=tuple(range(8)),
+        kvp_size=8,
+        kvp_group=tuple(range(8)),
         components=(
             replace(config.components[0], backend_name="flashmla"),
             *config.components[1:],
         ),
     )
     groups = tuple(group for group, _ in recipe.groups())
-    attention_registry._validate_hybrid_dcp_cache(
+    attention_registry._validate_hybrid_kvp_cache(
         SimpleNamespace(cache_group_specs=groups),
-        dcp_size=8,
+        kvp_size=8,
     )
     with pytest.raises(ValueError, match="full-history cache group"):
-        attention_registry._validate_hybrid_dcp_cache(
+        attention_registry._validate_hybrid_kvp_cache(
             SimpleNamespace(
                 cache_group_specs=tuple(g for g in groups if g.family == "state")
             ),
-            dcp_size=8,
+            kvp_size=8,
         )
 
     window_only = tuple(
@@ -752,9 +754,9 @@ def test_hybrid_dcp_accepts_builtin_groups_and_requires_history() -> None:
         for g in groups
     )
     with pytest.raises(ValueError, match="full-history cache group"):
-        attention_registry._validate_hybrid_dcp_cache(
+        attention_registry._validate_hybrid_kvp_cache(
             SimpleNamespace(cache_group_specs=window_only),
-            dcp_size=8,
+            kvp_size=8,
         )
 
     history = next(g for g in groups if g.family == "history")
@@ -767,9 +769,9 @@ def test_hybrid_dcp_accepts_builtin_groups_and_requires_history() -> None:
             shard_count=shard_count,
         )
         with pytest.raises(ValueError, match="must use full-history retention"):
-            attention_registry._validate_hybrid_dcp_cache(
+            attention_registry._validate_hybrid_kvp_cache(
                 SimpleNamespace(cache_group_specs=(*groups, window)),
-                dcp_size=8,
+                kvp_size=8,
             )
 
 

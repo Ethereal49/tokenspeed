@@ -38,7 +38,7 @@ def flashinfer_prims_qsa_sparse_attention(
     selected_slots: torch.Tensor,
     *,
     scale: float,
-    max_seqlen_q: int,
+    max_seqlen_q: int | None,
     metadata_capacity_rows: int | None,
     k_scale: float | torch.Tensor | None,
     v_scale: float | torch.Tensor | None,
@@ -52,8 +52,8 @@ def flashinfer_prims_qsa_sparse_attention(
         v_cache: Flattened BF16 values with the same geometry as the keys.
         selected_slots: Equivalent physical candidates used by fallback kernels.
         scale: QK softmax scale.
-        max_seqlen_q: Facade-normalized query width; logical metadata describes
-            the actual ragged query lengths.
+        max_seqlen_q: ``None`` for prefill; logical metadata describes the
+            actual ragged query lengths.
         metadata_capacity_rows: Fallback reservation; PrimTS sizes its shared
             workspace from the logical metadata's actual geometry.
         k_scale: Optional Python scalar key descale.

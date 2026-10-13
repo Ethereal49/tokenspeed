@@ -90,74 +90,28 @@ LSE_LN = math.log2(math.e)
 # ===-----------------------------------------------------------------------===#
 
 
-def qsa_sparse_attention(
+def select_qsa_sparse_attention_kernel(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     selected_slots: torch.Tensor,
     *,
-    scale: float,
     max_seqlen_q: int | None,
-    metadata_capacity_rows: int | None,
     k_scale: float | torch.Tensor | None,
     v_scale: float | torch.Tensor | None,
+    prefill_metadata: QSAPrefillMetadata | None,
     override: str | None,
     solution: str | None,
-    prefill_metadata: QSAPrefillMetadata | None = None,
-) -> torch.Tensor:
-    """Attend to a per-query list of physical QSA KV-cache slots.
+):
+    """Select the ``qsa_sparse_attention`` kernel for validated inputs.
 
-    Args:
-        q: Query tensor shaped ``[tokens, query_heads, head_dim]``.
-        k_cache: Flattened key cache shaped
-            ``[cache_slots, kv_heads, head_dim]``.
-        v_cache: Flattened value cache shaped
-            ``[cache_slots, kv_heads, value_head_dim]``.
-        selected_slots: Physical cache slots shaped ``[tokens, budget]``;
-            non-positive values are ignored.
-        scale: Softmax scale applied to query-key scores.
-        max_seqlen_q: Uniform query tokens per request for decode: 1 for
-            normal decode and ``spec_num_tokens`` for compact speculative
-            decode. Pass None for prefill or mixed/ragged queries, including
-            a prefill containing only one token.
-        metadata_capacity_rows: Row capacity reserved by stateful fallback
-            implementations. Pass ``None`` to use the actual query-row count;
-            workspace-free kernels ignore it.
-        k_scale: Optional scalar FP8 key descale.
-        v_scale: Optional scalar FP8 value descale.
-        override: Optional registered kernel name or solution override.
-        solution: Optional kernel solution selected through normal capability
-            and shape filtering.
-        prefill_metadata: Optional logical representation of the same slots,
-            enabling grouped prefill kernels. Without it, direct-slot kernels
-            remain available. Unsupported geometries use the physical slots.
+    Arguments follow ``qsa_sparse_attention``; ``q`` must have at least one row.
 
     Returns:
-        Attention output shaped
-        ``[tokens, query_heads, value_head_dim]`` with the query dtype.
-
-    The SM100/SM103 CuTe DSL implementation is preferred when its specialization
-    matches a uniform decode. On Blackwell, BF16 prefill with logical metadata
-    prefers FlashInfer PrimTS QSA. Other supported inputs retain FlashInfer
-    FA2. Selection preserves prefill versus decode before adapting ragged
-    inputs to independent one-token query rows.
+        The selected kernel.
     """
 
-    if q.ndim != 3 or k_cache.ndim != 3 or v_cache.ndim != 3:
-        raise ValueError("QSA sparse attention expects rank-three Q/K/V tensors")
-    if selected_slots.ndim != 2 or selected_slots.shape[0] != q.shape[0]:
-        raise ValueError("QSA selected slots must have one row per query token")
     query_width = 1 if max_seqlen_q is None else max_seqlen_q
-    if query_width < 1:
-        raise ValueError("QSA max_seqlen_q must be positive")
-    if q.shape[0] % query_width:
-        raise ValueError("QSA query rows must be divisible by max_seqlen_q")
-    if prefill_metadata is not None:
-        if max_seqlen_q is not None:
-            raise ValueError("QSA prefill metadata cannot be used with uniform decode")
-        prefill_metadata.validate(q.shape[0], selected_slots.shape[1])
-    if q.shape[0] == 0:
-        return q.new_empty((0, q.shape[1], v_cache.shape[-1]))
     traits = {
         "batch_size": q.shape[0] // query_width,
         "q_len": query_width,
@@ -185,7 +139,7 @@ def qsa_sparse_attention(
         and not isinstance(v_scale, torch.Tensor),
     }
     signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
-    kernel = select_kernel(
+    return select_kernel(
         "attention",
         "qsa_sparse_attention",
         signature,
@@ -193,9 +147,97 @@ def qsa_sparse_attention(
         solution=solution,
         override=override,
     )
+
+
+def qsa_sparse_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    selected_slots: torch.Tensor,
+    *,
+    scale: float,
+    max_seqlen_q: int | None,
+    metadata_capacity_rows: int | None,
+    k_scale: float | torch.Tensor | None,
+    v_scale: float | torch.Tensor | None,
+    override: str | None,
+    solution: str | None,
+    prefill_metadata: QSAPrefillMetadata | None,
+) -> torch.Tensor:
+    """Attend to a per-query list of physical QSA KV-cache slots.
+
+    Args:
+        q: Query tensor shaped ``[tokens, query_heads, head_dim]``.
+        k_cache: Flattened key cache shaped
+            ``[cache_slots, kv_heads, head_dim]``. Slot 1 must contain finite
+            values for masked reads; slot 0 may contain NaN/Inf.
+        v_cache: Flattened value cache shaped
+            ``[cache_slots, kv_heads, value_head_dim]`` with the same slot 1
+            requirement. Both caches must have at least two slots.
+        selected_slots: Physical cache slots shaped ``[tokens, budget]``;
+            non-positive values are ignored.
+        scale: Softmax scale applied to query-key scores.
+        max_seqlen_q: Uniform query tokens per request for decode: 1 for
+            normal decode and ``spec_num_tokens`` for compact speculative
+            decode. Pass None for prefill or mixed/ragged queries, including
+            a prefill containing only one token.
+        metadata_capacity_rows: Row capacity reserved by stateful fallback
+            implementations. Pass ``None`` to use the actual query-row count;
+            workspace-free kernels ignore it.
+        k_scale: Optional scalar FP8 key descale.
+        v_scale: Optional scalar FP8 value descale.
+        override: Optional registered kernel name or solution override.
+        solution: Optional kernel solution selected through normal capability
+            and shape filtering.
+        prefill_metadata: Logical representation of the same slots, enabling
+            grouped prefill kernels. Pass ``None`` explicitly for direct-slot
+            kernels. Unsupported geometries use the physical slots.
+
+    Returns:
+        Attention output shaped
+        ``[tokens, query_heads, value_head_dim]`` with the query dtype.
+
+    The SM100/SM103 CuTe DSL implementation is preferred when its specialization
+    matches a uniform decode. On Blackwell, BF16 prefill with logical metadata
+    prefers FlashInfer PrimTS QSA. Other supported NVIDIA inputs retain FA2.
+    AMD GPUs use the portable Triton kernel. Selection preserves prefill versus
+    decode before adapting ragged inputs to independent one-token query rows.
+    """
+
+    if q.ndim != 3 or k_cache.ndim != 3 or v_cache.ndim != 3:
+        raise ValueError("QSA sparse attention expects rank-three Q/K/V tensors")
+    if selected_slots.ndim != 2 or selected_slots.shape[0] != q.shape[0]:
+        raise ValueError("QSA selected slots must have one row per query token")
+    query_width = 1 if max_seqlen_q is None else max_seqlen_q
+    if query_width < 1:
+        raise ValueError("QSA max_seqlen_q must be positive")
+    if q.shape[0] % query_width:
+        raise ValueError("QSA query rows must be divisible by max_seqlen_q")
+    if prefill_metadata is not None:
+        if max_seqlen_q is not None:
+            raise ValueError("QSA prefill metadata cannot be used with uniform decode")
+        prefill_metadata.validate(q.shape[0], selected_slots.shape[1])
+    if q.shape[0] == 0:
+        return q.new_empty((0, q.shape[1], v_cache.shape[-1]))
+    if k_cache.shape[0] < 2 or v_cache.shape[0] < 2:
+        raise ValueError("QSA caches must include slot 1 for masked reads")
+    kernel = select_qsa_sparse_attention_kernel(
+        q,
+        k_cache,
+        v_cache,
+        selected_slots,
+        max_seqlen_q=max_seqlen_q,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        prefill_metadata=prefill_metadata,
+        override=override,
+        solution=solution,
+    )
     metadata_kwargs = {}
     if "qsa_prefill_metadata" in KernelRegistry.get().get_by_name(kernel.name).features:
         metadata_kwargs["prefill_metadata"] = prefill_metadata
+        # Grouped prefill reads ragged lengths from its logical metadata.
+        query_width = max_seqlen_q
     return kernel(
         q,
         k_cache,

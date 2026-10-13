@@ -101,6 +101,10 @@ class CacheTransferContract:
     def __post_init__(self) -> None:
         self.transfer_schema.validate(self.plan)
 
+    def shard_count(self, group_id: str) -> int:
+        """Return the cache group's cyclic owner count; one means replicated."""
+        return self.group_spec(group_id).shard_count
+
     def fields_for_group(self, group_id: str) -> tuple[CacheFieldLayout, ...]:
         return tuple(
             sorted(
@@ -310,7 +314,7 @@ class CachePDBlockManifest:
     """One request's transferable blocks per group, in logical slot order.
 
     Block IDs are the publishing side's scheduler IDs -- virtual IDs for a
-    DCP-sharded group. The sender translates its own IDs to local pages when
+    KVP-sharded group. The sender translates its own IDs to local pages when
     it copies; the destination's IDs are addressed as the destination's
     contract says.
     """
@@ -394,9 +398,10 @@ def validate_cache_peer_layout(
     for local_spec, peer_spec in zip(
         layout.group_specs, peer_layout.group_specs, strict=True
     ):
-        # shard_count is deliberately not compared: a DCP-sharded Prefill
-        # transfers into an unsharded Decode. Which rank sets exchange which
-        # pages is the transfer planner's decision, not a contract mismatch.
+        # shard_count is deliberately not compared: Prefill and Decode shard
+        # a group independently (either, both or neither). Which rank sets
+        # exchange which pages is the transfer planner's decision, not a
+        # contract mismatch.
         if (
             local_spec.family != peer_spec.family
             or local_spec.rows_per_page != peer_spec.rows_per_page

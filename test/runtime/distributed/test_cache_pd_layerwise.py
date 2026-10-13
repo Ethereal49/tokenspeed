@@ -530,6 +530,7 @@ def test_heterogeneous_zero_edge_interval_does_not_fall_back_to_identity() -> No
     def blocks(begin, end):
         return list(
             manager._cache_transfer_blocks(
+                dst_tp_rank=0,
                 dst_ptr=0x20000,
                 src_block_manifest=None,
                 dst_block_manifest=destination_block_manifest,
@@ -569,6 +570,7 @@ def _layerwise_fanout_context():
     manager.decode_kv_args_table = {
         request.mooncake_session_id: SimpleNamespace(
             dst_kv_ptr=0x20000 + rank * 0x1000,
+            decode_tp_rank=rank,
             endpoint=f"decode-{rank}",
             dst_port=9000 + rank,
             peer_cache_layout=layout,
@@ -708,7 +710,7 @@ def test_dsa_sparse_prefill_publishes_one_cache_step_after_cache_use(
     events = []
     backend = object.__new__(dsa_backend.DSABackend)
     backend.index_topk = 2
-    backend.dcp_group = (0,)
+    backend.kvp_group = (0,)
     backend.v_head_dim = 1
     backend.data_type = torch.bfloat16
     backend.qk_nope_head_dim = 1

@@ -61,7 +61,10 @@ class _PrimTSQSARunner:
     """Bounded plans sharing one high-water workspace on one CUDA stream.
 
     Plans retain cache views and route offsets, but no request-owned history.
-    The public wrapper refreshes candidate unions and membership on every run.
+    Packed queries supply their offsets separately. With split_kv=False,
+    every live route is rewritten before attention reads it; split scratch
+    and attention sinks are unused. Runs do not depend on previous workspace
+    contents.
     """
 
     def __init__(self, device: torch.device) -> None:
@@ -109,6 +112,8 @@ class _PrimTSQSARunner:
             _tensor_layout(q),
             _tensor_layout(k),
             _tensor_layout(v),
+            # PrimTS binds K/V storage in its prepared attention plan. Separate
+            # warmed wrappers let each layer capture without rebinding inputs.
             k.data_ptr(),
             v.data_ptr(),
             _tensor_layout(metadata.block_table),
@@ -151,7 +156,9 @@ class _PrimTSQSARunner:
                     size, dtype=torch.uint8, device=self._device
                 )
             else:
-                # Workspace section offsets can change with the launch geometry.
+                # Initialize the new geometry's sections. Cached nonsplit
+                # plans remain safe: run rewrites every workspace value read
+                # by attention, including on replay after another geometry.
                 self._workspace.zero_()
             wrapper = QTokenKvBlockSparsePagedTSWrapper()
             wrapper.plan(
