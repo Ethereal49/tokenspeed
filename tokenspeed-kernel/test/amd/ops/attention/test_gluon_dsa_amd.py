@@ -1301,6 +1301,10 @@ def test_dsa_with_sparse_kvcache(mode: str, api, q_dtype: torch.dtype) -> None:
         pytest.param(torch.float8_e5m2, torch.float8_e5m2, id="e5m2"),
         pytest.param(torch.bfloat16, torch.float8_e4m3fn, id="bf16-q-e4m3-kv"),
         pytest.param(torch.float8_e4m3fn, torch.bfloat16, id="e4m3-q-bf16-kv"),
+        pytest.param(torch.bfloat16, torch.float8_e5m2, id="bf16-q-e5m2-kv"),
+        pytest.param(torch.float8_e5m2, torch.bfloat16, id="e5m2-q-bf16-kv"),
+        pytest.param(torch.float8_e4m3fn, torch.float8_e5m2, id="e4m3-q-e5m2-kv"),
+        pytest.param(torch.float8_e5m2, torch.float8_e4m3fn, id="e5m2-q-e4m3-kv"),
     ],
 )
 @pytest.mark.parametrize(
