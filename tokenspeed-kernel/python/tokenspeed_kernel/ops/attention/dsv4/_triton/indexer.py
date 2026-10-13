@@ -235,7 +235,7 @@ def _select_topk(
     base_rows: torch.Tensor | None,
 ) -> torch.Tensor:
     """Return top-k offsets with optional bases, -1 padding, and output reuse."""
-    selected = triton_topk_from_logits(logits, topk, enable_pdl=False)
+    selected = triton_topk_from_logits(logits, topk, seq_lens=None, enable_pdl=False)
     if base_rows is not None:
         selected = torch.where(selected >= 0, selected + base_rows[:, None], -1).to(
             torch.int32

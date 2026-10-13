@@ -133,6 +133,7 @@ def _check_replays(forward, sources, targets, enabled):
         ("stream", 1024, 64),
         ("stream", 16384, 512),
         ("logits", 1024, 64),
+        ("logits", 32768, 512),
     ],
 )
 def test_qsa_selection_waits_for_query_cache_and_metadata(

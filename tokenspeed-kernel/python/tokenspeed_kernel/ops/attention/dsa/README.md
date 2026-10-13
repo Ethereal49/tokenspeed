@@ -24,6 +24,23 @@ the online softmax; unused entries remain `-1`.
 Portable Triton implementations remain the fallback for trait combinations
 without a matching native registration.
 
+## Materialized Triton row top-k
+
+`triton_topk_from_logits(logits, topk, seq_lens=..., enable_pdl=...)` selects
+FP32 rows with descending scores and smaller column ids first on ties.
+`seq_lens` is an int32 or int64 vector on the scores' device, clamped per row
+to `[0, width]`; explicit `None` selects the full row. Scores and lengths may
+be strided. Invalid scores inside the visible prefix still use `-inf` and
+produce `-1` output padding. Entries beyond the prefix are never read and may
+be uninitialized.
+
+The sorting and radix implementations both bound input reads by these device
+lengths. Radix histogram reduction excludes unwritten tiles and selects at
+most `min(topk, seq_lens[row])` entries, including empty and short rows.
+CUDA Graph replay may change the lengths without changing allocation or launch
+capacity. QSA passes its complete compressed-block counts to both CUDA and
+Triton selection, so its scorer writes only valid prefixes.
+
 ## Index-K plane formats
 
 `dsa_prefill_topk` and `dsa_decode_topk` read the storage of the index-key

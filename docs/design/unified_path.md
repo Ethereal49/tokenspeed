@@ -336,9 +336,17 @@ page mapping. Mixed batches with device-only decode lengths, and persistent
 decode views, retain the capacity bound; decode graph shapes stay fixed.
 Uniform query runs may share a K tile, but groups must never cross requests.
 A single-request forward is uniform regardless of its forward mode. Long runs
-use larger query groups; ragged layouts retain independent rows. A score tile
-beyond all of its queries' complete-block frontiers must write `-inf` without
-reading K or executing its dot, including padded graph requests.
+use larger query groups; ragged layouts retain independent rows. Scoring writes
+only each query's complete-block prefix. Both CUDA persistent and portable
+Triton top-k read that per-row frontier on the device, so the score tail may
+remain uninitialized even when the frontier shrinks during graph replay.
+A bounded set of scoring CTAs walks tiles at the grid stride, stopping at each
+query group's current device frontier and reusing Q across its tiles. CTAs
+beyond that frontier skip Q/K reads, the dot and score stores, including for
+padded graph requests. Allocated score width retains its capacity bound; the
+grid depends on SM count, query-group count and capacity, never live lengths.
+Longer frontiers need more device-loop iterations, not a new graph or a
+device-to-host read.
 
 ### `for_graph_replay` is for graph-mechanics asymmetries only
 

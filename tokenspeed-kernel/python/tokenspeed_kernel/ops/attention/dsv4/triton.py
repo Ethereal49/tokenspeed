@@ -4260,7 +4260,7 @@ def triton_dsv4_index_candidates(
         cu_seq_lens=None,
         starts=None,
     )
-    offsets = triton_topk_from_logits(logits, topk)
+    offsets = triton_topk_from_logits(logits, topk, seq_lens=None, enable_pdl=False)
     scores = logits.gather(1, offsets.clamp_min(0).long())
     valid = (offsets >= 0) & (scores > -float("inf"))
     return torch.where(valid, offsets, -1), torch.where(valid, scores, -float("inf"))

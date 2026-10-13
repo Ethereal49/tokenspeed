@@ -39,6 +39,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 _is_nvidia = current_platform().is_nvidia
 _PERSISTENT_TOPK_WORKSPACE_BYTES = 1024 * 1024
+_SCORE_CTAS_PER_SM = 12
 LOG2E = math.log2(math.e)
 
 
@@ -1612,7 +1613,7 @@ def _qwen4_exp_qsa_merge_chunk_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_blocks", "stride_pt_b", "stride_l_n"])
 def _qwen4_exp_qsa_score_blocks_kernel(
     query,
     key_cache,
@@ -1648,11 +1649,9 @@ def _qwen4_exp_qsa_score_blocks_kernel(
     request = tl.load(request_indices + row).to(tl.int64)
     query_offsets = tl.arange(0, QUERY_GROUP_SIZE)
     complete = tl.load(complete_blocks + row + query_offsets).to(tl.int64)
-    max_complete = tl.max(complete, axis=0)
-    block_ids = tile * BLOCK_N + tl.arange(0, BLOCK_N)
-    tile_mask = block_ids < num_blocks
-    # A masked load alone still executes the dot on zero keys. Skip all
-    # producers and tensor-core work for tiles beyond every query frontier.
+    max_complete = tl.minimum(tl.max(complete, axis=0), num_blocks)
+    # The grid stays bounded during graph replay. Each CTA walks only its
+    # valid tiles, reusing Q when a request outgrows the launch width.
     if tile * BLOCK_N < max_complete:
         head_offsets = tl.arange(0, BLOCK_H * QUERY_GROUP_SIZE)
         dim_offsets = tl.arange(0, BLOCK_D)
@@ -1666,38 +1665,40 @@ def _qwen4_exp_qsa_score_blocks_kernel(
             mask=head_mask[:, None] & dim_mask[None, :],
             other=0.0,
         )
-        columns = block_ids // page_size
-        offsets = block_ids % page_size
-        pages = tl.load(
-            page_table + request * stride_pt_b + columns,
-            mask=tile_mask,
-            other=0,
-        ).to(tl.int64)
-        slots = pages * page_size + offsets
-        valid = tile_mask & (block_ids < max_complete)
-        keys = tl.load(
-            key_cache + slots[None, :] * stride_k_n + dim_offsets[:, None] * stride_k_d,
-            mask=valid[None, :] & dim_mask[:, None],
-            other=0.0,
-        )
-        scores = tl.dot(q, keys, out_dtype=tl.float32)
-        scores = tl.maximum(scores, 0.0)
-        scores = tl.sum(
-            tl.reshape(
-                tl.where(head_mask[:, None], scores, 0.0),
-                (QUERY_GROUP_SIZE, BLOCK_H, BLOCK_N),
-            ),
-            axis=1,
-        )
-    else:
-        scores = tl.full((QUERY_GROUP_SIZE, BLOCK_N), -float("inf"), tl.float32)
-    # Invalid blocks become -inf so the downstream selection drops them.
-    scores = tl.where(block_ids[None, :] < complete[:, None], scores, -float("inf"))
-    tl.store(
-        logits + (row + query_offsets[:, None]) * stride_l_n + block_ids[None, :],
-        scores,
-        mask=tile_mask[None, :],
-    )
+        for start in range(tile * BLOCK_N, max_complete, tl.num_programs(1) * BLOCK_N):
+            block_ids = start + tl.arange(0, BLOCK_N)
+            valid = block_ids < max_complete
+            columns = block_ids // page_size
+            offsets = block_ids % page_size
+            pages = tl.load(
+                page_table + request * stride_pt_b + columns,
+                mask=valid,
+                other=0,
+            ).to(tl.int64)
+            slots = pages * page_size + offsets
+            keys = tl.load(
+                key_cache
+                + slots[None, :] * stride_k_n
+                + dim_offsets[:, None] * stride_k_d,
+                mask=valid[None, :] & dim_mask[:, None],
+                other=0.0,
+            )
+            scores = tl.dot(q, keys, out_dtype=tl.float32)
+            scores = tl.maximum(scores, 0.0)
+            scores = tl.sum(
+                tl.reshape(
+                    tl.where(head_mask[:, None], scores, 0.0),
+                    (QUERY_GROUP_SIZE, BLOCK_H, BLOCK_N),
+                ),
+                axis=1,
+            )
+            tl.store(
+                logits
+                + (row + query_offsets[:, None]) * stride_l_n
+                + block_ids[None, :],
+                scores,
+                mask=valid[None, :] & (block_ids[None, :] < complete[:, None]),
+            )
 
 
 def _qwen4_exp_qsa_block_topk_stream(
@@ -1854,15 +1855,15 @@ def _qwen4_exp_qsa_block_topk_logits(
     persistent_topk_workspace: torch.Tensor | None,
     enable_pdl: bool,
 ) -> torch.Tensor:
-    """Materialized path: score every block to FP32, then radix-select.
+    """Materialized path: score valid blocks to FP32, then radix-select.
 
-    Writes the ``[rows, num_blocks]`` score matrix (blocks at or beyond
-    ``complete_blocks`` are ``-inf``). On NVIDIA, a valid caller-owned
-    workspace routes selection through the length-aware persistent CUDA radix
-    kernel; ``complete_blocks`` prevents the selector from rescanning
-    graph-padded columns. Other platforms and direct callers without a
-    workspace retain the portable Triton top-k fallback. Callers bound the
-    score matrix via the routing heuristic in ``qwen4_exp_qsa_block_topk``.
+    Writes only the valid prefix of each ``[rows, num_blocks]`` score row;
+    blocks at or beyond ``complete_blocks`` remain uninitialized. On NVIDIA,
+    a valid caller-owned workspace selects the length-aware persistent CUDA
+    radix kernel. Other platforms and direct callers without a workspace use
+    portable Triton top-k. Both selectors bound reads by ``complete_blocks``.
+    Callers bound the score matrix via the routing heuristic in
+    ``qwen4_exp_qsa_block_topk``.
     """
 
     rows = query.shape[0]
@@ -1882,9 +1883,17 @@ def _qwen4_exp_qsa_block_topk_logits(
     # The old 512-block tile used 129 KiB shared memory for 4x128 BF16 heads,
     # limiting a B300 SM to one CTA. 128 blocks leave room for concurrent CTAs.
     block_n = 128
-    _qwen4_exp_qsa_score_blocks_kernel[
-        (rows // query_group_size, triton.cdiv(num_blocks, block_n))
-    ](
+    query_groups = rows // query_group_size
+    # Cap scheduling overhead independently of context capacity. The device
+    # loop covers longer frontiers without changing a captured graph's grid.
+    # Twelve CTAs/SM give about 2-3 waves for grouped 4x128 BF16 decode on
+    # Blackwell, where the scoring kernel can keep five CTAs resident per SM.
+    target_programs = _SCORE_CTAS_PER_SM * current_platform().sm_count
+    tile_programs = min(
+        triton.cdiv(num_blocks, block_n),
+        max(1, triton.cdiv(target_programs, query_groups)),
+    )
+    _qwen4_exp_qsa_score_blocks_kernel[(query_groups, tile_programs)](
         query,
         key_cache,
         page_table,
@@ -1933,7 +1942,9 @@ def _qwen4_exp_qsa_block_topk_logits(
             max_seq_len=num_blocks,
         )
         return selected
-    return triton_topk_from_logits(logits, block_topk, enable_pdl=use_pdl)
+    return triton_topk_from_logits(
+        logits, block_topk, seq_lens=complete_blocks, enable_pdl=use_pdl
+    )
 
 
 def qwen4_exp_qsa_block_topk(
