@@ -34,14 +34,8 @@ import statistics
 import torch
 from tokenspeed_kernel._triton import triton
 from tokenspeed_kernel.ops.attention.dsa.cuda import has_ragged_decode_topk
-from tokenspeed_kernel.ops.attention.qsa.triton import (
-    _qwen4_exp_qsa_block_topk_stream,
-    qwen4_exp_qsa_block_topk,
-)
+from tokenspeed_kernel.ops.attention.qsa import qwen4_exp_qsa_block_topk
 from tokenspeed_kernel.platform import pdl_enabled
-from tokenspeed_kernel.thirdparty.cute_dsl.qsa_stream_topk import (
-    kernel as cute_dsl_qsa_stream_topk,
-)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -55,8 +49,9 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--queries-per-request", type=int, required=True)
     parser.add_argument(
-        "--solution", choices=("cute_dsl", "triton", "logits"), required=True
+        "--solution", choices=("auto", "cute_dsl", "triton", "logits"), required=True
     )
+    parser.add_argument("--max-logits-mb", type=int, required=True)
     parser.add_argument("--timing", choices=("eager", "graph"), required=True)
     parser.add_argument("--frontier", choices=("full", "causal"), required=True)
     parser.add_argument("--distribution", choices=("random", "ties"), required=True)
@@ -193,42 +188,26 @@ def main() -> None:
     enable_pdl = args.pdl == "on"
     pdl_enabled(enable_pdl)
     workspace = None
-    if args.solution == "logits":
+    if args.solution in ("auto", "logits"):
         if not has_ragged_decode_topk():
             raise RuntimeError("logits comparison requires the persistent CUDA top-k")
         workspace = torch.empty(1024 * 1024, device=device, dtype=torch.uint8)
 
     def invoke() -> torch.Tensor:
         tensors = query, key_cache, page_table, request_indices, complete_blocks
-        if args.solution == "logits":
-            return qwen4_exp_qsa_block_topk(
-                *tensors,
-                page_size=page_size,
-                block_topk=block_topk,
-                queries_per_request=args.queries_per_request,
-                max_partial_bytes=32 * 1024 * 1024,
-                solution="logits",
-                persistent_topk_workspace=workspace,
-                enable_pdl=enable_pdl,
-            )
-        if args.solution == "triton":
-            return _qwen4_exp_qsa_block_topk_stream(
-                *tensors,
-                page_size=page_size,
-                block_topk=block_topk,
-                max_partial_bytes=32 * 1024 * 1024,
-                enable_pdl=enable_pdl,
-            )
-        return cute_dsl_qsa_stream_topk(
-            query,
-            key_cache,
-            page_table,
-            request_indices,
-            complete_blocks,
+        path = args.solution if args.solution in ("auto", "logits") else "stream"
+        backend = args.solution if path == "stream" else None
+        return qwen4_exp_qsa_block_topk(
+            *tensors,
             page_size=page_size,
             block_topk=block_topk,
             queries_per_request=args.queries_per_request,
             max_partial_bytes=32 * 1024 * 1024,
+            max_logits_bytes=args.max_logits_mb << 20,
+            path=path,
+            solution=backend,
+            override=None,
+            persistent_topk_workspace=workspace,
             enable_pdl=enable_pdl,
         )
 
@@ -299,6 +278,7 @@ def main() -> None:
                 "kv_tokens": kv_tokens,
                 "physical_key_pages": key_cache.shape[0] // page_size,
                 "queries_per_request": args.queries_per_request,
+                "max_logits_mb": args.max_logits_mb,
                 "pdl": enable_pdl,
                 "warmups": args.warmups,
                 "iterations": args.iterations,

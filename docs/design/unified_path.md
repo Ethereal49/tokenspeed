@@ -824,17 +824,24 @@ selection. Group size one and larger groups use the same scoring kernel, in
 both eager and captured forwards. Grouping must not be inferred from the total
 row count or page-table batch size for a ragged layout.
 
-NVIDIA stream selection always uses CuTe DSL, with an independent-row,
-shared-memory running top-k for general layouts and no global selection scratch.
-Other vendors use portable Triton. The Blackwell CuTe specializations use four
+QSA block selection enters through the public QSA API and `select_kernel`.
+The streaming and materialized implementations declare their path as a required
+feature, so backend overrides cannot silently switch algorithms. Automatic
+selection uses query rows, table capacity and supported layouts, never the
+prefill/decode mode. The caller's logits budget forces streaming when the score
+matrix would exceed it. Explicit paths bypass that automatic budget.
+
+Supported Blackwell stream layouts use CuTe DSL; other layouts and vendors
+retain portable Triton. The Blackwell CuTe specializations use four
 BF16 index heads of width 128, 64-block pages, and block top-k 512. Grouped
 scoring requires explicit eight-row request runs; small query grids can score
 rows independently, including ragged queries. Grouped streams keep exact
 running selections in selector registers, with double-buffered score
 candidates overlapping selection and MMA across tiles. Small grids may split
 the key range into bounded global scratch. The caller's partial-workspace
-budget bounds that scratch as well as
-Triton's; grouped streaming only allocates its output. Candidate pruning must
+budget bounds that scratch. Grouped CuTe and portable Triton streaming only
+allocate their output; each Triton program scans one row's complete key range
+and keeps its running top-k locally, with no split/merge buffers. Candidate pruning must
 prove that discarded scores cannot enter the top-k, or perform a full-score
 fallback. Each row retains its complete-block frontier. Query count, request
 count, page-table width and Q strides remain runtime values; split geometry is

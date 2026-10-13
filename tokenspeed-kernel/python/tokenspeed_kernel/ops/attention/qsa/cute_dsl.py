@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CuTe DSL registration for NVIDIA QSA streaming and Blackwell sparse attention."""
+"""CuTe DSL registration for Blackwell QSA selection and sparse attention."""
 
 from __future__ import annotations
 
@@ -33,13 +33,7 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 _PLATFORM = current_platform()
-_IS_NVIDIA = _PLATFORM.is_nvidia
 _IS_NVIDIA_BLACKWELL = _PLATFORM.is_nvidia and _PLATFORM.is_blackwell
-
-if _IS_NVIDIA:
-    from tokenspeed_kernel.thirdparty.cute_dsl._qsa_stream_topk.general import (
-        kernel as _cute_dsl_qsa_general_stream_topk,
-    )
 
 if _IS_NVIDIA_BLACKWELL:
     from tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse import (
@@ -70,7 +64,7 @@ def can_use_cute_dsl_qwen4_exp_qsa_block_topk(
 ) -> bool:
     """Return whether a tuned Blackwell MMA specialization should be used.
 
-    Other NVIDIA layouts still use the general CuTe DSL streaming kernel.
+    The selector excludes other layouts before ranking registered kernels.
 
     Args:
         query: Candidate BF16 query tensor shaped ``[rows, 4, 128]``.
@@ -162,20 +156,17 @@ def cute_dsl_qwen4_exp_qsa_block_topk(
     max_partial_bytes: int,
     enable_pdl: bool,
 ) -> torch.Tensor:
-    """Run NVIDIA QSA streaming with the best matching CuTe DSL kernel.
-
-    Blackwell specializations share K for uniform runs or split small grids.
-    Other layouts use a workspace-free, independent-row CuTe streaming kernel.
+    """Run the registered Blackwell QSA streaming specialization.
 
     Args:
-        query: BF16, FP16 or FP32 queries shaped ``[rows, heads, head_dim]``.
-        key_cache: Compressed keys shaped ``[slots, 1, head_dim]``.
-        page_table: Int32 or int64 physical pages shaped ``[requests, max_pages]``;
-            both row and column strides are supported.
+        query: Aligned BF16 queries shaped ``[rows, 4, 128]``.
+        key_cache: Contiguous BF16 keys shaped ``[slots, 1, 128]``.
+        page_table: Aligned int32 physical pages shaped ``[requests, max_pages]``
+            with contiguous columns and a runtime row stride.
         request_indices: Int32 or int64 request id per query row.
-        complete_blocks: Int32 or int64 valid-block count per query row.
-        page_size: Number of compressed blocks per page.
-        block_topk: Power-of-two number of selected blocks, at least 64.
+        complete_blocks: Contiguous int32 valid-block count per query row.
+        page_size: Number of compressed blocks per page; must be 64.
+        block_topk: Number of selected blocks; must be 512.
         queries_per_request: Uniform consecutive query-run width, or ``None``
             for ragged rows; required for grouped scoring optimizations.
         max_partial_bytes: Budget for global scratch, excluding the output.
@@ -185,29 +176,8 @@ def cute_dsl_qwen4_exp_qsa_block_topk(
         Int32 logical block ids shaped ``[rows, block_topk]``, padded with ``-1``.
     """
 
-    if not _IS_NVIDIA:
-        raise RuntimeError("CuTe DSL QSA stream top-k requires NVIDIA GPUs")
-    if not can_use_cute_dsl_qwen4_exp_qsa_block_topk(
-        query,
-        key_cache,
-        page_table,
-        request_indices,
-        complete_blocks,
-        page_size=page_size,
-        block_topk=block_topk,
-        queries_per_request=queries_per_request,
-        max_partial_bytes=max_partial_bytes,
-    ):
-        return _cute_dsl_qsa_general_stream_topk(
-            query,
-            key_cache,
-            page_table,
-            request_indices,
-            complete_blocks,
-            page_size=page_size,
-            block_topk=block_topk,
-            enable_pdl=enable_pdl,
-        )
+    if not _IS_NVIDIA_BLACKWELL:
+        raise RuntimeError("CuTe DSL QSA stream top-k requires NVIDIA Blackwell")
     return _cute_dsl_qsa_stream_block_topk(
         query,
         key_cache,
@@ -222,17 +192,18 @@ def cute_dsl_qwen4_exp_qsa_block_topk(
     )
 
 
-if _IS_NVIDIA:
+if _IS_NVIDIA_BLACKWELL:
     register_kernel(
         "attention",
         "qsa_block_topk",
         name="cute_dsl_qwen4_exp_qsa_block_topk",
         solution="cute_dsl",
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 0),
+            min_arch_version=ArchVersion(10, 0),
             max_arch_version=ArchVersion(10, 7),
             vendors=frozenset({"nvidia"}),
         ),
+        features=frozenset({"stream"}),
         signatures=frozenset(
             {
                 format_signature(
@@ -246,6 +217,7 @@ if _IS_NVIDIA:
             "head_dim": frozenset({128}),
             "page_size": frozenset({64}),
             "block_topk": frozenset({512}),
+            "supported_layout": frozenset({True}),
         },
         priority=Priority.SPECIALIZED,
     )(cute_dsl_qwen4_exp_qsa_block_topk)

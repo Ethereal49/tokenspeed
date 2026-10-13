@@ -25,9 +25,11 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.attention.qsa import qsa_sparse_attention
-from tokenspeed_kernel.ops.attention.qsa.triton import (
+from tokenspeed_kernel.ops.attention.qsa import (
+    qsa_sparse_attention,
     qwen4_exp_qsa_block_topk,
+)
+from tokenspeed_kernel.ops.attention.qsa.triton import (
     qwen4_exp_qsa_compress_and_store,
     qwen4_exp_qsa_prepare_metadata,
     qwen4_exp_qsa_recent_write,
@@ -179,7 +181,10 @@ def test_qsa_selection_waits_for_query_cache_and_metadata(
             block_topk=topk,
             queries_per_request=queries_per_request,
             max_partial_bytes=32 * 1024 * 1024,
-            solution=solution,
+            path=solution,
+            max_logits_bytes=256 << 20,
+            solution=None,
+            override=None,
             persistent_topk_workspace=None,
             enable_pdl=enable_pdl,
         )
@@ -254,7 +259,10 @@ def test_cute_dsl_qsa_stream_waits_before_query_copy_and_frontiers(
             block_topk=512,
             queries_per_request=width,
             max_partial_bytes=32 * 1024 * 1024,
-            solution="stream",
+            path="stream",
+            max_logits_bytes=256 << 20,
+            solution=None,
+            override=None,
             persistent_topk_workspace=None,
             enable_pdl=enable_pdl,
         )

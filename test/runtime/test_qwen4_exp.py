@@ -699,29 +699,48 @@ def test_qsa_dispatch_uses_router_slots_and_records_one_pd_step(
     )
 
 
-def test_qwen4_exp_qsa_topk_solution_reads_env(monkeypatch) -> None:
-    indexer = object.__new__(QSAIndexer)
-    small = torch.empty(1, 64)  # 1 x 4096 blocks x 4B fits any default budget
-    large = torch.empty(1, 8192)  # 1 x 524288 blocks x 4B exceeds 1 MiB
+@pytest.mark.parametrize(
+    ("path", "budget_mb"), [("auto", 256), ("stream", 1), ("logits", 0)]
+)
+def test_qwen4_exp_qsa_forwards_topk_policy(monkeypatch, path, budget_mb) -> None:
+    indexer, _, _, compressed, _ = _qsa_cache_test_indexer("cpu")
+    query = torch.empty(8, 4, indexer.index_head_dim)
+    positions = torch.arange(8)
+    requests = torch.zeros(8, dtype=torch.int32)
+    complete = torch.ones(8, dtype=torch.int32)
+    table = torch.ones(1, 1, dtype=torch.int32)
+    output = torch.empty(8, indexer.token_topk + indexer.compress_ratio - 1)
+    calls = []
 
-    monkeypatch.delenv("TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH", raising=False)
-    monkeypatch.delenv("TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB", raising=False)
-    assert indexer._topk_solution(1, small, 64) == "logits"
-    assert indexer._topk_solution(1, large, 64) == "logits"
+    def select_blocks(*args, **kwargs):
+        calls.append(kwargs)
+        return torch.zeros(8, indexer.block_topk, dtype=torch.int32)
 
-    # A tighter budget flips only the oversized batch onto the stream path.
-    monkeypatch.setenv("TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB", "1")
-    assert indexer._topk_solution(1, small, 64) == "logits"
-    assert indexer._topk_solution(1, large, 64) == "stream"
-
-    # Explicit backends pin the routing regardless of shape or budget.
-    for pinned in ("stream", "logits"):
-        monkeypatch.setenv("TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH", pinned)
-        assert indexer._topk_solution(1, large, 64) == pinned
-
-    monkeypatch.setenv("TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH", "bogus")
-    with pytest.raises(ValueError, match="TOPK_PATH"):
-        indexer._topk_solution(1, small, 64)
+    monkeypatch.setenv("TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH", path)
+    monkeypatch.setenv("TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB", str(budget_mb))
+    monkeypatch.setattr(qsa_indexer_module, "qwen4_exp_qsa_block_topk", select_blocks)
+    monkeypatch.setattr(
+        qsa_indexer_module,
+        "qwen4_exp_qsa_selected_slots",
+        lambda *args, **kwargs: output,
+    )
+    actual = indexer._select_slots(
+        query,
+        positions,
+        requests,
+        table,
+        table,
+        compressed,
+        full_page_size=64,
+        complete_blocks=complete,
+        queries_per_request=8,
+    )
+    assert actual is output
+    assert len(calls) == 1
+    assert calls[0]["path"] == path
+    assert calls[0]["max_logits_bytes"] == budget_mb << 20
+    assert calls[0]["queries_per_request"] == 8
+    assert calls[0]["persistent_topk_workspace"] is indexer._persistent_topk_workspace
 
 
 def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:

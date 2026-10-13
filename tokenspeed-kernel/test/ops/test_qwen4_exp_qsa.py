@@ -25,16 +25,16 @@ import tokenspeed_kernel.ops.attention.qsa.triton as qsa_ops
 import torch
 from tokenspeed_kernel._triton import triton
 from tokenspeed_kernel.ops.attention.dsa.cuda import has_ragged_decode_topk
+from tokenspeed_kernel.ops.attention.qsa import qwen4_exp_qsa_block_topk
 from tokenspeed_kernel.ops.attention.qsa.triton import (
-    _qwen4_exp_qsa_merge_block_topk_kernel,
     _qwen4_exp_qsa_stream_block_topk_kernel,
-    qwen4_exp_qsa_block_topk,
     qwen4_exp_qsa_commit_verify_layers,
     qwen4_exp_qsa_compress_and_store,
     qwen4_exp_qsa_prepare_metadata,
     qwen4_exp_qsa_recent_write,
     qwen4_exp_qsa_selected_slots,
 )
+from utils import assert_no_triton_compile
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -651,104 +651,6 @@ def test_qwen4_exp_qsa_recent_write_honors_explicit_mask(device: str) -> None:
     )
 
 
-@pytest.mark.parametrize("splits", [1, 3, 13, 16])
-def test_qwen4_exp_qsa_merge_tree_matches_flat_topk(device: str, splits: int) -> None:
-    """Merge bitonic partial rows exactly, including padded split rows."""
-
-    torch.manual_seed(37)
-    rows, block_topk = 3, 64
-    shape = (2, rows, splits, block_topk)
-    score_bits = torch.randint(1, 1 << 20, shape, dtype=torch.int64)
-    block_ids = torch.arange(1, 1 + 2 * rows * splits * block_topk).reshape(shape)
-    packed = ((score_bits + 1) << 32) | block_ids
-    ascending = packed[0].sort(dim=-1).values
-    descending = packed[1].sort(dim=-1, descending=True).values
-    partial = torch.maximum(ascending, descending).to(device)
-    valid_splits = torch.tensor(
-        [splits, max(splits - 1, 0), 0], device=device, dtype=torch.int32
-    )
-    blocks_per_split = block_topk
-    complete_blocks = valid_splits * blocks_per_split
-
-    actual = torch.empty((rows, block_topk), dtype=torch.int32, device=device)
-    _qwen4_exp_qsa_merge_block_topk_kernel[(rows,)](
-        partial,
-        actual,
-        complete_blocks,
-        blocks_per_split,
-        partial.stride(0),
-        partial.stride(1),
-        actual.stride(0),
-        BLOCK_TOPK=block_topk,
-        SPLITS=splits,
-        POW2_SPLITS=triton.next_power_of_2(splits),
-        ENABLE_PDL=False,
-        num_warps=8,
-    )
-    expected = torch.full_like(actual, -1)
-    for row, count in enumerate(valid_splits.tolist()):
-        if count:
-            expected_keys = torch.topk(
-                partial[row, :count].flatten(), block_topk, sorted=True
-            ).values
-            expected[row] = (expected_keys & 0xFFFFFFFF).to(torch.int32)
-    torch.testing.assert_close(actual, expected)
-
-
-def test_qwen4_exp_qsa_stream_skips_empty_split_writes(device: str) -> None:
-    """A split beyond a row's complete range leaves its partials untouched."""
-
-    torch.manual_seed(39)
-    rows, heads, head_dim, page_size = 2, 4, 16, 64
-    block_topk, splits, blocks_per_split = 64, 4, 96
-    num_blocks = splits * blocks_per_split
-    query = torch.randn(rows, heads, head_dim, device=device, dtype=torch.bfloat16)
-    key_cache = torch.randn(
-        num_blocks, 1, head_dim, device=device, dtype=torch.bfloat16
-    )
-    page_table = torch.arange(
-        num_blocks // page_size, device=device, dtype=torch.int32
-    ).repeat(rows, 1)
-    requests = torch.arange(rows, device=device, dtype=torch.int64)
-    complete_blocks = torch.tensor([num_blocks, 40], device=device, dtype=torch.int32)
-    sentinel = 0x123456789ABCDEF
-    partial = torch.full(
-        (rows, splits, block_topk), sentinel, device=device, dtype=torch.int64
-    )
-
-    _qwen4_exp_qsa_stream_block_topk_kernel[(rows, splits)](
-        query,
-        key_cache,
-        page_table,
-        requests,
-        complete_blocks,
-        partial,
-        heads,
-        head_dim,
-        num_blocks,
-        page_size,
-        blocks_per_split,
-        query.stride(0),
-        query.stride(1),
-        query.stride(2),
-        key_cache.stride(0),
-        key_cache.stride(2),
-        page_table.stride(0),
-        partial.stride(0),
-        partial.stride(1),
-        BLOCK_TOPK=block_topk,
-        BLOCK_N=block_topk,
-        BLOCK_H=triton.next_power_of_2(heads),
-        BLOCK_D=triton.next_power_of_2(head_dim),
-        ENABLE_PDL=False,
-        num_warps=8,
-        num_stages=2,
-    )
-
-    assert torch.all(partial[1, 1:] == sentinel)
-    assert torch.all(partial[1, 0] != sentinel)
-
-
 def test_qwen4_exp_qsa_block_topk_matches_torch(device: str) -> None:
     torch.manual_seed(29)
     rows, heads, head_dim, page_size = 3, 4, 16, 64
@@ -780,7 +682,10 @@ def test_qwen4_exp_qsa_block_topk_matches_torch(device: str) -> None:
         block_topk=block_topk,
         queries_per_request=1,
         max_partial_bytes=32 * 1024 * 1024,
-        solution="stream",
+        path="stream",
+        max_logits_bytes=256 << 20,
+        solution=None,
+        override=None,
         persistent_topk_workspace=None,
         enable_pdl=False,
     )
@@ -808,9 +713,8 @@ def test_qwen4_exp_qsa_block_topk_matches_torch(device: str) -> None:
         assert set(got) == expected
 
 
-def test_qwen4_exp_qsa_block_topk_two_stage_merge_matches_torch(device: str) -> None:
-    # block_topk=512 with 16k blocks forces 32 streaming splits, so the
-    # merge runs in two stages (16 splits per chunk program).
+def test_qwen4_exp_qsa_block_topk_long_stream_matches_torch(device: str) -> None:
+    # A long stream retains one exact running set across every key tile.
     torch.manual_seed(31)
     rows, heads, head_dim, page_size = 2, 4, 16, 64
     block_topk = 512
@@ -840,7 +744,10 @@ def test_qwen4_exp_qsa_block_topk_two_stage_merge_matches_torch(device: str) -> 
         block_topk=block_topk,
         queries_per_request=1,
         max_partial_bytes=32 * 1024 * 1024,
-        solution="stream",
+        path="stream",
+        max_logits_bytes=256 << 20,
+        solution=None,
+        override=None,
         persistent_topk_workspace=None,
         enable_pdl=False,
     )
@@ -993,7 +900,10 @@ def test_qwen4_exp_qsa_grouped_scores_match_independent_queries(
                 block_topk=block_topk,
                 queries_per_request=width,
                 max_partial_bytes=32 * 1024 * 1024,
-                solution="logits",
+                path="logits",
+                max_logits_bytes=256 << 20,
+                solution=None,
+                override=None,
                 persistent_topk_workspace=None,
                 enable_pdl=False,
             )
@@ -1048,7 +958,10 @@ def test_qwen4_exp_qsa_grouped_scores_refresh_during_graph_replay(device: str) -
             block_topk=64,
             queries_per_request=queries_per_request,
             max_partial_bytes=32 * 1024 * 1024,
-            solution="logits",
+            path="logits",
+            max_logits_bytes=256 << 20,
+            solution=None,
+            override=None,
             persistent_topk_workspace=None,
             enable_pdl=False,
         )
@@ -1118,7 +1031,10 @@ def test_qwen4_exp_qsa_long_query_groups_match_independent_rows(
                 block_topk=64,
                 queries_per_request=query_width,
                 max_partial_bytes=32 * 1024 * 1024,
-                solution="logits",
+                path="logits",
+                max_logits_bytes=256 << 20,
+                solution=None,
+                override=None,
                 persistent_topk_workspace=None,
                 enable_pdl=False,
             )
@@ -1159,7 +1075,10 @@ def test_qwen4_exp_qsa_rejects_invalid_query_width(
             block_topk=64,
             queries_per_request=queries_per_request,
             max_partial_bytes=32 * 1024 * 1024,
-            solution="logits",
+            path="logits",
+            max_logits_bytes=256 << 20,
+            solution=None,
+            override=None,
             persistent_topk_workspace=None,
             enable_pdl=False,
         )
@@ -1201,7 +1120,10 @@ def test_qwen4_exp_qsa_block_topk_logits_matches_stream(device: str) -> None:
         page_table,
         requests,
         complete_blocks,
-        solution="stream",
+        path="stream",
+        max_logits_bytes=256 << 20,
+        solution=None,
+        override=None,
         **kwargs,
     )
     logits = qwen4_exp_qsa_block_topk(
@@ -1210,7 +1132,10 @@ def test_qwen4_exp_qsa_block_topk_logits_matches_stream(device: str) -> None:
         page_table,
         requests,
         complete_blocks,
-        solution="logits",
+        path="logits",
+        max_logits_bytes=256 << 20,
+        solution=None,
+        override=None,
         **kwargs,
     )
 
@@ -1279,7 +1204,10 @@ def test_qwen4_exp_qsa_block_topk_logits_dispatches_persistent_radix(
         block_topk=block_topk,
         queries_per_request=1,
         max_partial_bytes=32 * 1024 * 1024,
-        solution="logits",
+        path="logits",
+        max_logits_bytes=256 << 20,
+        solution=None,
+        override=None,
         persistent_topk_workspace=workspace,
         enable_pdl=False,
     )
@@ -1319,7 +1247,10 @@ def test_qwen4_exp_qsa_compact_logits_shorter_than_persistent_topk(
         block_topk=topk,
         queries_per_request=rows,
         max_partial_bytes=32 * 1024 * 1024,
-        solution="logits",
+        path="logits",
+        max_logits_bytes=256 << 20,
+        solution=None,
+        override=None,
         persistent_topk_workspace=torch.empty(
             1024 * 1024, device=device, dtype=torch.uint8
         ),
@@ -1373,7 +1304,10 @@ def test_qwen4_exp_qsa_block_topk_logits_persistent_radix_matches_stream(
         page_table,
         requests,
         complete_blocks,
-        solution="stream",
+        path="stream",
+        max_logits_bytes=256 << 20,
+        solution=None,
+        override=None,
         persistent_topk_workspace=None,
         **kwargs,
     )
@@ -1383,7 +1317,10 @@ def test_qwen4_exp_qsa_block_topk_logits_persistent_radix_matches_stream(
         page_table,
         requests,
         complete_blocks,
-        solution="logits",
+        path="logits",
+        max_logits_bytes=256 << 20,
+        solution=None,
+        override=None,
         persistent_topk_workspace=workspace,
         **kwargs,
     )
@@ -1489,7 +1426,10 @@ def test_qwen4_exp_qsa_block_topk_reads_strided_inputs(device: str) -> None:
             block_topk=block_topk,
             queries_per_request=1,
             max_partial_bytes=32 * 1024 * 1024,
-            solution=solution,
+            path=solution,
+            max_logits_bytes=256 << 20,
+            solution=None,
+            override=None,
             persistent_topk_workspace=None,
             enable_pdl=False,
         )
@@ -1503,7 +1443,10 @@ def test_qwen4_exp_qsa_block_topk_reads_strided_inputs(device: str) -> None:
             block_topk=block_topk,
             queries_per_request=1,
             max_partial_bytes=32 * 1024 * 1024,
-            solution=solution,
+            path=solution,
+            max_logits_bytes=256 << 20,
+            solution=None,
+            override=None,
             persistent_topk_workspace=None,
             enable_pdl=False,
         )
@@ -1715,3 +1658,103 @@ def test_qwen4_exp_qsa_commit_verify_layers_rejects_bad_args(
     args[argument] = replace(args[argument])
     with pytest.raises(ValueError, match=error):
         qwen4_exp_qsa_commit_verify_layers(**args)
+
+
+@pytest.mark.parametrize("budget", [0, 1 << 20])
+@pytest.mark.parametrize("topk", [64, 512, 2048])
+def test_portable_stream_allocates_only_output_and_refreshes_graph(
+    device, monkeypatch, budget, topk
+):
+    torch.manual_seed(311)
+    rows, blocks = 4, 512
+    query = torch.randn(rows, 5, 32, device=device, dtype=torch.bfloat16)[:, :4]
+    keys = torch.randn(blocks, 1, 32, device=device, dtype=query.dtype)
+    table = torch.arange(8, device=device, dtype=torch.int32)[None]
+    requests = torch.zeros(rows, device=device, dtype=torch.int32)
+    complete = torch.tensor([0, 50, 128, blocks], device=device, dtype=torch.int32)
+
+    def invoke():
+        return qwen4_exp_qsa_block_topk(
+            query,
+            keys,
+            table,
+            requests,
+            complete,
+            page_size=64,
+            block_topk=topk,
+            queries_per_request=None,
+            max_partial_bytes=budget,
+            max_logits_bytes=256 << 20,
+            path="stream",
+            persistent_topk_workspace=None,
+            enable_pdl=False,
+            solution="triton",
+            override=None,
+        )
+
+    invoke()
+    allocations = []
+    empty = torch.empty
+
+    def record_empty(*args, **kwargs):
+        tensor = empty(*args, **kwargs)
+        allocations.append(tensor.numel() * tensor.element_size())
+        return tensor
+
+    monkeypatch.setattr(torch, "empty", record_empty)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = invoke()
+    assert allocations == [actual.numel() * actual.element_size()]
+    for frontiers in ([0, 50, 128, blocks], [blocks, 128, 50, 0]):
+        complete.copy_(torch.tensor(frontiers, device=device, dtype=torch.int32))
+        query.normal_()
+        keys.normal_()
+        graph.replay()
+        scores = _block_topk_reference_scores(
+            query, keys, table, requests, complete, 64, blocks
+        )
+        for row, count in enumerate(frontiers):
+            expected = _expected_stream_ids(scores[row], min(count, topk))
+            assert sorted(actual[row][actual[row] >= 0].tolist()) == sorted(expected)
+
+
+def test_portable_stream_reuses_compile_across_rows_capacities_and_strides(device):
+    torch.manual_seed(317)
+    query_storage = torch.randn(12, 5, 128, device=device, dtype=torch.bfloat16)
+    keys = torch.randn(1024, 1, 128, device=device, dtype=query_storage.dtype)
+    table_storage = torch.arange(16, device=device, dtype=torch.int32).repeat(12, 1)
+    requests = torch.zeros(12, device=device, dtype=torch.int32)
+    complete = torch.full_like(requests, 512)
+
+    def invoke(rows, pages, feature_stride):
+        return qwen4_exp_qsa_block_topk(
+            (
+                query_storage[:rows, :4, :64]
+                if feature_stride == 1
+                else query_storage[:rows, :4, :128:2]
+            ),
+            keys[:, :, :64] if feature_stride == 1 else keys[:, :, ::2],
+            table_storage[:rows, :pages],
+            requests[:rows],
+            complete[:rows],
+            page_size=64,
+            block_topk=64,
+            queries_per_request=None,
+            max_partial_bytes=0,
+            max_logits_bytes=256 << 20,
+            path="stream",
+            persistent_topk_workspace=None,
+            enable_pdl=False,
+            solution="triton",
+            override=None,
+        )
+
+    # Triton distinguishes unit and non-unit runtime strides; warm each class.
+    invoke(3, 8, 1)
+    invoke(3, 8, 2)
+    with assert_no_triton_compile(_qwen4_exp_qsa_stream_block_topk_kernel):
+        for rows, pages in ((7, 11), (9, 13), (12, 16)):
+            for feature_stride in (1, 2):
+                selected = invoke(rows, pages, feature_stride)
+                assert bool(((selected >= 0) & (selected < 512)).all())

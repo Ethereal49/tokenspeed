@@ -21,13 +21,12 @@
 from __future__ import annotations
 
 import pytest
-import tokenspeed_kernel.ops.attention.qsa.triton as qsa_ops
 import tokenspeed_kernel.thirdparty.cute_dsl.qsa_stream_topk as stream_topk
 import torch
+from tokenspeed_kernel.ops.attention.qsa import qwen4_exp_qsa_block_topk
 from tokenspeed_kernel.ops.attention.qsa.cute_dsl import (
     can_use_cute_dsl_qwen4_exp_qsa_block_topk,
 )
-from tokenspeed_kernel.ops.attention.qsa.triton import qwen4_exp_qsa_block_topk
 from tokenspeed_kernel.thirdparty.cute_dsl.qsa_stream_topk import (
     kernel as cute_dsl_qsa_stream_topk,
 )
@@ -303,7 +302,6 @@ def test_cute_dsl_qsa_stream_topk_reuses_compile_across_layouts(
 )
 def test_cute_dsl_qsa_stream_topk_matches_reference(
     device: str,
-    monkeypatch: pytest.MonkeyPatch,
     pages: int,
     enable_pdl: bool,
     complete_counts: list[int],
@@ -337,11 +335,6 @@ def test_cute_dsl_qsa_stream_topk_matches_reference(
             enable_pdl=enable_pdl,
         )
     else:
-        monkeypatch.setattr(
-            qsa_ops,
-            "_qwen4_exp_qsa_block_topk_stream",
-            lambda *args, **kwargs: pytest.fail("unexpected Triton stream fallback"),
-        )
         selected = qwen4_exp_qsa_block_topk(
             query,
             key_cache,
@@ -352,7 +345,10 @@ def test_cute_dsl_qsa_stream_topk_matches_reference(
             block_topk=block_topk,
             queries_per_request=rows,
             max_partial_bytes=32 * 1024 * 1024,
-            solution="stream",
+            path="stream",
+            max_logits_bytes=256 << 20,
+            solution="cute_dsl",
+            override=None,
             persistent_topk_workspace=None,
             enable_pdl=enable_pdl,
         )
@@ -373,7 +369,6 @@ def test_cute_dsl_qsa_stream_topk_matches_reference(
 )
 def test_cute_dsl_qsa_stream_topk_keeps_groups_within_requests(
     device: str,
-    monkeypatch: pytest.MonkeyPatch,
     queries_per_request: int,
     pages: int,
 ) -> None:
@@ -408,11 +403,6 @@ def test_cute_dsl_qsa_stream_topk_keeps_groups_within_requests(
         dtype=torch.int32,
     )
 
-    monkeypatch.setattr(
-        qsa_ops,
-        "_qwen4_exp_qsa_block_topk_stream",
-        lambda *args, **kwargs: pytest.fail("unexpected Triton stream fallback"),
-    )
     selected = qwen4_exp_qsa_block_topk(
         query,
         key_cache,
@@ -423,7 +413,10 @@ def test_cute_dsl_qsa_stream_topk_keeps_groups_within_requests(
         block_topk=block_topk,
         queries_per_request=queries_per_request,
         max_partial_bytes=32 * 1024 * 1024,
-        solution="stream",
+        path="stream",
+        max_logits_bytes=256 << 20,
+        solution="cute_dsl",
+        override=None,
         persistent_topk_workspace=None,
         enable_pdl=False,
     )
@@ -600,11 +593,6 @@ def test_cute_dsl_qsa_stream_topk_prefill_graph_without_global_partial(
             for start in (0, 4096, 8192, rows - 8)
         ]
     )
-    monkeypatch.setattr(
-        qsa_ops,
-        "_qwen4_exp_qsa_block_topk_stream",
-        lambda *args, **kwargs: pytest.fail("unexpected Triton stream fallback"),
-    )
 
     def invoke() -> torch.Tensor:
         return qwen4_exp_qsa_block_topk(
@@ -617,7 +605,10 @@ def test_cute_dsl_qsa_stream_topk_prefill_graph_without_global_partial(
             block_topk=block_topk,
             queries_per_request=rows,
             max_partial_bytes=0,
-            solution="stream",
+            path="stream",
+            max_logits_bytes=256 << 20,
+            solution="cute_dsl",
+            override=None,
             persistent_topk_workspace=None,
             enable_pdl=enable_pdl,
         )
@@ -713,7 +704,10 @@ def test_stream_topk_graph_refreshes_pruning_and_full_refinement(
             block_topk=512,
             queries_per_request=width,
             max_partial_bytes=32 * 1024 * 1024,
-            solution="stream",
+            path="stream",
+            max_logits_bytes=256 << 20,
+            solution="cute_dsl",
+            override=None,
             persistent_topk_workspace=None,
             enable_pdl=enable_pdl,
         )
@@ -830,12 +824,11 @@ def test_stream_topk_small_shapes_reuse_capacity_buckets(
         pytest.param(8, 8, 1025, id="split-prefill"),
         pytest.param(136, 136, 1025, id="overlap-prefill"),
         pytest.param(136, 136, 2048, id="overlap-second-window"),
-        pytest.param(2, 1, 2049, id="general-long-capacity"),
+        pytest.param(2, 1, 2049, id="portable-long-capacity"),
     ],
 )
 def test_stream_topk_graph_preserves_ids_above_65535(
     device: str,
-    monkeypatch: pytest.MonkeyPatch,
     rows: int,
     width: int,
     pages: int,
@@ -852,11 +845,6 @@ def test_stream_topk_graph_preserves_ids_above_65535(
     winners = torch.arange(capacity - 512, capacity, device=device)
     slots = table[0, winners // 64].long() * 64 + winners % 64
     keys[slots, 0, 0] = torch.arange(1, 513, device=device).to(torch.bfloat16)
-    monkeypatch.setattr(
-        qsa_ops,
-        "_qwen4_exp_qsa_block_topk_stream",
-        lambda *args, **kwargs: pytest.fail("unexpected Triton stream fallback"),
-    )
 
     def invoke() -> torch.Tensor:
         return qwen4_exp_qsa_block_topk(
@@ -869,7 +857,10 @@ def test_stream_topk_graph_preserves_ids_above_65535(
             block_topk=512,
             queries_per_request=width,
             max_partial_bytes=32 * 1024 * 1024,
-            solution="stream",
+            path="stream",
+            max_logits_bytes=256 << 20,
+            solution="triton" if pages > 2048 else "cute_dsl",
+            override=None,
             persistent_topk_workspace=None,
             enable_pdl=enable_pdl,
         )
