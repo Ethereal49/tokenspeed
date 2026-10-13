@@ -531,8 +531,9 @@ scorer. Only the first program of a KPool row writes its `row_ends_out`.
 For dense BF16, E4M3 and E5M2 query and KV rows with 512 latent values,
 the Gluon kernel computes score and value products in four 128-column
 phases. Matching dtypes retain their native matrix format; mixed inputs
-convert to BF16. It stages selected indices once per tile
-in shared memory for the KV gather. The configured selected-slot width fixes
+convert to BF16. Inside the key loop, it reuses selected indices staged in
+shared memory for the KV gather. The first tile loads gather indices directly,
+so one-tile rows avoid an initial shared-index handoff. The configured width fixes
 the launch and compile shape; device-resident selected lengths skip unused
 tiles and mask live rows across graph replays. Optional 64-value RoPE inputs
 add a separate score product. Rank-128 and packed KV layouts retain their

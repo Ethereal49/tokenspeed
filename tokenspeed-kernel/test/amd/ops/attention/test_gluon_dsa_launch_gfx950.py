@@ -113,9 +113,9 @@ def test_dense_launch_parameters_ignore_live_length(
     assert width == torch.Size((tokens, 2051))
     assert grid[0] == tokens
     assert grid[2] == constants["NUM_KV_SPLITS"]
-    assert constants["PHASED_E4M3"] is True
-    assert constants["TRIM_EMPTY_TILES"] is True
-    assert constants["FP8_INPUTS"] == (q_dtype != kv_dtype)
+    assert "PHASED_E4M3" not in constants
+    assert "COLUMN_PARALLEL" not in constants
+    assert constants["CONVERT_INPUTS"] == (q_dtype != kv_dtype)
     assert constants["NATIVE_FP8"] == (
         q_dtype == kv_dtype and q_dtype in attention._FP8_DTYPES
     )
