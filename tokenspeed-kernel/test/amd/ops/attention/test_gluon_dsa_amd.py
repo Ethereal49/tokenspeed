@@ -1798,18 +1798,26 @@ def test_dsa_decode_glm53_flash_graph_tracks_live_lengths(
 
     topk_lens.fill_(13)
     topk_slots[:, :13] = torch.arange(13, device=device, dtype=torch.int32)
-    invoke(graph_out, 13)
+    initial_max_seqlen_k = 13 if is_cdna4() else 131072
+    invoke(graph_out, initial_max_seqlen_k)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        invoke(graph_out, 13)
+        invoke(graph_out, initial_max_seqlen_k)
 
     # Revisit a long row after short/empty rows to exercise shared-buffer reuse
     # and online-softmax state under the same captured launch.
-    with assert_no_triton_compile(
-        gfx950_dsa_backend._dsa_dense_mfma_kv_kernel,
-        gfx950_dsa_backend._dsa_dense_mfma_reduce_kernel,
-    ):
+    # Changed host context bounds exercise gfx950's fixed-capacity contract.
+    # Other architectures retain their existing graph metadata coverage.
+    compile_kernels = (
+        (
+            gfx950_dsa_backend._dsa_dense_mfma_kv_kernel,
+            gfx950_dsa_backend._dsa_dense_mfma_reduce_kernel,
+        )
+        if is_cdna4()
+        else ()
+    )
+    with assert_no_triton_compile(*compile_kernels):
         for visible in (0, 1, 13, 63, 64, 65, 449, 526, 1961, 2048, 2051, 0, 65, 2051):
             topk_slots.fill_(-1)
             topk_lens.fill_(visible)
@@ -1819,7 +1827,7 @@ def test_dsa_decode_glm53_flash_graph_tracks_live_lengths(
             graph.replay()
             torch.cuda.synchronize()
             replayed = graph_out.clone()
-            invoke(eager_out, visible)
+            invoke(eager_out, visible if is_cdna4() else initial_max_seqlen_k)
             torch.cuda.synchronize()
             torch.testing.assert_close(replayed, eager_out, rtol=0.0, atol=0.0)
             ref = _dsa_reference(
