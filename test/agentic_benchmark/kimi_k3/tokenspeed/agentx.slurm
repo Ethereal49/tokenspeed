@@ -23,7 +23,7 @@
 
 # Run via sbatch with a native client, or from the login host in a held job.
 # All paths must be absolute and visible where they are used. See agentx.md.
-# Arguments after this script are passed unchanged to the server configuration.
+# Caller arguments are preserved; API_PORT supplies the final server port override.
 set -euo pipefail
 : "${SLURM_JOB_ID:?use sbatch or an existing allocation}"
 
@@ -31,7 +31,7 @@ validate_config() {
     : "${SOURCE_ROOT:?absolute checkout path; independent of sbatch submit directory}"
     : "${CONFIG_NAMES:?space-separated server configuration names}"
     read -r -a CONFIGS <<< "$CONFIG_NAMES"
-    (( ${#CONFIGS[@]} > 0 ))
+    (( ${#CONFIGS[@]} > 0 )) || { echo "CONFIG_NAMES must select at least one config" >&2; exit 2; }
     for config in "${CONFIGS[@]}"; do
         case "$config" in attn_tp8_moe_tp8|attn_tp8_moe_ep8) ;; *) echo "Unknown config: $config" >&2; exit 2 ;; esac
     done
@@ -41,6 +41,7 @@ validate_config() {
         seen[$config]=1
     done
     : "${SERVER_VENV?server venv path; set empty to use the image environment}"
+    export SERVER_VENV
     : "${CONTAINER_IMAGE:?pinned server image}"
     : "${CONTAINER_MOUNTS:?explicit shared mounts}"
     : "${CLIENT_PYTHON:?absolute Python from the prepared InferenceX AgentX venv}"
@@ -61,10 +62,14 @@ validate_config() {
         [[ "${!variable}" =~ ^[1-9][0-9]*$ ]] || { echo "$variable must be a positive integer" >&2; exit 2; }
     done
     SCRIPT_DIR="$SOURCE_ROOT/test/agentic_benchmark/kimi_k3/tokenspeed"
-    [[ -x "$CLIENT_PYTHON" && -f "$CLIENT_ROOT/inferencex/inferencex-e2e/benchmarks/benchmark_lib.sh" ]]
+    [[ -x "$CLIENT_PYTHON" ]] || { echo "Client Python is not executable: $CLIENT_PYTHON" >&2; exit 2; }
+    [[ -f "$CLIENT_ROOT/inferencex/inferencex-e2e/benchmarks/benchmark_lib.sh" ]] || { echo "Missing InferenceX benchmark_lib.sh under $CLIENT_ROOT" >&2; exit 2; }
+    [[ -f "$SCRIPT_DIR/agentx.sh" ]] || { echo "Missing client script: $SCRIPT_DIR/agentx.sh" >&2; exit 2; }
+    source "$SCRIPT_DIR/agentx.sh"
+    validate_agentx_config
     [[ "$CLIENT_PYTHON" = "$CLIENT_ROOT/venv/bin/python" ]] || { echo "CLIENT_PYTHON must use CLIENT_ROOT/venv" >&2; exit 2; }
     for config in "${CONFIGS[@]}"; do
-        [[ -f "$SCRIPT_DIR/configs/$config.sh" ]]
+        [[ -f "$SCRIPT_DIR/configs/$config.sh" ]] || { echo "Missing server config: $SCRIPT_DIR/configs/$config.sh" >&2; exit 2; }
     done
     [[ "$(squeue -h -j "$SLURM_JOB_ID" -o '%u')" = "$(id -un)" ]] || { echo 'Allocation not owned by current user' >&2; exit 1; }
     [[ "$(squeue -h -j "$SLURM_JOB_ID" -o '%T')" = RUNNING ]] || { echo 'Allocation must be RUNNING' >&2; exit 1; }
@@ -214,10 +219,10 @@ for CONFIG in "${CONFIGS[@]}"; do
     trap finish EXIT
     trap 'CLIENT_SIGNAL=INT; exit 130' INT
     trap 'CLIENT_SIGNAL=TERM; exit 143' TERM
-    prepare_run "$@"
+    prepare_run "$@" --port "$API_PORT"
     setup_slurm
     check_resources
-    launch_server "$@"
+    launch_server "$@" --port "$API_PORT"
     wait_for_ready
     run_benchmark
     stop_server

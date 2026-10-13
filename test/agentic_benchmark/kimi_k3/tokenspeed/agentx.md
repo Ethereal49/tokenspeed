@@ -4,6 +4,9 @@
 waits for readiness, runs native InferenceX AgentX replay, saves its outputs,
 and stops the server. It uses two four-GPU GB300 nodes as one aggregate TP8
 instance. Arguments after the script are appended to the existing server config.
+The launcher appends `--port "$API_PORT"` last so serving and readiness use the
+same port; any caller-supplied port is overridden. Client settings are validated
+before server startup.
 
 ## Prepare once
 
@@ -63,7 +66,7 @@ export AIPERF_EXTRA_INPUTS='{"ignore_eos":true,"temperature":1.0,"top_p":0.95,"t
 SERVER_ARGS=(
   --model "$MODEL_DIR" --served-model-name "$MODEL_NAME"
   --speculative-draft-model-path "$DRAFT_DIR" --max-model-len 262144
-  --gpu-memory-utilization 0.9 --seed 42 --port "$API_PORT"
+  --gpu-memory-utilization 0.9 --seed 42
   --engine-startup-timeout 7200 --disable-kvstore
 )
 export SLURM_JOB_ID=YOUR_HELD_JOB_ID
@@ -112,3 +115,10 @@ tools. Exit zero means native replay/validation succeeded, not that a run passed
 an additional comparison audit. Smoke is not a formal performance measurement.
 
 Run a GPU smoke for each selected layout before starting a formal benchmark.
+
+CPU lifecycle and input-validation checks run in the Lint workflow without GPUs:
+
+```bash
+python -m unittest discover -s test/agentic_benchmark/tests \
+  -p test_k3_inferencex_agentx.py -v
+```

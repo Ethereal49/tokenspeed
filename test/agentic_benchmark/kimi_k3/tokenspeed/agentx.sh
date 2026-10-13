@@ -23,17 +23,33 @@
 
 set -eo pipefail
 
-# All workload choices are explicit; the caller prepares the client environment.
-for variable in CLIENT_ROOT RESULT_DIR TOKENIZER_PATH MODEL_NAME API_PORT CONCURRENCY \
-    EP_SIZE DURATION BENCHMARK_GRACE_SECONDS REQUEST_TIMEOUT_SECONDS CLIENT_SEED \
-    AIPERF_WARMUP_REQUESTS_PER_LANE AGENTIC_WARMUP_GRACE_PERIOD \
-    AIPERF_TRACE_IDLE_GAP_CAP_SECONDS AIPERF_FAILED_REQUEST_THRESHOLD \
-    AIPERF_EXTRA_INPUTS AIPERF_UNSAFE_OVERRIDE AIPERF_SERVER_URL; do
-    [[ -n "${!variable}" ]] || { echo "Missing $variable" >&2; exit 2; }
-    # The pinned native replay builder splits its command on whitespace.
-    [[ "${!variable}" != *[[:space:]]* ]] || { echo "$variable must not contain whitespace" >&2; exit 2; }
-done
-case "$AIPERF_UNSAFE_OVERRIDE" in true|false) ;; *) exit 2 ;; esac
+# Share input validation with the launcher so invalid settings fail before startup.
+validate_agentx_values() {
+    local variable
+    for variable in "$@"; do
+        [[ -n "${!variable:-}" ]] || { echo "Missing $variable" >&2; return 2; }
+        # The pinned native replay builder splits its command on whitespace.
+        [[ "${!variable}" != *[[:space:]]* ]] || { echo "$variable must not contain whitespace" >&2; return 2; }
+        export "$variable"
+    done
+}
+
+validate_agentx_config() {
+    validate_agentx_values CLIENT_ROOT TOKENIZER_PATH MODEL_NAME API_PORT CONCURRENCY \
+        DURATION BENCHMARK_GRACE_SECONDS REQUEST_TIMEOUT_SECONDS CLIENT_SEED \
+        AIPERF_WARMUP_REQUESTS_PER_LANE AGENTIC_WARMUP_GRACE_PERIOD \
+        AIPERF_TRACE_IDLE_GAP_CAP_SECONDS AIPERF_FAILED_REQUEST_THRESHOLD \
+        AIPERF_EXTRA_INPUTS AIPERF_UNSAFE_OVERRIDE || return "$?"
+    case "$AIPERF_UNSAFE_OVERRIDE" in
+        true|false) ;;
+        *) echo "AIPERF_UNSAFE_OVERRIDE must be true or false; got '$AIPERF_UNSAFE_OVERRIDE'" >&2; return 2 ;;
+    esac
+}
+
+# Sourcing exposes validation only; replay runs when this script is executed.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then return 0; fi
+validate_agentx_config
+validate_agentx_values RESULT_DIR EP_SIZE AIPERF_SERVER_URL
 mkdir "$RESULT_DIR"
 export INFMAX_CONTAINER_WORKSPACE="$CLIENT_ROOT/inferencex/inferencex-e2e"
 export AIPERF_RUNTIME_DIR="$CLIENT_ROOT"
