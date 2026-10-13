@@ -1740,6 +1740,11 @@ def test_dsa_decode_glm53_flash_bf16_split_matrix(tokens: int) -> None:
         (torch.float8_e4m3fn, torch.float8_e4m3fn),
         (torch.bfloat16, torch.float8_e4m3fn),
         (torch.float8_e4m3fn, torch.bfloat16),
+        (torch.float8_e5m2, torch.float8_e5m2),
+        (torch.bfloat16, torch.float8_e5m2),
+        (torch.float8_e5m2, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.float8_e5m2),
+        (torch.float8_e5m2, torch.float8_e4m3fn),
     ),
 )
 def test_dsa_decode_glm53_flash_graph_tracks_live_lengths(

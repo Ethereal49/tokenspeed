@@ -39,10 +39,20 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.dsa import attention
         ("launch_gluon_dsa_prefill_gfx950", 16),
     ),
 )
-def test_native_fp8_launch_parameters_ignore_live_length(
+@pytest.mark.parametrize(
+    "q_dtype", (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2)
+)
+@pytest.mark.parametrize(
+    "kv_dtype", (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2)
+)
+@pytest.mark.parametrize("rope_dim", (0, 64))
+def test_dense_launch_parameters_ignore_live_length(
     monkeypatch: pytest.MonkeyPatch,
     entrypoint: str,
     tokens: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    rope_dim: int,
 ) -> None:
     launches: list[tuple[torch.Size, tuple[int, int, int], dict[str, Any]]] = []
 
@@ -67,8 +77,8 @@ def test_native_fp8_launch_parameters_ignore_live_length(
     monkeypatch.setattr(attention, "_dsa_dense_mfma_kv_kernel", CaptureKernel())
     monkeypatch.setattr(attention, "_dsa_dense_mfma_reduce_kernel", IgnoreReduce())
 
-    q = torch.empty((tokens, 16, 512), dtype=torch.float8_e4m3fn)
-    kv = torch.empty((2051, 512), dtype=torch.float8_e4m3fn)
+    q = torch.empty((tokens, 16, 512 + rope_dim), dtype=q_dtype)
+    kv = torch.empty((2051, 512 + rope_dim), dtype=kv_dtype)
     slots = torch.zeros((tokens, 2051), dtype=torch.int32)
     lengths = torch.empty((tokens,), dtype=torch.int32)
     launch = getattr(attention, entrypoint)
@@ -92,7 +102,7 @@ def test_native_fp8_launch_parameters_ignore_live_length(
             max_seqlen_k=max_seqlen_k,
             qk_nope_head_dim=256,
             kv_lora_rank=512,
-            qk_rope_head_dim=0,
+            qk_rope_head_dim=rope_dim,
             softmax_scale=1.0,
             page_size=64,
         )
@@ -105,9 +115,14 @@ def test_native_fp8_launch_parameters_ignore_live_length(
     assert grid[2] == constants["NUM_KV_SPLITS"]
     assert constants["PHASED_E4M3"] is True
     assert constants["TRIM_EMPTY_TILES"] is True
+    assert constants["FP8_INPUTS"] == (q_dtype != kv_dtype)
+    assert constants["NATIVE_FP8"] == (
+        q_dtype == kv_dtype and q_dtype in attention._FP8_DTYPES
+    )
+    assert constants["NATIVE_E5M2"] == (q_dtype == kv_dtype == torch.float8_e5m2)
 
 
-def test_bf16_fallback_still_trims_selected_width(
+def test_scalar_rank128_still_trims_selected_width(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     widths: list[int] = []
@@ -123,9 +138,9 @@ def test_bf16_fallback_still_trims_selected_width(
         widths.append(topk_slots.shape[1])
         return torch.empty((q.shape[0], q.shape[1], 512), dtype=torch.bfloat16)
 
-    monkeypatch.setattr(attention, "_run_dense_kv", fake_dense)
-    q = torch.empty((1, 16, 512), dtype=torch.bfloat16)
-    kv = torch.empty((2051, 512), dtype=torch.bfloat16)
+    monkeypatch.setattr(attention, "_run_dense_kv_scalar", fake_dense)
+    q = torch.empty((1, 16, 128), dtype=torch.bfloat16)
+    kv = torch.empty((2051, 128), dtype=torch.bfloat16)
     slots = torch.zeros((1, 2051), dtype=torch.int32)
     lengths = torch.ones((1,), dtype=torch.int32)
     for max_seqlen_k in (511, 2051):
@@ -137,7 +152,7 @@ def test_bf16_fallback_still_trims_selected_width(
             topk_lens=lengths,
             max_seqlen_k=max_seqlen_k,
             qk_nope_head_dim=256,
-            kv_lora_rank=512,
+            kv_lora_rank=128,
             qk_rope_head_dim=0,
             softmax_scale=1.0,
             page_size=64,

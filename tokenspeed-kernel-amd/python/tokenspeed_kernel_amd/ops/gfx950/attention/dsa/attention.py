@@ -190,7 +190,7 @@ def _dsa_e4m3_value_4x128(
     """Rescale the running outputs and add four phase-local value products."""
 
     phase: gl.constexpr = 128
-    fp8_max: gl.constexpr = 448.0
+    fp8_max: gl.constexpr = 448.0 if smem_dtype == gl.float8e4nv else 1.0
     alpha_out = gl.convert_layout(alpha, gl.SliceLayout(1, output_layout))
     acc0 *= alpha_out[:, None]
     acc1 *= alpha_out[:, None]
@@ -716,12 +716,13 @@ def _dsa_dense_mfma_kv_kernel(
             next_offs_krope = next_base + local_offs_krope
             next_offs_mma = next_base + local_offs_mma
             next_buf = 1 - cur_buf
-            topk_pos_klora_next = gl.amd.cdna4.buffer_load(
-                ptr=topk_indices,
-                offsets=topk_base.to(tl.int32) + next_offs_klora,
-                mask=next_offs_klora < TOPK,
-                other=-1,
-            )
+            if not PHASED_E4M3:
+                topk_pos_klora_next = gl.amd.cdna4.buffer_load(
+                    ptr=topk_indices,
+                    offsets=topk_base.to(tl.int32) + next_offs_klora,
+                    mask=next_offs_klora < TOPK,
+                    other=-1,
+                )
             topk_pos_krope_next = gl.amd.cdna4.buffer_load(
                 ptr=topk_indices,
                 offsets=topk_base.to(tl.int32) + next_offs_krope,
@@ -734,6 +735,9 @@ def _dsa_dense_mfma_kv_kernel(
                 mask=next_offs_mma < TOPK,
                 other=-1,
             )
+            if PHASED_E4M3:
+                smem_topk.store(topk_pos_mma_next)
+                topk_pos_klora_next = smem_topk.load(gl.SliceLayout(0, blk_klora))
             valid_klora_next = (next_offs_klora < valid_len) & (
                 topk_pos_klora_next >= 0
             )
@@ -830,7 +834,7 @@ def _dsa_dense_mfma_kv_kernel(
         m_i = m_new
         l_i = l_new
         if FP8_INPUTS:
-            # The E4M3-FP8 copy is blocking, so loading into an alternate
+            # Mixed-type conversion is blocking, so loading into an alternate
             # buffer before this tile's matrix work cannot overlap anything.
             # Refill the consumed tile instead, keeping load operands out of
             # the live range of the score/value accumulators.
@@ -1436,13 +1440,13 @@ def _use_native_e4m3_core(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
 ) -> bool:
-    """Select the GLM-5.3 native-E4M3 matrix path."""
+    """Select phase-local products for the supported dense matrix inputs."""
 
     return (
-        q_dtype == torch.float8_e4m3fn
-        and kv_dtype == torch.float8_e4m3fn
+        q_dtype in (torch.bfloat16, *_FP8_DTYPES)
+        and kv_dtype in (torch.bfloat16, *_FP8_DTYPES)
         and int(kv_lora_rank) == 512
-        and int(qk_rope_head_dim) == 0
+        and int(qk_rope_head_dim) in (0, 64)
     )
 
 
@@ -1471,7 +1475,9 @@ def _run_dense_kv(
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
     )
-    fp8_inputs = q.dtype == torch.float8_e4m3fn or kv_cache.dtype == torch.float8_e4m3fn
+    # Direct-to-shared copies preserve the source bits. Mixed inputs must
+    # convert to the common BF16 compute format before their shared store.
+    fp8_inputs = q.dtype != kv_cache.dtype
     native_fp8 = q.dtype == kv_cache.dtype and q.dtype in _FP8_DTYPES
     # Native E4M3 uses the configured selected-key capacity for scheduling.
     # Per-row live/causal lengths stay in topk_lens and are loaded by the
