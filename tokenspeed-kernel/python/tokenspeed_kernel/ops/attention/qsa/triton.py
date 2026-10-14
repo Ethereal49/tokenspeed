@@ -39,7 +39,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 _is_nvidia = current_platform().is_nvidia
 _PERSISTENT_TOPK_WORKSPACE_BYTES = 1024 * 1024
-_SCORE_CTAS_PER_SM = 12
+_SCORE_TARGET_CTAS_PER_SM = 12
 LOG2E = math.log2(math.e)
 
 
@@ -1873,14 +1873,14 @@ def triton_qsa_block_scores(
     # limiting a B300 SM to one CTA. 128 blocks leave room for concurrent CTAs.
     block_n = 128
     query_groups = rows // query_group_size
-    # Cap scheduling overhead independently of context capacity. The device
-    # loop covers longer frontiers without changing a captured graph's grid.
-    # Twelve CTAs/SM give about 2-3 waves for grouped 4x128 BF16 decode on
-    # Blackwell, where the scoring kernel can keep five CTAs resident per SM.
-    target_programs = _SCORE_CTAS_PER_SM * current_platform().sm_count
+    # Target a bounded launch size to limit scheduling overhead. The device
+    # loop covers longer frontiers without growing a captured graph's grid.
+    # Waves depend on actual residency: 12 launched CTAs/SM take about 2-3
+    # waves when five CTAs are resident per SM.
+    target_ctas = _SCORE_TARGET_CTAS_PER_SM * current_platform().sm_count
     tile_programs = min(
         triton.cdiv(num_blocks, block_n),
-        max(1, triton.cdiv(target_programs, query_groups)),
+        max(1, triton.cdiv(target_ctas, query_groups)),
     )
     _qwen4_exp_qsa_score_blocks_kernel[(query_groups, tile_programs)](
         query,
