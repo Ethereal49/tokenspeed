@@ -210,7 +210,6 @@ def ragged_decode_topk(
     max_seq_len: int | None = None,
     q_len_per_req: int,
     enable_pdl: bool,
-    lengths_independent: bool,
 ) -> None:
     """Select per-row top-``topk`` local offsets over ragged (length-aware) logits.
 
@@ -225,27 +224,21 @@ def ragged_decode_topk(
         max_seq_len: Max scanned columns; defaults to ``logits.shape[1]``.
         q_len_per_req: Query rows per request (speculative decode); 1 for decode.
         enable_pdl: Enable programmatic CUDA launch dependencies.
-        lengths_independent: Lengths are ready independently of the preceding
-            kernel. Copies and casts disable prefetch of the converted lengths.
 
     Raises:
         RuntimeError: if the CUDA persistent kernel is unavailable.
     """
     if not has_ragged_decode_topk():
         raise RuntimeError("length-aware DSA decode top-k is unavailable.")
-    normalized_lengths = lengths.to(torch.int32).contiguous().reshape(-1)
     persistent_topk(
         logits.contiguous(),
-        normalized_lengths,
+        lengths.to(torch.int32).contiguous().reshape(-1),
         out,
         workspace,
         int(topk),
         int(logits.shape[1] if max_seq_len is None else max_seq_len),
         int(q_len_per_req),
         enable_pdl=enable_pdl,
-        lengths_independent=(
-            lengths_independent and normalized_lengths.data_ptr() == lengths.data_ptr()
-        ),
     )
 
 

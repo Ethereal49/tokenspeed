@@ -97,11 +97,10 @@ if current_platform().is_amd:
         page_size: int,
         queries_per_request: int | None,
         enable_pdl: bool,
-        metadata_independent: bool,
     ) -> torch.Tensor:
         # The kernel finds each tile's request runs itself, and GFX950 has no
         # programmatic dependent launch.
-        del queries_per_request, enable_pdl, metadata_independent
+        del queries_per_request, enable_pdl
         return launch_gluon_qsa_block_scores_gfx950(
             query,
             key_cache,
@@ -133,10 +132,9 @@ if current_platform().is_amd:
         lengths: torch.Tensor,
         persistent_workspace: torch.Tensor | None,
         enable_pdl: bool,
-        lengths_independent: bool,
     ) -> torch.Tensor:
         # GFX950 selection uses per-CTA scratch and has no PDL dependency wait.
-        del persistent_workspace, enable_pdl, lengths_independent
+        del persistent_workspace, enable_pdl
         return launch_gluon_qsa_block_topk_select_gfx950(logits, topk, lengths=lengths)
 
     __all__ = [

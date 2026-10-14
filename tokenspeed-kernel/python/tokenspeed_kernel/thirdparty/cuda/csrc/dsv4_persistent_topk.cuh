@@ -1078,10 +1078,8 @@ namespace persistent {
 namespace impl = tokenspeed::device::topk;
 
 constexpr int kThreadsPerBlock = impl::TopKConfig::kBlockSize;
-constexpr uint32_t kRegister2MaxSeqLen =
-    impl::TopKRegister<2>::kMaxSeqLen;
-constexpr uint32_t kRegister4MaxSeqLen =
-    impl::TopKRegister<4>::kMaxSeqLen;
+constexpr uint32_t kRegister2MaxSeqLen = impl::TopKRegister<2>::kMaxSeqLen;
+constexpr uint32_t kRegister4MaxSeqLen = impl::TopKRegister<4>::kMaxSeqLen;
 constexpr uint32_t kClusterSize = 8;
 constexpr uint32_t kClusterFloor = 32768;
 // A 9-bit coarse histogram minimizes fixed histogram work through 64K. Longer
@@ -1103,7 +1101,6 @@ struct PersistentTopKParams {
   uint32_t top_k;
   uint32_t max_seq_len;
   uint32_t q_len_per_req;
-  bool lengths_independent;
 };
 
 template <int TopK, int Level, bool kUsePDL, int kMinBlocksPerSm>
@@ -1115,17 +1112,13 @@ __global__ void __launch_bounds__(kThreadsPerBlock, kMinBlocksPerSm)
   const uint32_t row = blockIdx.x;
   if (row >= params.num_rows) return;
 
-  if constexpr (kUsePDL) {
-    if (!params.lengths_independent) {
-      tokenspeed::device::PDLWaitPrimary<true>();
-    }
-  }
+  // Lengths and scores may both be produced by the preceding kernel.
+  tokenspeed::device::PDLWaitPrimary<kUsePDL>();
   const uint32_t seq_len =
       dsa_topk_row_seq_len(params.lengths, row, params.q_len_per_req);
   int32_t* row_output = params.output + row * params.top_k;
   if (seq_len <= static_cast<uint32_t>(TopK)) {
     // Empty and short rows still participate in the dependency chain.
-    tokenspeed::device::PDLWaitPrimary<kUsePDL>();
     for (uint32_t i = threadIdx.x; i < static_cast<uint32_t>(TopK);
          i += kThreadsPerBlock) {
       row_output[i] = i < seq_len ? static_cast<int32_t>(i) : -1;
@@ -1151,14 +1144,14 @@ __global__ void __launch_bounds__(kThreadsPerBlock, kMinBlocksPerSm)
   };
 
   if constexpr (Level == 0) {
-    Register2::forward<kUsePDL>(problem, &smem);
+    Register2::forward<false>(problem, &smem);
   } else if constexpr (Level == 1) {
-    Register4::forward<kUsePDL>(problem, &smem);
+    Register4::forward<false>(problem, &smem);
   } else {
     if (seq_len <= kRegister4MaxSeqLen) {
-      Register4::forward<kUsePDL>(problem, &smem);
+      Register4::forward<false>(problem, &smem);
     } else {
-      Streaming::forward<kUsePDL>(problem, &smem);
+      Streaming::forward<false>(problem, &smem);
     }
   }
   tokenspeed::device::PDLTriggerSecondary<kUsePDL>();
@@ -1175,18 +1168,14 @@ __device__ __forceinline__ void cluster_topk_body(PersistentTopKParams params,
   if (row >= params.num_rows) return;
   const uint32_t rank = blockIdx.y;
   const uint32_t worker_rank = row % Cluster::kClusterSize;
-  if constexpr (kUsePDL) {
-    if (!params.lengths_independent) {
-      tokenspeed::device::PDLWaitPrimary<true>();
-    }
-  }
+  // Lengths and scores may both be produced by the preceding kernel.
+  tokenspeed::device::PDLWaitPrimary<kUsePDL>();
   const uint32_t seq_len =
       dsa_topk_row_seq_len(params.lengths, row, params.q_len_per_req);
   int32_t* row_output = params.output + row * params.top_k;
   const auto cluster = cooperative_groups::this_cluster();
 
   if (seq_len <= static_cast<uint32_t>(TopK)) {
-    tokenspeed::device::PDLWaitPrimary<kUsePDL>();
     if (rank == worker_rank) {
       for (uint32_t i = threadIdx.x; i < static_cast<uint32_t>(TopK);
            i += kThreadsPerBlock) {
@@ -1208,11 +1197,11 @@ __device__ __forceinline__ void cluster_topk_body(PersistentTopKParams params,
   };
 
   if (seq_len <= kRegister4MaxSeqLen) {
-    if (rank == worker_rank) Register4::forward<kUsePDL>(problem, smem);
+    if (rank == worker_rank) Register4::forward<false>(problem, smem);
   } else if (seq_len <= kClusterFloor) {
-    if (rank == worker_rank) Streaming::forward<kUsePDL>(problem, smem);
+    if (rank == worker_rank) Streaming::forward<false>(problem, smem);
   } else {
-    Cluster::template forward<kUsePDL>(problem, smem);
+    Cluster::template forward<false>(problem, smem);
     // Cluster::forward's last DSMEM consumer is already preceded by a
     // cluster-wide barrier. Once it returns, each CTA only completes local or
     // global-memory writes, and kernel completion provides the launch-wide

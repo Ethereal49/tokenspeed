@@ -298,7 +298,6 @@ def _decode_topk(
             topk,
             logits.shape[1],
             enable_pdl=False,
-            lengths_independent=False,
             q_len_per_req=1,
         )
         return out

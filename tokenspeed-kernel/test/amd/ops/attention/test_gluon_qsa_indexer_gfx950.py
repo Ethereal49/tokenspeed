@@ -156,7 +156,6 @@ def test_qsa_indexer_public_ops_match_portable_solution() -> None:
         page_size=_PAGE_SIZE,
         queries_per_request=4,
         enable_pdl=False,
-        metadata_independent=True,
     )
     gluon = qsa_block_scores(
         query,
@@ -185,7 +184,6 @@ def test_qsa_indexer_public_ops_match_portable_solution() -> None:
         lengths=complete,
         persistent_workspace=None,
         enable_pdl=False,
-        lengths_independent=True,
     )
     ids = qsa_block_topk_select(
         portable, 256, **select_kwargs, override=None, solution=None

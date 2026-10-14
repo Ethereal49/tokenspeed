@@ -197,12 +197,9 @@ arithmetic without changing the launch grid, logits capacity or Top-K scan.
 
 ### Persistent CUDA top-k dependencies
 
-`ragged_decode_topk` requires explicit `enable_pdl` and
-`lengths_independent` arguments. With PDL, independent lengths and histogram
-initialization may precede the score dependency wait; scores and output stores
-remain protected, including empty and short rows. A length copy or cast makes
-the converted lengths producer-owned and disables that preload. Cluster and
-single-CTA launches both honor the PDL flag.
+`ragged_decode_topk` requires an explicit `enable_pdl` argument. With PDL,
+selection waits at entry before reading lengths or scores, including empty and
+short rows. Cluster and single-CTA launches both honor the PDL flag.
 
 For non-cluster PDL grids with no more rows than SMs, the launcher selects a
 one-block register budget to reduce packing of waiting CTAs. Larger grids keep

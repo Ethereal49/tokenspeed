@@ -787,7 +787,6 @@ def test_qwen4_exp_qsa_block_topk_matches_torch(device: str) -> None:
         algorithm="stream",
         persistent_topk_workspace=None,
         enable_pdl=False,
-        metadata_independent=False,
     )
 
     block_ids = torch.arange(num_blocks, device=device)
@@ -848,7 +847,6 @@ def test_qwen4_exp_qsa_block_topk_two_stage_merge_matches_torch(device: str) -> 
         algorithm="stream",
         persistent_topk_workspace=None,
         enable_pdl=False,
-        metadata_independent=False,
     )
 
     block_ids = torch.arange(num_blocks, device=device)
@@ -972,7 +970,6 @@ def test_qwen4_exp_qsa_scores_leave_invalid_blocks_unwritten(
         BLOCK_D=32,
         QUERY_GROUP_SIZE=query_group_size,
         ENABLE_PDL=False,
-        METADATA_INDEPENDENT=True,
         num_warps=4,
         num_stages=2,
     )
@@ -1025,7 +1022,6 @@ def test_qwen4_exp_qsa_score_grid_refreshes_without_recompile(device: str) -> No
             BLOCK_D=dim,
             QUERY_GROUP_SIZE=width,
             ENABLE_PDL=False,
-            METADATA_INDEPENDENT=True,
             num_warps=4,
             num_stages=2,
         )
@@ -1142,7 +1138,6 @@ def test_qwen4_exp_qsa_grouped_scores_match_independent_queries(
                 algorithm="logits",
                 persistent_topk_workspace=None,
                 enable_pdl=False,
-                metadata_independent=False,
             )
         )
     expected = torch.stack(
@@ -1203,7 +1198,6 @@ def test_qwen4_exp_qsa_grouped_scores_refresh_during_graph_replay(
             algorithm="logits",
             persistent_topk_workspace=None,
             enable_pdl=False,
-            metadata_independent=False,
         )
 
     forward(width)
@@ -1279,7 +1273,6 @@ def test_qwen4_exp_qsa_long_query_groups_match_independent_rows(
                 algorithm="logits",
                 persistent_topk_workspace=None,
                 enable_pdl=False,
-                metadata_independent=False,
             )
         )
     expected = torch.stack(
@@ -1321,7 +1314,6 @@ def test_qwen4_exp_qsa_rejects_invalid_query_width(
             algorithm="logits",
             persistent_topk_workspace=None,
             enable_pdl=False,
-            metadata_independent=False,
         )
 
 
@@ -1363,7 +1355,6 @@ def test_qwen4_exp_qsa_block_topk_logits_matches_stream(device: str) -> None:
         complete_blocks,
         algorithm="stream",
         **kwargs,
-        metadata_independent=False,
     )
     logits = qwen4_exp_qsa_block_topk(
         query,
@@ -1373,7 +1364,6 @@ def test_qwen4_exp_qsa_block_topk_logits_matches_stream(device: str) -> None:
         complete_blocks,
         algorithm="logits",
         **kwargs,
-        metadata_independent=False,
     )
 
     # The two solutions break fp32 score ties in opposite directions, so
@@ -1395,9 +1385,8 @@ def test_qwen4_exp_qsa_block_topk_logits_matches_stream(device: str) -> None:
         )
 
 
-@pytest.mark.parametrize("metadata_independent", [False, True])
 def test_qwen4_exp_qsa_block_topk_logits_dispatches_persistent_radix(
-    device: str, monkeypatch, metadata_independent: bool
+    device: str, monkeypatch
 ) -> None:
     rows, heads, head_dim, page_size = 2, 4, 16, 64
     block_topk = 512
@@ -1422,7 +1411,6 @@ def test_qwen4_exp_qsa_block_topk_logits_dispatches_persistent_radix(
         workspace,
         max_seq_len,
         enable_pdl,
-        lengths_independent,
         q_len_per_req,
     ):
         calls.update(
@@ -1432,7 +1420,6 @@ def test_qwen4_exp_qsa_block_topk_logits_dispatches_persistent_radix(
             workspace=workspace,
             max_seq_len=max_seq_len,
             enable_pdl=enable_pdl,
-            lengths_independent=lengths_independent,
             q_len_per_req=q_len_per_req,
         )
         out.fill_(7)
@@ -1466,7 +1453,6 @@ def test_qwen4_exp_qsa_block_topk_logits_dispatches_persistent_radix(
         algorithm="logits",
         persistent_topk_workspace=workspace,
         enable_pdl=False,
-        metadata_independent=metadata_independent,
     )
 
     assert torch.equal(actual, torch.full_like(actual, 7))
@@ -1476,7 +1462,6 @@ def test_qwen4_exp_qsa_block_topk_logits_dispatches_persistent_radix(
     assert calls["workspace"] is workspace
     assert calls["max_seq_len"] == num_blocks
     assert calls["enable_pdl"] is False
-    assert calls["lengths_independent"] is metadata_independent
     assert calls["q_len_per_req"] == 1
 
 
@@ -1501,7 +1486,6 @@ def test_qwen4_exp_qsa_registered_selection_ignores_uninitialized_tails(
         page_size=page_size,
         queries_per_request=rows,
         enable_pdl=False,
-        metadata_independent=True,
         override=None,
         solution="triton",
     )
@@ -1513,7 +1497,6 @@ def test_qwen4_exp_qsa_registered_selection_ignores_uninitialized_tails(
         lengths=complete,
         persistent_workspace=None,
         enable_pdl=False,
-        lengths_independent=True,
         override=None,
         solution="triton",
     )
@@ -1559,7 +1542,6 @@ def test_qwen4_exp_qsa_compact_logits_shorter_than_persistent_topk(
             1024 * 1024, device=device, dtype=torch.uint8
         ),
         enable_pdl=False,
-        metadata_independent=False,
     )
     for row, count in enumerate(complete.tolist()):
         ids = selected[row][selected[row] >= 0].sort().values
@@ -1612,7 +1594,6 @@ def test_qwen4_exp_qsa_block_topk_logits_persistent_radix_matches_stream(
         algorithm="stream",
         persistent_topk_workspace=None,
         **kwargs,
-        metadata_independent=False,
     )
     logits = qwen4_exp_qsa_block_topk(
         query,
@@ -1623,7 +1604,6 @@ def test_qwen4_exp_qsa_block_topk_logits_persistent_radix_matches_stream(
         algorithm="logits",
         persistent_topk_workspace=workspace,
         **kwargs,
-        metadata_independent=False,
     )
 
     scores_per_row = _block_topk_reference_scores(
@@ -1730,7 +1710,6 @@ def test_qwen4_exp_qsa_block_topk_reads_strided_inputs(device: str) -> None:
             algorithm=algorithm,
             persistent_topk_workspace=None,
             enable_pdl=False,
-            metadata_independent=False,
         )
         packed = qwen4_exp_qsa_block_topk(
             query.contiguous(),
@@ -1745,7 +1724,6 @@ def test_qwen4_exp_qsa_block_topk_reads_strided_inputs(device: str) -> None:
             algorithm=algorithm,
             persistent_topk_workspace=None,
             enable_pdl=False,
-            metadata_independent=False,
         )
         torch.testing.assert_close(strided, packed)
 

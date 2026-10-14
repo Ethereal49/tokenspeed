@@ -160,7 +160,6 @@ def persistent_topk(
     q_len_per_req: int,
     *,
     enable_pdl: bool,
-    lengths_independent: bool,
 ) -> None:
     """Select ragged row indices with optional CUDA launch dependencies.
 
@@ -173,13 +172,10 @@ def persistent_topk(
         max_seq_len: Maximum columns scanned by a row.
         q_len_per_req: Query rows per request; 1 selects per-row lengths.
         enable_pdl: Enable CUDA programmatic launch dependencies.
-        lengths_independent: Lengths are ready independently of the preceding
-            kernel. Length copies/casts disable prefetch of the converted tensor.
 
     Returns:
         None. Writes selected indices to ``output`` in place.
     """
-    original_lengths = lengths
     if logits.dtype != torch.float32:
         raise TypeError(f"logits must be float32, got {logits.dtype}")
     if lengths.dtype != torch.int32:
@@ -201,5 +197,4 @@ def persistent_topk(
         int(max_seq_len),
         int(q_len_per_req),
         bool(enable_pdl),
-        bool(lengths_independent and lengths.data_ptr() == original_lengths.data_ptr()),
     )

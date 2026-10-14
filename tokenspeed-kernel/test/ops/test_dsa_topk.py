@@ -49,7 +49,6 @@ from tokenspeed_kernel.ops.attention.dsa.cute_dsl import (
 )
 from tokenspeed_kernel.ops.attention.dsa.deep_gemm import _prepare_logits_for_topk
 from tokenspeed_kernel.ops.attention.dsa.triton import combine_topk_weights
-from tokenspeed_kernel.thirdparty.cuda import dsv4_attention as cuda_topk
 
 requires_kernel = pytest.mark.skipif(
     not (torch.cuda.is_available() and has_cute_dsl_decode_topk()),
@@ -64,28 +63,13 @@ requires_cuda = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 # Wrapper dispatch (CPU, monkeypatched kernels)
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize(
-    "length_dtype, strided",
-    [(torch.int32, False), (torch.int64, False), (torch.int32, True)],
-)
-def test_ragged_decode_topk_delegates_to_persistent_topk(
-    monkeypatch, length_dtype, strided
-):
+def test_ragged_decode_topk_delegates_to_persistent_topk(monkeypatch):
     calls = {}
 
     monkeypatch.setattr(cuda_dsa_topk, "has_persistent_topk", lambda: True)
 
     def fake_persistent_topk(
-        logits,
-        lengths,
-        output,
-        workspace,
-        k,
-        max_seq_len,
-        q_len_per_req,
-        *,
-        enable_pdl,
-        lengths_independent,
+        logits, lengths, output, workspace, k, max_seq_len, q_len_per_req, *, enable_pdl
     ):
         calls["logits"] = logits
         calls["lengths"] = lengths
@@ -93,16 +77,12 @@ def test_ragged_decode_topk_delegates_to_persistent_topk(
         calls["k"] = k
         calls["max_seq_len"] = max_seq_len
         calls["q_len_per_req"] = q_len_per_req
-        calls["enable_pdl"] = enable_pdl
-        calls["lengths_independent"] = lengths_independent
         output.fill_(7)
 
     monkeypatch.setattr(cuda_dsa_topk, "persistent_topk", fake_persistent_topk)
 
     logits = torch.randn(2, 8, dtype=torch.float32)
-    lengths = torch.tensor([[3, 0], [6, 0]], dtype=length_dtype)[:, :1]
-    if not strided:
-        lengths = lengths.contiguous()
+    lengths = torch.tensor([[3], [6]], dtype=torch.int64)
     output = torch.empty(2, 4, dtype=torch.int32)
     workspace = torch.empty(32, dtype=torch.uint8)
 
@@ -113,9 +93,8 @@ def test_ragged_decode_topk_delegates_to_persistent_topk(
         lengths=lengths,
         workspace=workspace,
         max_seq_len=8,
-        enable_pdl=True,
-        lengths_independent=True,
         q_len_per_req=1,
+        enable_pdl=False,
     )
 
     assert torch.equal(output, torch.full_like(output, 7))
@@ -125,8 +104,6 @@ def test_ragged_decode_topk_delegates_to_persistent_topk(
     assert calls["k"] == 4
     assert calls["max_seq_len"] == 8
     assert calls["q_len_per_req"] == 1
-    assert calls["enable_pdl"] is True
-    assert calls["lengths_independent"] == (length_dtype == torch.int32 and not strided)
 
 
 def test_ragged_decode_topk_raises_when_persistent_kernel_unavailable(monkeypatch):
@@ -146,7 +123,6 @@ def test_ragged_decode_topk_raises_when_persistent_kernel_unavailable(monkeypatc
             workspace=workspace,
             max_seq_len=8,
             enable_pdl=False,
-            lengths_independent=False,
             q_len_per_req=1,
         )
 
@@ -395,36 +371,3 @@ def test_prepare_logits_for_topk_passthrough_still_scrubs():
     cube = torch.full((2, 3, 4), float("nan"))
     assert _prepare_logits_for_topk(cube) is cube
     assert (cube == float("-inf")).all()
-
-
-@pytest.mark.parametrize(
-    "length_dtype, strided",
-    [(torch.int32, False), (torch.int64, False), (torch.int32, True)],
-)
-def test_persistent_topk_length_conversion_guards_preload(
-    monkeypatch, length_dtype, strided
-):
-    calls = []
-    module = SimpleNamespace(dsv4_persistent_topk=lambda *args: calls.append(args))
-    monkeypatch.setattr(cuda_topk, "_load_dsv4_attention_module", lambda: module)
-    logits = torch.randn(2, 8)
-    lengths = torch.tensor([[3, 0], [6, 0]], dtype=length_dtype)[:, 0]
-    if not strided:
-        lengths = lengths.contiguous()
-    output = torch.empty(2, 512, dtype=torch.int32)
-    workspace = torch.empty(32, dtype=torch.uint8)
-    cuda_topk.persistent_topk(
-        logits,
-        lengths,
-        output,
-        workspace,
-        512,
-        8,
-        1,
-        enable_pdl=True,
-        lengths_independent=True,
-    )
-    assert len(calls) == 1
-    assert calls[0][-2] is True
-    assert calls[0][-1] == (length_dtype == torch.int32 and not strided)
-    torch.testing.assert_close(calls[0][1], torch.tensor([3, 6], dtype=torch.int32))

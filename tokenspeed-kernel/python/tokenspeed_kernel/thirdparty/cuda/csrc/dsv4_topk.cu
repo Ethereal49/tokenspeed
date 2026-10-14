@@ -551,7 +551,7 @@ template <int TopK, bool kUsePDL>
 void launch_persistent_topk(const TensorView& logits, const TensorView& lengths,
                             TensorView& output, TensorView& workspace,
                             int64_t max_seq_len, int64_t q_len_per_req,
-                            bool lengths_independent, cudaStream_t stream) {
+                            cudaStream_t stream) {
   namespace P = vllm::persistent;
 
   const int64_t num_rows = logits.size(0);
@@ -567,7 +567,6 @@ void launch_persistent_topk(const TensorView& logits, const TensorView& lengths,
   params.top_k = static_cast<uint32_t>(TopK);
   params.max_seq_len = static_cast<uint32_t>(max_seq_len);
   params.q_len_per_req = static_cast<uint32_t>(q_len_per_req);
-  params.lengths_independent = lengths_independent;
 
   cudaError_t launch_error = cudaSuccess;
   const bool use_cluster =
@@ -625,16 +624,13 @@ template <int TopK>
 void LaunchPersistentTopK(const TensorView& logits, const TensorView& lengths,
                           TensorView& output, TensorView& workspace,
                           int64_t max_seq_len, int64_t q_len_per_req,
-                          bool enable_pdl, bool lengths_independent,
-                          cudaStream_t stream) {
+                          bool enable_pdl, cudaStream_t stream) {
   if (enable_pdl) {
     launch_persistent_topk<TopK, true>(logits, lengths, output, workspace,
-                                       max_seq_len, q_len_per_req,
-                                       lengths_independent, stream);
+                                       max_seq_len, q_len_per_req, stream);
   } else {
     launch_persistent_topk<TopK, false>(logits, lengths, output, workspace,
-                                        max_seq_len, q_len_per_req,
-                                        lengths_independent, stream);
+                                        max_seq_len, q_len_per_req, stream);
   }
 }
 
@@ -643,7 +639,7 @@ void LaunchPersistentTopK(const TensorView& logits, const TensorView& lengths,
 void dsv4_persistent_topk(TensorView logits, TensorView lengths,
                           TensorView output, TensorView workspace, int64_t k,
                           int64_t max_seq_len, int64_t q_len_per_req,
-                          bool enable_pdl, bool lengths_independent) {
+                          bool enable_pdl) {
   CHECK_CUDA(logits);
   CHECK_CUDA(lengths);
   CHECK_CUDA(output);
@@ -678,15 +674,12 @@ void dsv4_persistent_topk(TensorView logits, TensorView lengths,
   cudaStream_t stream = get_stream(logits.device());
   if (k == 512) {
     LaunchPersistentTopK<512>(logits, lengths, output, workspace, max_seq_len,
-                              q_len_per_req, enable_pdl, lengths_independent,
-                              stream);
+                              q_len_per_req, enable_pdl, stream);
   } else if (k == 1024) {
     LaunchPersistentTopK<1024>(logits, lengths, output, workspace, max_seq_len,
-                               q_len_per_req, enable_pdl, lengths_independent,
-                               stream);
+                               q_len_per_req, enable_pdl, stream);
   } else {
     LaunchPersistentTopK<2048>(logits, lengths, output, workspace, max_seq_len,
-                               q_len_per_req, enable_pdl, lengths_independent,
-                               stream);
+                               q_len_per_req, enable_pdl, stream);
   }
 }

@@ -186,7 +186,6 @@ def test_qsa_selection_waits_for_query_cache_and_metadata(
             algorithm=algorithm,
             persistent_topk_workspace=None,
             enable_pdl=enable_pdl,
-            metadata_independent=False,
         )
         slots = qwen4_exp_qsa_selected_slots(
             selected,
@@ -321,7 +320,7 @@ def test_qsa_attention_waits_for_slots_and_kv(
 
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("persistent", [False, True])
-def test_qsa_selection_prefetches_ready_metadata(enabled, persistent, restore_pdl):
+def test_qsa_selection_refreshes_block_frontiers(enabled, persistent, restore_pdl):
     if persistent and not has_ragged_decode_topk():
         pytest.skip("CUDA persistent top-k is unavailable")
     batch, width, heads, dim, page_size, blocks = 3, 4, 4, 128, 64, 17408
@@ -358,7 +357,6 @@ def test_qsa_selection_prefetches_ready_metadata(enabled, persistent, restore_pd
             algorithm="logits",
             persistent_topk_workspace=workspace,
             enable_pdl=enable_pdl,
-            metadata_independent=True,
         )
 
     forward(enabled)
@@ -382,46 +380,50 @@ def test_qsa_selection_prefetches_ready_metadata(enabled, persistent, restore_pd
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("lengths_independent", [False, True])
+@pytest.mark.parametrize(
+    "length_dtype, length_stride",
+    [(torch.int32, 1), (torch.int64, 1), (torch.int32, 2)],
+)
 @pytest.mark.parametrize("q_len_per_req", [1, 4])
 @pytest.mark.parametrize(
     "rows, columns", [(4, 4096), (36, 16384), (36, 65536), (4, 65536)]
 )
 def test_persistent_topk_waits_for_producers(
-    enabled, lengths_independent, q_len_per_req, rows, columns, restore_pdl
+    enabled, length_dtype, length_stride, q_len_per_req, rows, columns, restore_pdl
 ):
     if not has_ragged_decode_topk():
         pytest.skip("CUDA persistent top-k is unavailable")
     logits = torch.randn(rows, columns, device="cuda")
     length_values = torch.tensor(
-        [0, 1, 511, 512, 513, 8192, 8193, columns], device="cuda", dtype=torch.int32
+        [0, 1, 511, 512, 513, 8192, 8193, columns], device="cuda", dtype=length_dtype
     ).clamp_max(columns)
-    lengths = length_values[
-        torch.arange(rows // q_len_per_req, device="cuda") % length_values.numel()
-    ].clone()
+    length_storage = torch.zeros(
+        rows // q_len_per_req * length_stride, device="cuda", dtype=length_dtype
+    )
+    lengths = length_storage[::length_stride]
+    lengths.copy_(
+        length_values[
+            torch.arange(rows // q_len_per_req, device="cuda") % length_values.numel()
+        ]
+    )
     lengths[-1] = columns
     target_logits = torch.empty_like(logits)
-    target_lengths = torch.empty_like(lengths)
+    target_length_storage = torch.empty_like(length_storage)
+    target_lengths = target_length_storage[::length_stride]
     output = torch.empty(rows, 512, device="cuda", dtype=torch.int32)
     workspace = torch.empty(1024 * 1024, device="cuda", dtype=torch.uint8)
 
     def forward(enable_pdl):
-        if lengths_independent:
-            _publish((logits,), (target_logits,))
-            current_lengths = lengths
-        else:
-            _publish((logits, lengths), (target_logits, target_lengths))
-            current_lengths = target_lengths
+        _publish((logits, length_storage), (target_logits, target_length_storage))
         ragged_decode_topk(
             target_logits,
             output,
             512,
-            lengths=current_lengths,
+            lengths=target_lengths,
             workspace=workspace,
             max_seq_len=columns,
             q_len_per_req=q_len_per_req,
             enable_pdl=enable_pdl,
-            lengths_independent=lengths_independent,
         )
         return output
 
@@ -429,7 +431,9 @@ def test_persistent_topk_waits_for_producers(
     graph = torch.cuda.CUDAGraph(keep_graph=True)
     with torch.cuda.graph(graph):
         actual = forward(enabled)
-    _check_graph_edges(graph, enabled)
+    # Length conversions add ordinary edges; the identity case checks PDL edges.
+    if length_dtype == torch.int32 and length_stride == 1:
+        _check_graph_edges(graph, enabled)
     for step in range(3):
         logits.normal_()
         lengths.copy_(
@@ -471,7 +475,6 @@ def test_persistent_topk_pdl_register_budget(enabled, large_grid, restore_pdl):
             workspace=workspace,
             max_seq_len=65536,
             enable_pdl=enabled,
-            lengths_independent=True,
             q_len_per_req=1,
         )
 

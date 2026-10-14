@@ -370,7 +370,6 @@ class QSAIndexer(nn.Module):
             algorithm=self._topk_algorithm(q.shape[0], qsa_page_table, page_size),
             persistent_topk_workspace=self._persistent_topk_workspace,
             enable_pdl=enable_pdl,
-            metadata_independent=True,
         )
         return qwen4_exp_qsa_selected_slots(
             selected_blocks,

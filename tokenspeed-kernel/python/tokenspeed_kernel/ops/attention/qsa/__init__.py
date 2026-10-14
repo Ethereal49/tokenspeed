@@ -231,7 +231,6 @@ def qsa_block_scores(
     page_size: int,
     queries_per_request: int | None,
     enable_pdl: bool,
-    metadata_independent: bool,
     override: str | None,
     solution: str | None,
 ) -> torch.Tensor:
@@ -249,9 +248,6 @@ def qsa_block_scores(
             for ragged layouts; implementations may share key tiles within
             these runs.
         enable_pdl: Use programmatic dependent launch where supported.
-        metadata_independent: Request indices, complete-block counts and page
-            tables are ready independently of the preceding Q/K producer;
-            implementations may preload them before the PDL wait.
         override: Optional registered kernel name.
         solution: Optional kernel solution.
 
@@ -281,7 +277,6 @@ def qsa_block_scores(
         page_size=page_size,
         queries_per_request=queries_per_request,
         enable_pdl=enable_pdl,
-        metadata_independent=metadata_independent,
     )
 
 
@@ -292,7 +287,6 @@ def qsa_block_topk_select(
     lengths: torch.Tensor,
     persistent_workspace: torch.Tensor | None,
     enable_pdl: bool,
-    lengths_independent: bool,
     override: str | None,
     solution: str | None,
 ) -> torch.Tensor:
@@ -307,8 +301,6 @@ def qsa_block_topk_select(
         persistent_workspace: Optional caller-owned CUDA uint8 workspace of
             at least 1 MiB for implementations that keep persistent state.
         enable_pdl: Use programmatic dependent launch where supported.
-        lengths_independent: Lengths are ready independently of the preceding
-            score producer; implementations may preload them before waiting.
         override: Optional registered kernel name.
         solution: Optional kernel solution.
 
@@ -332,7 +324,6 @@ def qsa_block_topk_select(
         lengths=lengths,
         persistent_workspace=persistent_workspace,
         enable_pdl=enable_pdl,
-        lengths_independent=lengths_independent,
     )
 
 
@@ -408,7 +399,6 @@ def qwen4_exp_qsa_block_topk(
     algorithm: str,
     persistent_topk_workspace: torch.Tensor | None,
     enable_pdl: bool,
-    metadata_independent: bool,
 ) -> torch.Tensor:
     """Select the highest-scoring compressed blocks for each query row.
 
@@ -439,10 +429,6 @@ def qwen4_exp_qsa_block_topk(
             otherwise selection falls back to portable Triton.
         enable_pdl: Wait for query/cache/metadata producers and release
             successor setup early between scoring and selection on NVIDIA GPUs.
-        metadata_independent: Request indices, complete-block counts and page
-            tables are ready independently of the preceding Q/K producer. The
-            logits algorithm may preload them before waiting; the streaming
-            algorithm retains its entry wait.
 
     Returns:
         Int32 block ids shaped ``[rows, block_topk]``, in no particular order;
@@ -478,7 +464,6 @@ def qwen4_exp_qsa_block_topk(
             page_size=page_size,
             queries_per_request=queries_per_request,
             enable_pdl=enable_pdl,
-            metadata_independent=metadata_independent,
             override=None,
             solution=None,
         )
@@ -488,7 +473,6 @@ def qwen4_exp_qsa_block_topk(
             lengths=complete_blocks,
             persistent_workspace=persistent_topk_workspace,
             enable_pdl=enable_pdl,
-            lengths_independent=metadata_independent,
             override=None,
             solution=None,
         )
