@@ -244,7 +244,7 @@ def test_moe_topk_row_count():
 
 
 def test_iris_allreduce_sizes():
-    pytest.importorskip("iris")
+    pytest.importorskip("tokenspeed_kernel.ops.communication._iris")
     from tokenspeed_kernel._triton import gl
     from tokenspeed_kernel.ops.communication._iris import all_reduce as comm
 
