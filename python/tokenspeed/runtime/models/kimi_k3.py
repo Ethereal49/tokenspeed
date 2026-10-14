@@ -69,7 +69,10 @@ from tokenspeed_kernel.ops.activation.triton import (
     rmsnorm_gated_sigmoid,
     sigmoid_mul,
 )
-from tokenspeed_kernel.ops.attention.mla import mla_normalize_project_query
+from tokenspeed_kernel.ops.attention.mla import (
+    mla_normalize_project_query,
+    validate_mla_query_projection,
+)
 from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
 from tokenspeed_kernel.ops.communication.flashinfer import get_flashinfer_moe_alltoall
 from tokenspeed_kernel.ops.gemm import (
@@ -86,7 +89,7 @@ from tokenspeed_kernel.ops.moe import (
     latent_moe_decode_pipeline_available,
     latent_moe_input_projections,
 )
-from tokenspeed_kernel.ops.moe.latent_down import KimiK3LatentDownOp
+from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import KimiK3LatentDownOp
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.ops.residual import attn_res_fwd, attn_res_fwd_available
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
@@ -506,6 +509,19 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             prefix=prefix,
             reduce_attn_results=reduce_attn_results,
         )
+
+        if (
+            self.use_output_gate
+            and self.q_b_proj.weight.dtype not in _FP8_WEIGHT_DTYPES
+        ):
+            validate_mla_query_projection(
+                self.fused_qk_layernorm.weight_q_a,
+                self.fused_qk_layernorm.weight_kv_a,
+                self.q_b_proj.weight,
+                eps=self.q_a_layernorm.variance_epsilon,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+            )
 
     def _split_fused_qkv_a(
         self, qkv_gate: torch.Tensor
@@ -3483,6 +3499,9 @@ class KimiLinearModel(nn.Module):
         shared_parallel = validate_shared_expert_settings(mapping, shared_size)
         if shared_parallel is not None:
             initialize_shared_expert_group(shared_parallel)
+            logger.info(
+                f"K3 shared-expert TP enabled: tp_size={shared_parallel.tp_size}, num_groups={shared_parallel.dp_size}"
+            )
 
         qkv_parallel, output_parallel = validate_projection_settings(
             mapping,
