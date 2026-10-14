@@ -18,18 +18,27 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Compile the generic Iris all-reduce protocols for gfx1250 without launching."""
+"""Compile the generic Iris all-reduce protocols without launching them."""
 
 import re
 
 import pytest
 from tokenspeed_kernel.platform import current_platform
 
-pytestmark = pytest.mark.skipif(
-    not current_platform().is_amd, reason="Iris requires AMD ROCm"
+_ARCHS = (
+    pytest.param(
+        "gfx950",
+        marks=pytest.mark.skipif(
+            not current_platform().is_cdna4, reason="gfx950 codegen"
+        ),
+    ),
+    pytest.param(
+        "gfx1250",
+        marks=pytest.mark.skipif(
+            not current_platform().is_cdna5, reason="gfx1250 codegen"
+        ),
+    ),
 )
-
-_GFX1250 = ("gfx1250", 32)
 
 
 @pytest.fixture(autouse=True)
@@ -45,11 +54,11 @@ def _aligned(fn, names):
     }
 
 
-def _compile(kind, world_size):
+def _compile(arch_name, kind, world_size):
     from tokenspeed_kernel._triton import gl, gluon, triton
     from tokenspeed_kernel.ops.communication._iris import all_reduce as ar
 
-    arch = ar.iris_arch_config(_GFX1250[0])
+    arch = ar.iris_arch_config(arch_name)
     if kind == "staged_oneshot":
         fn = ar.iris_pull_oneshot_staged
         signature = {
@@ -121,7 +130,7 @@ def _compile(kind, world_size):
         )
     kernel = triton.compile(
         source,
-        target=triton.backends.compiler.GPUTarget("hip", *_GFX1250),
+        target=triton.backends.compiler.GPUTarget("hip", arch_name, arch.subgroup_size),
         options={"num_warps": num_warps},
     )
     return kernel
@@ -146,31 +155,57 @@ def _backedge_cycles(lines):
     return cycles
 
 
+# gfx12 spells the cache policy as th:/scope: fields, gfx9 as sc0/sc1/nt bits.
+_ISA = {
+    "gfx950": {
+        "system": r"\bsc1\b",
+        "non_temporal": r"\bnt\b",
+        "flag_store": r"\bglobal_store_dword\s",
+    },
+    "gfx1250": {
+        "system": r"\bSCOPE_SYS\b",
+        "non_temporal": r"\bTH_LOAD_NT\b",
+        "flag_store": r"\bglobal_store_b32\b",
+    },
+}
+
 _KINDS = ("staged_oneshot", "pull_oneshot", "pull_twoshot", "pull_twoshot_exit")
 
 
 @pytest.mark.parametrize("world_size", (2, 4, 8))
 @pytest.mark.parametrize("kind", _KINDS)
-def test_iris_all_reduce_codegen_gfx1250(kind, world_size, tmp_path):
-    """Wave32 layouts compile, and only flag polls bypass the cache.
+@pytest.mark.parametrize("arch", _ARCHS)
+def test_iris_all_reduce_codegen(arch, kind, world_size, tmp_path):
+    """Peer accesses keep their architecture's cache policy.
 
-    A non-temporal peer data load refetches every partially read sector over
-    the fabric on gfx1250, so the only non-temporal loads allowed are the
-    system-scope flag polls, and each of them must stay on its retry backedge.
+    Flag polls and epoch atomics are system-scoped on every architecture, and
+    each poll must stay on its retry backedge. gfx950 reads peer data
+    non-temporally and writes peer flags write-through. On gfx1250 a
+    non-temporal data load refetches every partially read sector over the
+    fabric, so only the flag polls may bypass the cache.
     """
-    kernel = _compile(kind, world_size)
+    isa = _ISA[arch]
+    kernel = _compile(arch, kind, world_size)
     assembly = kernel.asm["amdgcn"]
-    (tmp_path / f"{kind}-ws{world_size}.amdgcn").write_text(assembly)
+    (tmp_path / f"{arch}-{kind}-ws{world_size}.amdgcn").write_text(assembly)
     lines = assembly.splitlines()
 
     loads = [line for line in lines if re.search(r"\b(global|buffer)_load_", line)]
-    non_temporal = [line for line in loads if "TH_LOAD_NT" in line]
-    assert all("SCOPE_SYS" in line for line in non_temporal), non_temporal
+    non_temporal = [line for line in loads if re.search(isa["non_temporal"], line)]
+    if arch == "gfx1250":
+        assert all(
+            re.search(isa["system"], line) for line in non_temporal
+        ), non_temporal
+    else:
+        assert any(
+            not re.search(isa["system"], line) for line in non_temporal
+        ), "peer data loads lost their non-temporal hint"
 
     polls = [
         index
         for index, line in enumerate(lines)
-        if re.search(r"\b(global|buffer)_load_\w+\s.*SCOPE_SYS", line)
+        if re.search(r"\b(global|buffer)_load_", line)
+        and re.search(isa["system"], line)
     ]
     assert polls
     cycles = _backedge_cycles(lines)
@@ -180,12 +215,15 @@ def test_iris_all_reduce_codegen_gfx1250(kind, world_size, tmp_path):
 
     if kind.startswith("pull_twoshot"):
         # The 32-bit global stores are the epochs written into peer flag rows.
-        stores = [line for line in lines if re.search(r"\bglobal_store_b32", line)]
+        stores = [line for line in lines if re.search(isa["flag_store"], line)]
         assert stores
-        assert not any("th:" in line or "scope:" in line for line in stores), stores
+        if arch == "gfx1250":
+            assert not any("th:" in line or "scope:" in line for line in stores), stores
+        else:
+            assert all(re.search(r"\bsc0 sc1\b", line) for line in stores), stores
     atomics = [line for line in lines if re.search(r"\bglobal_atomic_", line)]
     assert atomics
-    assert all("SCOPE_SYS" in line for line in atomics), atomics
+    assert all(re.search(isa["system"], line) for line in atomics), atomics
 
     # SGPRs can spill into VGPR lanes without allocating scratch.
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
