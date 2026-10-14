@@ -775,6 +775,7 @@ def _dsa_logits_topk_kernel(
         tl.extra.cuda.gdc_wait()
     row = tl.program_id(0)
     row_cols = _topk_row_length(seq_lens, row, seq_lens_stride, n_cols)
+    # Valid columns have a positive index key, so zero is an invalid sentinel.
     acc = tl.zeros((1, topk), dtype=tl.uint64)
     for tile in tl.static_range(n_cols_padded // BLOCK_N - 1, -1, -1):
         if tile * BLOCK_N < row_cols:
@@ -1054,6 +1055,7 @@ def _radix_topk(
     block_tiles = _next_power_of_2(tiles)
     seq_lens_stride = 0 if seq_lens is None else seq_lens.stride(0)
     use_pdl = bool(enable_pdl and _is_nvidia)
+    # Keep stage releases late to limit resource use by waiting successor CTAs.
     pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
 
     for shift in range(28, -1, -4):

@@ -673,8 +673,9 @@ algorithm of `qwen4_exp_qsa_block_topk` composes, select these Gluon kernels on
 gfx950. They return the same blocks as the portable Triton registrations; the
 selected ids come out in increasing order rather than by score.
 
-- `gluon_qsa_block_scores_gfx950` writes `sum_h relu(q_h . k)` for every
-  compressed block below each row's `complete_blocks` (`-inf` elsewhere).
+- `gluon_qsa_block_scores_gfx950` writes `sum_h relu(q_h . k)` for each valid
+  compressed block below each row's `complete_blocks`, leaving the tail
+  unwritten. Each request run stops at its current maximum frontier.
   A program owns 16 query rows (prefill) or 4 rows (decode) whose index heads
   form the 64- or 16-row MFMA M dimension, and loops over its share of
   128-block tiles, prefetching the next key tile. Rows of one request are

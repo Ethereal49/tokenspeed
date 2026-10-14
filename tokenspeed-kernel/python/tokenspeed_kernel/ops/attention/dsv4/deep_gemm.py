@@ -297,7 +297,7 @@ def _decode_topk(
             workspace,
             topk,
             logits.shape[1],
-            enable_pdl=False,
+            enable_pdl=pdl_enabled(),
             q_len_per_req=1,
         )
         return out

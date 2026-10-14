@@ -1295,7 +1295,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                     workspace,
                     topk,
                     stride,
-                    enable_pdl=False,
+                    enable_pdl=True,
                     q_len_per_req=1,
                 )
                 torch.cuda.synchronize()
@@ -1309,7 +1309,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                         workspace,
                         topk,
                         stride,
-                        enable_pdl=False,
+                        enable_pdl=True,
                         q_len_per_req=1,
                     )
                 for _ in range(3):

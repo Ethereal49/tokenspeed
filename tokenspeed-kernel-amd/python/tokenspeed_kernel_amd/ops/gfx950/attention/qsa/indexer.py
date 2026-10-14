@@ -154,7 +154,6 @@ def gluon_qsa_block_scores_gfx950(
     # A program owns BLOCK_Q query rows and every col_splits-th block tile.
     row0 = gl.program_id(0) * BLOCK_Q
     split = gl.program_id(1)
-    num_tiles = gl.cdiv(num_blocks, BLOCK_N)
     q_idx = gl.arange(0, BLOCK_Q, layout=row_layout)
     q_rows = row0 + q_idx
     row_mask = q_rows < rows
@@ -186,8 +185,11 @@ def gluon_qsa_block_scores_gfx950(
         )
         in_run = row_mask & (q_idx >= start) & (q_idx < run_end)
         frontier = gl.where(
-            request >= 0, gl.max(gl.where(in_run, complete, 0), axis=0), 0
+            request >= 0,
+            gl.minimum(gl.max(gl.where(in_run, complete, 0), axis=0), num_blocks),
+            0,
         )
+        num_tiles = gl.cdiv(frontier, BLOCK_N)
         # Key gathers run one tile ahead of the MFMA.
         keys = _load_key_tile(
             page_table,
@@ -219,25 +221,18 @@ def gluon_qsa_block_scores_gfx950(
                 BLOCK_N,
             )
             block_ids = tile * BLOCK_N + gl.arange(0, BLOCK_N, layout=col_layout)
-            if tile * BLOCK_N < frontier:
-                acc = gl.zeros([BLOCK_M, BLOCK_N], gl.float32, mma)
-                acc = cdna4.mfma(q_tile, keys, acc)
-                acc = gl.maximum(acc, 0.0)
-                scores = gl.sum(gl.reshape(acc, [BLOCK_Q, HEADS_PAD, BLOCK_N]), axis=1)
-                scores = gl.convert_layout(scores, out_layout)
-            else:
-                scores = gl.full(
-                    [BLOCK_Q, BLOCK_N], float("-inf"), gl.float32, out_layout
-                )
-            # Blocks at or beyond a row's frontier become -inf, so selection
-            # drops them.
-            scores = gl.where(
-                block_ids[None, :] < complete[:, None], scores, float("-inf")
-            )
+            acc = gl.zeros([BLOCK_M, BLOCK_N], gl.float32, mma)
+            acc = cdna4.mfma(q_tile, keys, acc)
+            acc = gl.maximum(acc, 0.0)
+            scores = gl.sum(gl.reshape(acc, [BLOCK_Q, HEADS_PAD, BLOCK_N]), axis=1)
+            scores = gl.convert_layout(scores, out_layout)
+            # Selection reads each row's complete prefix; leave its tail unwritten.
             gl.store(
                 out_rows + block_ids[None, :],
                 scores,
-                mask=in_run[:, None] & (block_ids < num_blocks)[None, :],
+                mask=in_run[:, None]
+                & (block_ids < num_blocks)[None, :]
+                & (block_ids[None, :] < complete[:, None]),
             )
             keys = next_keys
         start = run_end

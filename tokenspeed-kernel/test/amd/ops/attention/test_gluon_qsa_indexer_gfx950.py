@@ -29,6 +29,7 @@ from utils import assert_no_triton_compile, is_cdna4
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
+from tokenspeed_kernel._triton import triton  # noqa: E402
 from tokenspeed_kernel.ops.attention.dsa.triton import (  # noqa: E402
     triton_topk_from_logits,
 )
@@ -95,7 +96,8 @@ def test_gluon_qsa_block_scores_match_reference(widths, contexts) -> None:
     inputs = _inputs(widths, contexts)
     scores = launch_gluon_qsa_block_scores_gfx950(*inputs, page_size=_PAGE_SIZE)
     expected = _reference_scores(*inputs)
-    torch.testing.assert_close(scores, expected, atol=2e-3, rtol=1e-4)
+    valid = torch.arange(scores.shape[1], device="cuda")[None, :] < inputs[-1][:, None]
+    torch.testing.assert_close(scores[valid], expected[valid], atol=2e-3, rtol=1e-4)
 
 
 def test_gluon_qsa_block_scores_read_caches_beyond_2gib() -> None:
@@ -114,7 +116,59 @@ def test_gluon_qsa_block_scores_read_caches_beyond_2gib() -> None:
         query, key_cache, table, requests, complete, page_size=_PAGE_SIZE
     )
     expected = _reference_scores(query, key_cache, table, requests, complete)
-    torch.testing.assert_close(scores, expected, atol=2e-3, rtol=1e-4)
+    valid = torch.arange(scores.shape[1], device="cuda")[None, :] < complete[:, None]
+    torch.testing.assert_close(scores[valid], expected[valid], atol=2e-3, rtol=1e-4)
+
+
+def test_gluon_qsa_scores_refresh_frontiers_without_writing_tails() -> None:
+    inputs = _inputs([4] * 3, [900, 3000, 64])
+    query, key_cache, table, requests, complete = inputs
+    rows, num_blocks = query.shape[0], table.shape[1] * _PAGE_SIZE
+    logits = torch.full((rows, num_blocks), float("nan"), device="cuda")
+
+    def forward():
+        gluon_qsa_block_scores_gfx950[(triton.cdiv(rows, 4), 2)](
+            query,
+            key_cache,
+            table,
+            requests,
+            complete,
+            logits,
+            rows,
+            num_blocks,
+            _PAGE_SIZE,
+            2,
+            query.stride(0),
+            query.stride(1),
+            key_cache.stride(0),
+            table.stride(0),
+            logits.stride(0),
+            NUM_HEADS=4,
+            HEADS_PAD=4,
+            HEAD_DIM=128,
+            HEAD_DIM_PAD=128,
+            BLOCK_Q=4,
+            BLOCK_N=128,
+            num_warps=4,
+        )
+
+    forward()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        forward()
+    for frontier in (num_blocks, 129, -rows, 17, num_blocks):
+        query.normal_()
+        complete.copy_(
+            (torch.arange(rows, device="cuda", dtype=torch.int32) + frontier).clamp(
+                0, num_blocks
+            )
+        )
+        logits.fill_(float("nan"))
+        graph.replay()
+        expected = _reference_scores(*inputs)
+        valid = torch.arange(num_blocks, device="cuda")[None, :] < complete[:, None]
+        torch.testing.assert_close(logits[valid], expected[valid], atol=2e-3, rtol=1e-4)
+        assert torch.isnan(logits[~valid]).all()
 
 
 @pytest.mark.parametrize("cols", [300, 2048, 2100, 9000])

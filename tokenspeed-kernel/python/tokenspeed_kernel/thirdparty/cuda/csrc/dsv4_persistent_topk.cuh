@@ -1078,8 +1078,10 @@ namespace persistent {
 namespace impl = tokenspeed::device::topk;
 
 constexpr int kThreadsPerBlock = impl::TopKConfig::kBlockSize;
-constexpr uint32_t kRegister2MaxSeqLen = impl::TopKRegister<2>::kMaxSeqLen;
-constexpr uint32_t kRegister4MaxSeqLen = impl::TopKRegister<4>::kMaxSeqLen;
+constexpr uint32_t kRegister2MaxSeqLen =
+    impl::TopKRegister<2>::kMaxSeqLen;
+constexpr uint32_t kRegister4MaxSeqLen =
+    impl::TopKRegister<4>::kMaxSeqLen;
 constexpr uint32_t kClusterSize = 8;
 constexpr uint32_t kClusterFloor = 32768;
 // A 9-bit coarse histogram minimizes fixed histogram work through 64K. Longer
@@ -1158,8 +1160,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock, kMinBlocksPerSm)
 }
 
 template <int TopK, bool kUsePDL, typename Cluster>
-__device__ __forceinline__ void cluster_topk_body(PersistentTopKParams params,
-                                                  void* smem) {
+__device__ __forceinline__ void cluster_topk_body(
+    PersistentTopKParams params, void* smem) {
   static_assert(TopK == 512 || TopK == 1024 || TopK == 2048);
   using Register4 = impl::TopKRegister<4>;
   using Streaming = impl::TopKStreaming;
@@ -1223,21 +1225,22 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
   using Register4 = impl::TopKRegister<4>;
   using Streaming = impl::TopKStreaming;
   using Cluster = impl::TopKCluster<kClusterSize, kClusterHistBits>;
-  __shared__ impl::MaxSmem<typename Register4::Smem, typename Streaming::Smem,
-                           typename Cluster::Smem>
+  __shared__ impl::MaxSmem<typename Register4::Smem,
+                           typename Streaming::Smem, typename Cluster::Smem>
       smem;
   cluster_topk_body<TopK, kUsePDL, Cluster>(params, &smem);
 }
 
 template <int TopK, uint32_t kClusterHistBits, bool kUsePDL>
-__global__ void __launch_bounds__(kThreadsPerBlock, 1) __cluster_dims__(1, 8, 1)
-    cluster8_register4_topk_kernel(PersistentTopKParams params) {
+__global__ void __launch_bounds__(kThreadsPerBlock, 1)
+    __cluster_dims__(1, 8, 1)
+        cluster8_register4_topk_kernel(PersistentTopKParams params) {
   static_assert(kClusterHistBits == 9 || kClusterHistBits == 10);
   using Register4 = impl::TopKRegister<4>;
   using Streaming = impl::TopKStreaming;
   using Cluster = impl::TopKCluster<8, kClusterHistBits, 4>;
-  __shared__ impl::MaxSmem<typename Register4::Smem, typename Streaming::Smem,
-                           typename Cluster::Smem>
+  __shared__ impl::MaxSmem<typename Register4::Smem,
+                           typename Streaming::Smem, typename Cluster::Smem>
       smem;
   cluster_topk_body<TopK, kUsePDL, Cluster>(params, &smem);
 }
@@ -1250,8 +1253,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
   using Register4 = impl::TopKRegister<4>;
   using Streaming = impl::TopKStreaming;
   using Cluster = impl::TopKCluster<16, kClusterHistBits>;
-  __shared__ impl::MaxSmem<typename Register4::Smem, typename Streaming::Smem,
-                           typename Cluster::Smem>
+  __shared__ impl::MaxSmem<typename Register4::Smem,
+                           typename Streaming::Smem, typename Cluster::Smem>
       smem;
   cluster_topk_body<TopK, kUsePDL, Cluster>(params, &smem);
 }

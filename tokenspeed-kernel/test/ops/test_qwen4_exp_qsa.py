@@ -933,8 +933,9 @@ def _expected_logits_ids(scores: torch.Tensor, k: int, n_cols_padded: int) -> li
 
 @pytest.mark.parametrize("query_group_size", [1, 4])
 @pytest.mark.parametrize("tile_programs", [1, 2, 5])
+@pytest.mark.parametrize("group_programs", [1, 4])
 def test_qwen4_exp_qsa_scores_leave_invalid_blocks_unwritten(
-    device: str, query_group_size: int, tile_programs: int
+    device: str, query_group_size: int, tile_programs: int, group_programs: int
 ) -> None:
     rows, heads, dim, page_size, columns = 4, 3, 32, 64, 9
     num_blocks = page_size * columns
@@ -948,7 +949,7 @@ def test_qwen4_exp_qsa_scores_leave_invalid_blocks_unwritten(
     complete = torch.tensor([0, 1, 129, 513], device=device, dtype=torch.int32)
     logits = torch.full((rows, num_blocks), float("nan"), device=device)
     qsa_ops._qwen4_exp_qsa_score_blocks_kernel[
-        (rows // query_group_size, tile_programs)
+        (min(rows // query_group_size, group_programs), tile_programs)
     ](
         query,
         keys,
@@ -959,6 +960,7 @@ def test_qwen4_exp_qsa_scores_leave_invalid_blocks_unwritten(
         heads,
         dim,
         num_blocks,
+        rows // query_group_size,
         page_size,
         *query.stride(),
         keys.stride(0),
@@ -969,6 +971,7 @@ def test_qwen4_exp_qsa_scores_leave_invalid_blocks_unwritten(
         BLOCK_H=4,
         BLOCK_D=32,
         QUERY_GROUP_SIZE=query_group_size,
+        LOOP_QUERY_GROUPS=group_programs < rows // query_group_size,
         ENABLE_PDL=False,
         num_warps=4,
         num_stages=2,
@@ -1011,6 +1014,7 @@ def test_qwen4_exp_qsa_score_grid_refreshes_without_recompile(device: str) -> No
             heads,
             dim,
             table.shape[1] * page_size,
+            batch,
             page_size,
             *query.stride(),
             keys.stride(0),
@@ -1021,6 +1025,7 @@ def test_qwen4_exp_qsa_score_grid_refreshes_without_recompile(device: str) -> No
             BLOCK_H=heads,
             BLOCK_D=dim,
             QUERY_GROUP_SIZE=width,
+            LOOP_QUERY_GROUPS=False,
             ENABLE_PDL=False,
             num_warps=4,
             num_stages=2,
@@ -1168,7 +1173,7 @@ def test_qwen4_exp_qsa_grouped_scores_refresh_during_graph_replay(
     # Force a bounded production grid so replay must walk multiple tiles per CTA.
     platform = replace(qsa_ops.current_platform(), sm_count=1)
     monkeypatch.setattr(qsa_ops, "current_platform", lambda: platform)
-    batch, width, heads, dim, page_size, columns = 3, 4, 4, 128, 64, 9
+    batch, width, heads, dim, page_size, columns = 3, 4, 4, 128, 64, 19
     rows = batch * width
     query = torch.randn(rows, heads, dim, device=device, dtype=torch.bfloat16)
     keys = torch.randn(
@@ -1182,7 +1187,7 @@ def test_qwen4_exp_qsa_grouped_scores_refresh_during_graph_replay(
         1, batch * columns + 1, device=device, dtype=torch.int32
     ).reshape(batch, columns)
     requests = torch.arange(batch, device=device).repeat_interleave(width)
-    complete = torch.full((rows,), 576, device=device, dtype=torch.int32)
+    complete = torch.full((rows,), 1216, device=device, dtype=torch.int32)
 
     def forward(queries_per_request):
         return qwen4_exp_qsa_block_topk(
@@ -1205,8 +1210,8 @@ def test_qwen4_exp_qsa_grouped_scores_refresh_during_graph_replay(
     with torch.cuda.graph(graph):
         actual = forward(width)
     for frontiers in (
-        [0, 1, 127, 128, 129, 511, 513, 576, 0, 0, 0, 0],
-        [576, 513, 511, 129, 128, 127, 1, 0, 0, 0, 0, 0],
+        [0, 1, 127, 128, 129, 511, 513, 1216, 0, 0, 0, 0],
+        [1216, 513, 511, 129, 128, 127, 1, 0, 0, 0, 0, 0],
         [0] * rows,
     ):
         query.normal_()

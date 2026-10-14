@@ -415,7 +415,7 @@ if platform.is_hopper_plus:
                     device=q.device,
                 ),
                 max_seq_len=max_seq_len,
-                enable_pdl=False,
+                enable_pdl=pdl_enabled(),
             )
         else:
             # No ragged CUDA top-k: mask each row to its causal window first.
