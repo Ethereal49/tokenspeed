@@ -605,6 +605,29 @@ the compacted tiles over up to 32 workgroups that store FP32 partials and
 base-2 LSE; `gluon_qsa_sparse_attention_merge_gfx950` merges all splits of a
 (row, head) in one pass.
 
+### gfx950 QSA indexer
+
+The `qsa_block_scores` and `qsa_block_topk_select` ops, which the `logits`
+solution of `qwen4_exp_qsa_block_topk` composes, select these Gluon kernels on
+gfx950. They return the same blocks as the portable Triton registrations; the
+selected ids come out in increasing order rather than by score.
+
+- `gluon_qsa_block_scores_gfx950` writes `sum_h relu(q_h . k)` for every
+  compressed block below each row's `complete_blocks` (`-inf` elsewhere).
+  A program owns 16 query rows (prefill) or 4 rows (decode) whose index heads
+  form the 64- or 16-row MFMA M dimension, and loops over its share of
+  128-block tiles, prefetching the next key tile. Rows of one request are
+  contiguous; a tile spanning requests scores one request run at a time, so
+  ragged batches need no query grouping. Keys are gathered with 64-bit
+  pointers (the compressed cache may exceed 2 GiB).
+- `gluon_qsa_block_topk_select_gfx950` radix-selects the `topk` largest
+  finite scores per row: four 8-bit passes build LDS-atomic histograms, then
+  one pass writes the ids above the threshold and the first ids equal to it in
+  increasing column order (ties keep the smaller id, like the portable
+  selection). Rows with at most 4096 scores stay in registers; the chunk is a
+  power-of-two bucket of the score width, and wider rows stream in 4096-score
+  chunks.
+
 ### gfx1250 MLA decode
 
 `gluon_mla_decode_gfx1250` computes absorbed MLA decode over a paged cache,
@@ -808,6 +831,36 @@ three waves per SIMD. Fully visible tiles run in their own loop without mask
 code, and the boundary tiles mask keys only, since rows past `q_len` are
 never stored. V is not masked: TDM zero-fills tile rows past `kv_len`, and
 those keys score `-inf`.
+
+### gfx950 GDN decode and MTP verify
+
+`gluon_gdn_decode_gfx950` runs the sigmoid-gated delta-rule recurrence for
+`gdn_decode_step` (one token) and chain `gdn_decode_mtp` (T tokens) over the
+K-last recurrent-state pool. Draft trees stay on the Triton kernel.
+
+#### Contract
+
+- q/k are `[B, T, H, 128]` and v is `[B, T, HV, V]` (V a multiple of 16), with
+  contiguous heads and any batch/token strides, so packed conv-output views
+  need no split copy. a/b are `[B, T, HV]` with any strides.
+- The pool is K-last `[rows, HV, V, K]`, FP32 or BF16, with any row stride.
+  A negative read row starts from a zero state; negative destination rows are
+  skipped.
+- Per-token states go to `output_state_indices` rows of `output_state` (default
+  the read pool) or to the dense intermediate buffer; the final state goes
+  back to the read row only when neither applies and updates are enabled.
+- `T` and the batch are runtime values. The kernel stages tokens in LDS in
+  chunks of `min(next_power_of_2(T), 16)`, the only T-derived constexpr.
+
+#### Algorithm
+
+One wave owns 16 V rows of one request and value head: each lane holds two
+rows by four 4-wide K runs, so every state access is a 16-byte load or store
+filling whole 128-byte lines, and each K reduction is 16 in-register FMAs plus
+a three-step DPP butterfly. The prologue loads the chunk's q/k (L2-normalized
+and scaled), beta-scaled v, beta and decay into LDS once, so the serial steps
+wait only on LDS rather than one global round trip per token. The kernel is
+HBM bound: it reads the state once and writes it once per destination.
 
 ## Transform
 
@@ -1212,6 +1265,47 @@ The post and collapse kernels move eight contiguous BF16 values per lane.
 Post runs one token per CTA so its twenty coefficients are scalar loads that
 never wait behind the vector stores. The collapse runs one token per CTA so
 the optional RMSNorm reduces the whole row once.
+
+### gfx950 Qwen4 hyper-connection mix
+
+`gluon_hyperconnection_mix_gfx950` serves `gated_residual_mix` for decode
+batches (1 to 256 rows) of the HC4 / H2560 / R320 stream in two launches,
+replacing two hipBLASLt GEMMs (one with a split-K reduction kernel) and two
+Triton epilogues.
+
+#### Contract
+
+- Contiguous FP16/BF16 `normalized [rows, 4 * H]`, fused down/inject weight
+  `[R (+ 4), 4 * H]` and up weight `[4 * H, R]`; `4 * H` divisible by 10240
+  and `R` equal to 256 plus a power of two of at least 32. Returns the mixed
+  `[rows, H]` and the inject logits `[rows, 4]` (or `None`) in the input
+  dtype.
+- Numerics follow the GEMM-plus-epilogue path: both projections accumulate in
+  FP32 and are rounded to the input dtype before the scale/SiLU and the
+  sigmoid gate, so only the accumulation order differs (at most one ulp).
+  Split partials are summed in split order, so results are deterministic.
+- Row counts are runtime arguments within three tile buckets (up to 16, up
+  to 32, larger rows).
+- The split-K workspace (FP32 partials and self-resetting arrival counters)
+  is shared per device and tiling, so launches must be ordered on one stream.
+
+#### Algorithm
+
+The down projection splits `K = 4 * H` into 1024-deep slices, one per
+workgroup, with 16-wide weight tiles: about 200 workgroups each stream 32 KB
+of weight, which keeps every CU busy and the last split's reduction small.
+Operands are loaded with 16-byte coalesced loads, all issued before the
+first MFMA; the conversion to the MFMA operand layout broadcasts a shared
+operand through LDS rather than re-reading it per wave. Each split writes an
+FP32 partial through to memory and bumps a per-tile counter; the last split
+sums the partials, applies scale and SiLU, and writes the activation (and
+inject logits).
+
+The up projection gives each workgroup 16 hidden columns of all four
+branches as one MFMA tile, one branch per wave, with the 320-deep reduction
+loaded as a 256 + 64 pair so every load is in flight at once. The epilogue
+multiplies `sigmoid(gate)` with the matching normalized branch and sums the
+four branches across waves, so the gate tensor never reaches memory.
 
 ## Quantization
 
