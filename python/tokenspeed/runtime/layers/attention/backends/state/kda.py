@@ -235,13 +235,28 @@ class KdaAttnBackend(CapacityPrefillBackend):
         self._descriptor_row_by_layer: dict[int, int] = {}
         self._replay_group_ids: tuple[str, ...] = ()
         self._replay_group_rows: dict[str, int] = {}
+        # Host cache of each group's (table offset in elements, row stride,
+        # column count, source-page output pointer). Upload only when these
+        # change; a new packed table base alone does not invalidate the cache.
         self._replay_commit_table_signature: tuple[tuple[int, int, int, int], ...] = ()
+        # Device INT64 [groups, 4] copy of the signature for the commit planner.
         self._replay_commit_tables: torch.Tensor | None = None
+        # Fixed-capacity INT32 page buffers, viewed as [groups, batch] at use.
+        # Reads preserve source checkpoint IDs before page outputs are updated.
         self._replay_commit_reads: torch.Tensor | None = None
+        # Destination state-page IDs selected for the accepted endpoints.
         self._replay_commit_pages: torch.Tensor | None = None
+        # INT32 [max_bs] accepted counts, clamped by the shared commit planner.
         self._replay_commit_steps: torch.Tensor | None = None
+        # Split-producer INT64 [max_bs, 3]: (slot, generation, checkpoint
+        # position). Refreshed before verify; PR1 uses the batch row as slot.
         self._replay_record_metadata: torch.Tensor | None = None
+        # INT64 [layers, max_bs, draft_tokens, 2]: (absolute position,
+        # generation). Producers stamp records; recovery checks these stamps
+        # before reading payloads to reject stale or overwritten records.
         self._replay_record_stamps: torch.Tensor | None = None
+        # Incremented for each metadata refresh to identify this round's
+        # workspace ownership, even when a batch slot is reused.
         self._replay_record_generation = 0
 
     @staticmethod
@@ -422,6 +437,8 @@ class KdaAttnBackend(CapacityPrefillBackend):
         *,
         pages_out: Mapping[str, torch.Tensor],
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        # Resolve each group's source checkpoint pages into pages_out and
+        # retain the committed positions and tables for post-acceptance commit.
         committed, tables = super()._verify_state_blocks(
             bs, seq_lens, draft_token_num, block_tables, pages_out=pages_out
         )
@@ -460,6 +477,9 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 prepare_recoverssm_metadata,
             )
 
+            # Refresh the live rows before verify writes candidate records.
+            # A new generation prevents recovery from consuming an older
+            # round's records when the same workspace slots are reused.
             self._replay_record_generation += 1
             prepare_recoverssm_metadata(
                 committed,
@@ -473,12 +493,15 @@ class KdaAttnBackend(CapacityPrefillBackend):
     def _resolve_verify_commit_pages(
         self, accepted_length: torch.Tensor, group_ids: Sequence[str]
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Use the shared resolver when no GPU replay workspace is available.
+        # Otherwise, plan all state groups in one launch after acceptance.
         if self._replay_commit_tables is None or not accepted_length.is_cuda:
             return super()._resolve_verify_commit_pages(accepted_length, group_ids)
         from tokenspeed_kernel.ops.attention.kda.triton import (
             commit_state_groups,
         )
 
+        # Descriptor rows and output rows must refer to the same state groups.
         if tuple(group_ids) != self._replay_group_ids:
             raise ValueError(
                 "commit group order must match the prepared table descriptors"
@@ -488,10 +511,15 @@ class KdaAttnBackend(CapacityPrefillBackend):
         assert self._replay_commit_steps is not None
         committed, tables, width, _ = self._verify_commit_ctx
         batch = accepted_length.shape[0]
+        # Reuse fixed-capacity storage, packed for the current batch size.
+        # Returned views remain valid until the next planner call overwrites them.
         pages = self._replay_commit_pages[: len(group_ids) * batch].view(
             len(group_ids), batch
         )
         steps = self._replay_commit_steps[:batch]
+        # Preserve source page IDs for recovery and select destination pages
+        # from the accepted endpoint. Counts include the target token and are
+        # clamped to [1, width]. This plans the commit; it does not write states.
         commit_state_groups(
             accepted_length,
             committed,
