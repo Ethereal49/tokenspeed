@@ -238,8 +238,10 @@ class KdaAttnBackend(CapacityPrefillBackend):
         # Host cache of each group's (table offset in elements, row stride,
         # column count, source-page output pointer). Upload only when these
         # change; a new packed table base alone does not invalidate the cache.
-        self._replay_commit_table_signature: tuple[tuple[int, int, int, int], ...] = ()
-        # Device INT64 [groups, 4] copy of the signature for the commit planner.
+        self._replay_commit_table_descriptors_host: tuple[
+            tuple[int, int, int, int], ...
+        ] = ()
+        # Device INT64 [groups, 4] copy of the host descriptors for the commit planner.
         self._replay_commit_tables: torch.Tensor | None = None
         # Fixed-capacity INT32 page buffers, viewed as [groups, batch] at use.
         # Reads preserve source checkpoint IDs before page outputs are updated.
@@ -453,7 +455,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
             # The scheduler uploads fresh packed storage each round. Keep
             # relative table geometry so changing its base needs no upload.
             table_base = rows[0]
-            signature = tuple(
+            table_descriptors = tuple(
                 (
                     (table.data_ptr() - table_base.data_ptr())
                     // table_base.element_size(),
@@ -463,15 +465,15 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 )
                 for group, table in zip(self._replay_group_ids, rows, strict=True)
             )
-            if signature != self._replay_commit_table_signature:
+            if table_descriptors != self._replay_commit_table_descriptors_host:
                 self._replay_commit_tables.copy_(
                     torch.tensor(
-                        signature,
+                        table_descriptors,
                         dtype=torch.int64,
                         device=self.device,
                     )
                 )
-                self._replay_commit_table_signature = signature
+                self._replay_commit_table_descriptors_host = table_descriptors
         if self._replay_record_metadata is not None and seq_lens.is_cuda:
             from tokenspeed_kernel.ops.attention.kda.vllm_recoverssm import (
                 prepare_recoverssm_metadata,
