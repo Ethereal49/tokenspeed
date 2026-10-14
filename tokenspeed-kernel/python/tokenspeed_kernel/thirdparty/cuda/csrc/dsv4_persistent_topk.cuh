@@ -643,7 +643,6 @@ struct TopKRegister : TopKRadixBase<12> {
   static constexpr uint32_t kMaxSeqLen = kBlockSize * kVecSize * kLocalVecs;
   using Smem = typename TopKRadixBase<12>::Smem;
 
-  template <bool kUsePDL>
   TS_DEVICE static void forward(const TopKProblem problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
@@ -659,7 +658,6 @@ struct TopKRegister : TopKRadixBase<12> {
     }
 
     __syncthreads();
-    PDLWaitPrimary<kUsePDL>();
 
     // A vector `vi` is fully in bounds iff vi < num_full; only full vectors are
     // vector-loaded (16B aligned, never straddling seq_len). The <kVecSize tail is
@@ -743,7 +741,6 @@ struct TopKStreaming : TopKRegister<2> {
  public:
   static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
 
-  template <bool kUsePDL>
   TS_DEVICE static void forward(const TopKProblem problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
@@ -758,7 +755,6 @@ struct TopKStreaming : TopKRegister<2> {
       smem->count_gt = 0;
     }
     __syncthreads();
-    PDLWaitPrimary<kUsePDL>();
 
     // Phase 1: Load and build histogram
     for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t) {
@@ -846,12 +842,11 @@ struct TopKCluster : TopKRadixBase<kHistBits_> {
     int32_t tmp_out[kMaxTopK];
   };
 
-  // Process one batch element (one cluster). The PDL wait follows CTA-local
-  // initialization, and the kernel wrapper emits the dependent-launch trigger.
+  // Process one batch element (one cluster). The kernel wrapper handles the
+  // PDL wait before reading lengths and triggers dependents after selection.
   // There is no trailing cluster barrier: kernel completion makes the final
   // local/global writes visible. Writes raw indices to out; the kernel's
   // transform pass applies the page-table transform.
-  template <bool kUsePDL>
   TS_DEVICE static void forward(TopKProblem problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
@@ -883,7 +878,6 @@ struct TopKCluster : TopKRadixBase<kHistBits_> {
       smem->count_gt = 0;
     }
     __syncthreads();
-    PDLWaitPrimary<kUsePDL>();
 
     if constexpr (kLocalVecs > 0) {
 #pragma unroll
@@ -1146,14 +1140,14 @@ __global__ void __launch_bounds__(kThreadsPerBlock, kMinBlocksPerSm)
   };
 
   if constexpr (Level == 0) {
-    Register2::forward<false>(problem, &smem);
+    Register2::forward(problem, &smem);
   } else if constexpr (Level == 1) {
-    Register4::forward<false>(problem, &smem);
+    Register4::forward(problem, &smem);
   } else {
     if (seq_len <= kRegister4MaxSeqLen) {
-      Register4::forward<false>(problem, &smem);
+      Register4::forward(problem, &smem);
     } else {
-      Streaming::forward<false>(problem, &smem);
+      Streaming::forward(problem, &smem);
     }
   }
   tokenspeed::device::PDLTriggerSecondary<kUsePDL>();
@@ -1199,11 +1193,11 @@ __device__ __forceinline__ void cluster_topk_body(
   };
 
   if (seq_len <= kRegister4MaxSeqLen) {
-    if (rank == worker_rank) Register4::forward<false>(problem, smem);
+    if (rank == worker_rank) Register4::forward(problem, smem);
   } else if (seq_len <= kClusterFloor) {
-    if (rank == worker_rank) Streaming::forward<false>(problem, smem);
+    if (rank == worker_rank) Streaming::forward(problem, smem);
   } else {
-    Cluster::template forward<false>(problem, smem);
+    Cluster::forward(problem, smem);
     // Cluster::forward's last DSMEM consumer is already preceded by a
     // cluster-wide barrier. Once it returns, each CTA only completes local or
     // global-memory writes, and kernel completion provides the launch-wide

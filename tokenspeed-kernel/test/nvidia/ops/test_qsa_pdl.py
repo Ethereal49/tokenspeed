@@ -386,7 +386,15 @@ def test_qsa_selection_refreshes_block_frontiers(enabled, persistent, restore_pd
 )
 @pytest.mark.parametrize("q_len_per_req", [1, 4])
 @pytest.mark.parametrize(
-    "rows, columns", [(4, 4096), (36, 16384), (36, 65536), (4, 65536)]
+    "rows, columns",
+    [
+        (4, 4096),
+        (36, 16384),
+        (36, 65536),
+        (4, 65536),
+        (4, 131072),
+        (4, 262144),
+    ],
 )
 def test_persistent_topk_waits_for_producers(
     enabled, length_dtype, length_stride, q_len_per_req, rows, columns, restore_pdl
