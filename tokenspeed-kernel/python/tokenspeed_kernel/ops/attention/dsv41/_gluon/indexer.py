@@ -145,6 +145,7 @@ def run_dsv41_csa2_index_topk(
     score_chunk_size,
     process_group,
     out,
+    index_metadata,
     launch_logits,
     select_rows,
 ):
@@ -153,6 +154,7 @@ def run_dsv41_csa2_index_topk(
     ``launch_logits`` scores a query tile into -inf-initialized FP32 logits;
     ``select_rows`` has the ``select_rows_torch`` contract.
     """
+    del index_metadata
     out = _index_topk_outputs(
         index_q,
         weights,
