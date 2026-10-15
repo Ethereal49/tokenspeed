@@ -92,8 +92,18 @@ def _reference_scores(query, key_cache, table, requests, complete):
         ([1] * 5, [5, 99, 2050, 4000, 9]),
     ],
 )
-def test_gluon_qsa_block_scores_match_reference(widths, contexts) -> None:
-    inputs = _inputs(widths, contexts)
+@pytest.mark.parametrize("metadata_dtype", [torch.int32, torch.int64])
+def test_gluon_qsa_block_scores_match_reference(
+    widths, contexts, metadata_dtype
+) -> None:
+    query, key_cache, table, requests, complete = _inputs(widths, contexts)
+    inputs = (
+        query,
+        key_cache,
+        table.to(metadata_dtype),
+        requests.to(metadata_dtype),
+        complete.to(metadata_dtype),
+    )
     scores = launch_gluon_qsa_block_scores_gfx950(*inputs, page_size=_PAGE_SIZE)
     expected = _reference_scores(*inputs)
     valid = torch.arange(scores.shape[1], device="cuda")[None, :] < inputs[-1][:, None]

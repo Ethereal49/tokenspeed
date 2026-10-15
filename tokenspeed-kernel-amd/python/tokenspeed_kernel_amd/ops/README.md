@@ -687,7 +687,9 @@ selected ids come out in increasing order rather than by score.
   128-block tiles, prefetching the next key tile. Rows of one request are
   contiguous; a tile spanning requests scores one request run at a time, so
   ragged batches need no query grouping. Keys are gathered with 64-bit
-  pointers (the compressed cache may exceed 2 GiB).
+  pointers (the compressed cache may exceed 2 GiB). Page ids, request ids and
+  complete-block counts accept int32 or int64. Query and page-table buffers
+  must fit within 2 GiB; their buffer-load offsets remain 32-bit.
 - `gluon_qsa_block_topk_select_gfx950` radix-selects the `topk` largest
   finite scores per row: four 8-bit passes build LDS-atomic histograms, then
   one pass writes the ids above the threshold and the first ids equal to it in

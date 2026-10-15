@@ -94,9 +94,13 @@ def _load_key_tile(
     k_n = tile * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, k_layout))
     k_d = gl.arange(0, HEAD_DIM_PAD, layout=gl.SliceLayout(1, k_layout))
     live = k_n < frontier
-    # Buffer loads mask out-of-range lanes without branches.
+    # Int64 lengths can widen tile offsets; the host bounds the page table to
+    # 2 GiB, so valid buffer offsets fit in int32. Key addresses stay int64.
     pages = cdna4.buffer_load(
-        page_table, request * stride_pt_b + k_n // page_size, mask=live, other=0
+        page_table,
+        (request * stride_pt_b + k_n // page_size).to(gl.int32),
+        mask=live,
+        other=0,
     )
     slots = pages.to(gl.int64) * page_size + k_n % page_size
     # 64-bit addressing: the compressed cache may exceed the 2 GiB reach of
@@ -403,7 +407,8 @@ def launch_gluon_qsa_block_scores_gfx950(
 
     Returns:
         FP32 scores shaped ``[rows, pages * page_size]``: ``sum_h relu(q_h .
-        k)`` below each row's ``complete_blocks`` and ``-inf`` elsewhere.
+        k)`` below each row's ``complete_blocks``. Values outside that prefix
+        are undefined.
     """
 
     rows, num_heads, head_dim = query.shape
