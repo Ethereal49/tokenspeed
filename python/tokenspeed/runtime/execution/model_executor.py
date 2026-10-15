@@ -1469,10 +1469,14 @@ class ModelExecutor:
             else None
         )
         logits = logits_output.next_token_logits
+        ids = logits_output.next_token_ids
         token_parts, length_parts, logprob_parts = [], [], []
 
         if num_prefill_outputs:
-            prefill_out = LogitsProcessorOutput(next_token_logits=logits[prefill])
+            prefill_out = LogitsProcessorOutput(
+                next_token_logits=logits[prefill],
+                next_token_ids=None if ids is None else ids[prefill],
+            )
             tokens, lengths = self.sampling_backend.sample(
                 prefill_out,
                 _with_prefill_sample_offsets(
@@ -1501,7 +1505,10 @@ class ModelExecutor:
                 )
             )
         if num_decodes:
-            decode_out = LogitsProcessorOutput(next_token_logits=logits[decode_outputs])
+            decode_out = LogitsProcessorOutput(
+                next_token_logits=logits[decode_outputs],
+                next_token_ids=None if ids is None else ids[decode_outputs],
+            )
             tokens, lengths = self.sampling_backend.verify(
                 decode_out,
                 _sampling_info_for_requests(
@@ -1599,6 +1606,15 @@ class ModelExecutor:
         if self.drafter is not None:
             self.drafter.prepare_target_forward(ctx)
 
+        # The batch's sampling needs select the LM head's TP route: an
+        # argmax-only sampler lets it reduce the argmax across vocab shards.
+        # Set here, the one function capture, warmup and eager steps share, so
+        # a captured graph records the same route its replays need. The NaN
+        # guard audits full rows, so it keeps the gather.
+        ctx.sampler_reads_argmax_only = (
+            not self.config.enable_nan_detection
+            and self.sampling_backend.reads_argmax_only(sampling_info)
+        )
         logits_output = self._run_target_forward(ctx)
 
         if self.config.pp_size > 1 and not self._pp_is_last_stage:

@@ -27,6 +27,11 @@ prepared variants using the existing shape and topology policies. Different
 staging geometries have separate synchronization buffers because their workgroup
 IDs cover different element ranges. Triton RSAG remains independent.
 
+`argmax.py` exchanges one 8-byte argmax key per row for the distributed
+argmax over vocab-sharded logits (`tokenspeed_kernel.ops.sampling`). It only
+joins a heap a group's all-reduce already created, since creating the heap is
+collective over every rank of the job.
+
 K3 preparation, dispatch, and fused implementations live in `kimi_k3/`.
 General all-reduce implementations remain in `all_reduce.py`, separate from
 K3's shapes and fusion policies.

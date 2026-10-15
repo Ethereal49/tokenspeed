@@ -26,14 +26,9 @@ import torch
 from tokenspeed_kernel.ops.communication.triton import all_gather_inner, create_state
 from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
-from tokenspeed_kernel.ops.sampling.cute_dsl import (
-    DistArgmaxState,
+from tokenspeed_kernel.ops.sampling import (
+    dist_argmax_available,
     distributed_argmax,
-)
-from tokenspeed_kernel.ops.sampling.cute_dsl import (
-    is_available as dist_argmax_available,
-)
-from tokenspeed_kernel.ops.sampling.cute_dsl import (
     supports_dist_argmax_shape,
     try_create_dist_argmax_state,
 )
@@ -149,7 +144,11 @@ class LogitsProcessorOutput:
     ## Part 1: This part will be assigned in python/tokenspeed/runtime/layers/logits_processor.py::LogitsProcessor
     # The logits of the next tokens.       shape: [#seq, vocab_size]
     next_token_logits: torch.Tensor
-    # Used when ``do_argmax=True``.   shape: [#seq]
+    # The rows' argmax, when the processor reduced it: always under
+    # ``do_argmax=True``, and for an argmax-only sampler
+    # (``LogitsMetadata.sampler_reads_argmax_only``) when the distributed
+    # argmax ran -- ``next_token_logits`` is then this rank's vocab shard,
+    # not the full distribution.   shape: [#seq]
     next_token_ids: torch.Tensor | None = None
     # Used by speculative decoding.
     # The last hidden layers
@@ -181,6 +180,11 @@ class LogitsMetadata:
     # indexing), so every constructor names it.
     query_shard: QueryShardPlan | None = dataclasses.field(kw_only=True)
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
+    # The sampler reads only each sampled row's argmax (greedy rows, no
+    # logprobs, vocab mask or penalties), so under TP the processor may reduce
+    # the argmax across the vocab shards instead of gathering full-vocab
+    # logits. False, the default, always gathers.
+    sampler_reads_argmax_only: bool = False
     gather_ids: torch.Tensor | None = None
     logits_rows_selected: bool = False
     # Prompt rows whose next-token logprob the forward returns (SGLang
@@ -207,6 +211,7 @@ class LogitsMetadata:
         return cls(
             forward_mode=ctx.forward_mode,
             capture_hidden_mode=ctx.capture_hidden_mode,
+            sampler_reads_argmax_only=ctx.sampler_reads_argmax_only,
             gather_ids=ctx.gather_ids,
             logits_rows_selected=ctx.logits_rows_selected,
             input_logprob_rows=ctx.input_logprob_rows,
@@ -490,7 +495,7 @@ class LogitsProcessor(nn.Module):
         max_M: int,
         skip_ping_pong: bool,
         dtype: torch.dtype,
-    ) -> DistArgmaxState | None:
+    ) -> object | None:
         """Build this TP group's distributed-argmax state, or None to fall back.
 
         Shared by the sampler and the drafters. Construction rendezvouses and
@@ -524,9 +529,7 @@ class LogitsProcessor(nn.Module):
             return None  # never rendezvous inside capture; warmup probes first
 
         group = pg_manager.get_process_group("nccl", self.tp_group)
-        if self._agree_across_tp(
-            current_platform().is_nvidia and dist_argmax_available(), group, device
-        ):
+        if self._agree_across_tp(dist_argmax_available(), group, device):
             state = try_create_dist_argmax_state(
                 group=group,
                 rank_in_group=self.tp_rank,
@@ -708,8 +711,15 @@ class LogitsProcessor(nn.Module):
                 raise RuntimeError("Should never reach")
 
         # Greedy draft path: emit token ids here, fusing the cross-rank
-        # vocab reduction into the argmax when gated on.
-        next_token_ids = self._argmax(sampled_logits) if self.do_argmax else None
+        # vocab reduction into the argmax when gated on. An argmax-only
+        # sampler takes ids only from that reduction; over gathered logits it
+        # takes its own argmax, after any model epilogue on the logits.
+        next_token_ids = None
+        if self.do_argmax or (
+            logits_metadata.sampler_reads_argmax_only
+            and self._dist_argmax_active(sampled_logits.size(0))
+        ):
+            next_token_ids = self._argmax(sampled_logits)
         return LogitsProcessorOutput(
             next_token_logits=sampled_logits,
             next_token_ids=next_token_ids,
@@ -914,9 +924,11 @@ class LogitsProcessor(nn.Module):
             require_full_vocab: The caller reads the whole distribution of
                 every row and keeps the tensor across further device work
                 (prompt logprobs). Under TP this disables two shortcuts the
-                sampled rows take: a ``do_argmax`` processor with the
-                distributed argmax active keeps its logits TP-sharded for
-                ``_argmax``, and the multicast all-gather returns a view of the
+                sampled rows take: a ``do_argmax`` processor, or a forward
+                whose sampler reads only the argmax
+                (``sampler_reads_argmax_only``), keeps its logits TP-sharded
+                for ``_argmax`` when the distributed argmax is active, and the
+                multicast all-gather returns a view of the
                 group's shared comm buffer without an entry barrier (safe only
                 because a whole forward separates consecutive sampled-row
                 gathers). With it set the TP gather is the NCCL collective
@@ -990,19 +1002,16 @@ class LogitsProcessor(nn.Module):
             logits = self._logits_layout_executor.swap_batch_vocab(logits, plan)
 
         elif not dp_sampling and self.tp_size > 1 and not self.skip_all_gather:
-            if self.do_argmax and not require_full_vocab:
+            if (
+                self.do_argmax or logits_metadata.sampler_reads_argmax_only
+            ) and not require_full_vocab:
                 if (
                     self._dist_argmax_state is self._LOGITS_DIST_ARGMAX_UNINITIALIZED
                     and not torch.cuda.is_current_stream_capturing()
                 ):
                     self._dist_argmax_state = self._init_dist_argmax_state(lm_head)
 
-                if (
-                    self._dist_argmax_state
-                    not in (self._LOGITS_DIST_ARGMAX_UNINITIALIZED, None)
-                    and not self.final_logit_softcapping
-                    and logits.size(0) <= self._LOGITS_DIST_ARGMAX_MAX_TOKENS
-                ):
+                if self._dist_argmax_active(logits.size(0)):
                     return logits
 
             # The multicast buffer/kernel is BF16-only; retain other logits dtypes
@@ -1055,17 +1064,20 @@ class LogitsProcessor(nn.Module):
 
         return logits
 
-    def _argmax(self, logits: torch.Tensor) -> torch.Tensor:
-        if (
+    def _dist_argmax_active(self, rows: int) -> bool:
+        """Whether ``rows`` sampled rows reduce their argmax across the vocab
+        shards; ``_get_logits`` then leaves their logits sharded."""
+        return (
             self._dist_argmax_state
             not in (self._LOGITS_DIST_ARGMAX_UNINITIALIZED, None)
             and not self.final_logit_softcapping
-            and logits.size(0) <= self._LOGITS_DIST_ARGMAX_MAX_TOKENS
-        ):
-            _, idx = distributed_argmax(self._dist_argmax_state, logits)
-            return idx
-        else:
-            return sampling_argmax(logits)
+            and rows <= self._LOGITS_DIST_ARGMAX_MAX_TOKENS
+        )
+
+    def _argmax(self, logits: torch.Tensor) -> torch.Tensor:
+        if self._dist_argmax_active(logits.size(0)):
+            return distributed_argmax(self._dist_argmax_state, logits)
+        return sampling_argmax(logits)
 
 
 @triton.jit

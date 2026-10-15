@@ -492,6 +492,19 @@ class SamplingBackend(ABC):
         )
         accept_length.copy_(lengths - 1)
 
+    def reads_argmax_only(self, sampling_info: SamplingBatchInfo) -> bool:
+        """Whether sample()/verify() for this batch read only each row's argmax.
+
+        True lets the LM head reduce the argmax across its vocab shards and
+        hand over ``LogitsProcessorOutput.next_token_ids`` with TP-sharded
+        logits instead of gathering the full vocabulary; the backend must then
+        take those ids when present. A backend whose answer can change from
+        step to step must also key its CUDA graph variants on it, since the
+        captured forward bakes the choice in. Default: full logits.
+        """
+        del sampling_info
+        return False
+
     def cuda_graph_capture_variants(self, num_tokens_per_req: int) -> tuple[str, ...]:
         """Return sampler-specific CUDA graph variants to capture."""
         return (CUDA_GRAPH_VARIANT_DEFAULT,)

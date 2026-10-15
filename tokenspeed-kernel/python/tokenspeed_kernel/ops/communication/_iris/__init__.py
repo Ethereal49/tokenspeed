@@ -57,6 +57,15 @@ def allocation_bytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
     return (math.prod(shape) * dtype.itemsize + 1023) // 1024 * 1024
 
 
+def existing_context():
+    """Return the shared context if an operation already created it, else None.
+
+    Creating the context is collective over every rank of the job, so an
+    optional user that runs on a subgroup only joins a heap that exists.
+    """
+    return _context
+
+
 def get_or_create_context(*, heap_size: int):
     """Create the shared context at its initial capacity, or return it unchanged.
 

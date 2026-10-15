@@ -153,7 +153,9 @@ def test_tp_logits_gather_preserves_dtype(monkeypatch, dtype, cached):
     output = processor._get_logits(
         hidden,
         SimpleNamespace(weight=weight),
-        logits_metadata=None,
+        logits_metadata=LogitsMetadata(
+            forward_mode=ForwardMode.DECODE, query_shard=None
+        ),
         embedding_bias=None,
         plan=None,
         require_full_vocab=False,
@@ -239,8 +241,15 @@ def test_tp_logits_custom_collectives_skip_host_spread_group_without_fabric(
         lambda **kwargs: pytest.fail("a group without fabric must not gather"),
     )
     # Distributed argmax is no longer topology-gated: cross-node groups probe
-    # for NVLS instead. This shard is below the kernel's vocab floor, so the
-    # state is rejected before any collective work.
+    # for NVLS instead. This shard is below the NVIDIA kernel's vocab floor,
+    # so the state is rejected before any collective work.
+    from tokenspeed_kernel.ops.sampling import cute_dsl
+
+    monkeypatch.setattr(
+        logits_processor_module,
+        "supports_dist_argmax_shape",
+        cute_dsl.supports_dist_argmax_shape,
+    )
     monkeypatch.setattr(
         logits_processor_module,
         "try_create_dist_argmax_state",
@@ -478,7 +487,7 @@ def test_argmax_routes_sharded_to_kernel(monkeypatch):
 
     def fake_dist(state, logits):
         recorded["called"] = True
-        return None, logits.argmax(dim=-1)
+        return logits.argmax(dim=-1)
 
     monkeypatch.setattr(logits_processor_module, "distributed_argmax", fake_dist)
 

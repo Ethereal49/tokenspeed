@@ -27,11 +27,19 @@ from __future__ import annotations
 # package namespace, hence the alias.
 import torch as _torch
 from tokenspeed_kernel.ops.sampling.logprob import vocab_parallel_logprobs
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-__all__ = ["argmax", "vocab_parallel_logprobs"]
+__all__ = [
+    "argmax",
+    "dist_argmax_available",
+    "distributed_argmax",
+    "supports_dist_argmax_shape",
+    "try_create_dist_argmax_state",
+    "vocab_parallel_logprobs",
+]
 
 _SUPPORTED_DTYPES = (_torch.float16, _torch.bfloat16, _torch.float32)
 _SUPPORTED_OUT_DTYPES = (_torch.int32, _torch.int64)
@@ -121,6 +129,115 @@ def argmax(
         "sampling", "argmax", logits.dtype, kernel_name=kernel.name, **shape_params
     ):
         return kernel(logits, out=out)
+
+
+def dist_argmax_available() -> bool:
+    """Whether this platform can build a distributed-argmax state right now.
+
+    NVIDIA reduces through CuTe DSL and multicast (``cute_dsl``); AMD exchanges
+    per-row candidates through the Iris heap (``iris``). The verdict may differ
+    between ranks, so callers agree on it across the group before building.
+    """
+    platform = current_platform()
+    if platform.is_nvidia:
+        from tokenspeed_kernel.ops.sampling import cute_dsl
+
+        return cute_dsl.is_available()
+    if platform.is_amd:
+        from tokenspeed_kernel.ops.sampling import iris
+
+        return iris.is_available()
+    return False
+
+
+def supports_dist_argmax_shape(
+    vocab_per_rank: int, dtype: _torch.dtype, world_size: int
+) -> bool:
+    """Whether a shard's width, dtype and group size fit this platform's kernel.
+
+    Follows from the model config and the platform alone, so a caller may
+    reject on it before any collective work.
+    """
+    platform = current_platform()
+    if platform.is_nvidia:
+        from tokenspeed_kernel.ops.sampling import cute_dsl
+
+        return cute_dsl.supports_dist_argmax_shape(vocab_per_rank, dtype, world_size)
+    if platform.is_amd:
+        from tokenspeed_kernel.ops.sampling import iris
+
+        return iris.supports_dist_argmax_shape(vocab_per_rank, dtype, world_size)
+    return False
+
+
+def try_create_dist_argmax_state(
+    *,
+    group,
+    rank_in_group: int,
+    max_M: int,
+    dtype: _torch.dtype,
+    device: _torch.device,
+    skip_ping_pong: bool,
+):
+    """Build the group's distributed-argmax state, or None to keep the gather.
+
+    Collective over ``group``. Returns None when the platform lacks the
+    transport (no NVLS multicast, no prepared Iris heap).
+
+    Args:
+        group: The process group the argmax reduces over.
+        rank_in_group: This process's rank within ``group``.
+        max_M: Largest row count any call will pass.
+        dtype: Value dtype of the logits.
+        device: Device of the logits.
+        skip_ping_pong: The caller synchronizes the group between calls, so
+            the NVIDIA kernel may pin one slot band. The AMD exchange rotates
+            its slots by device-side epochs and is safe either way.
+    """
+    platform = current_platform()
+    if platform.is_nvidia:
+        from tokenspeed_kernel.ops.sampling import cute_dsl
+
+        return cute_dsl.try_create_dist_argmax_state(
+            group=group,
+            rank_in_group=rank_in_group,
+            max_M=max_M,
+            dtype=dtype,
+            device=device,
+            skip_ping_pong=skip_ping_pong,
+        )
+    if platform.is_amd:
+        from tokenspeed_kernel.ops.sampling import iris
+
+        return iris.try_create_dist_argmax_state(
+            group=group,
+            rank_in_group=rank_in_group,
+            max_M=max_M,
+            dtype=dtype,
+            device=device,
+        )
+    return None
+
+
+def distributed_argmax(state, logits: _torch.Tensor) -> _torch.Tensor:
+    """Row-wise argmax across the group's vocab shards.
+
+    Every rank of the state's group calls it in lockstep with its own
+    ``[M, vocab_per_rank]`` shard; rank ``r`` holds global columns
+    ``[r * vocab_per_rank, (r + 1) * vocab_per_rank)``.
+
+    Returns:
+        ``[M]`` int64 global indices, identical on every rank. Ties resolve
+        to the lowest index, as in :func:`argmax` over the gathered rows.
+    """
+    from tokenspeed_kernel.ops.sampling import iris
+
+    if isinstance(state, iris.IrisDistArgmaxState):
+        return iris.distributed_argmax(state, logits, out=None)
+    from tokenspeed_kernel.ops.sampling import cute_dsl
+
+    _, index = cute_dsl.distributed_argmax(state, logits)
+    return index
 
 
 # Backend registration (side-effect imports).

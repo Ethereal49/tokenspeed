@@ -149,6 +149,13 @@ class GreedySamplingBackend(SamplingBackend):
             (config.max_bs,), dtype=torch.int32, device=config.device
         )
 
+    def reads_argmax_only(self, sampling_info: SamplingBatchInfo) -> bool:
+        # Every row is greedy here; only a grammar mask (applied to the
+        # logits before the argmax) or output logprobs read the distribution.
+        return (
+            sampling_info.vocab_mask is None and not self.config.enable_output_logprobs
+        )
+
     @nvtx_range("sampling:sample", color="yellow")
     def sample(
         self,
@@ -165,7 +172,12 @@ class GreedySamplingBackend(SamplingBackend):
                 logits=logits, vocab_mask=sampling_info.vocab_mask
             )
         bs = logits.shape[0]
-        tokens = sampling_argmax(logits, out=self._sample_token_buf[:bs])
+        tokens = self._sample_token_buf[:bs]
+        if logits_output.next_token_ids is not None:
+            # The LM head already reduced the argmax across its vocab shards.
+            tokens.copy_(logits_output.next_token_ids)
+        else:
+            sampling_argmax(logits, out=tokens)
 
         # TP-rank sync (rank 0 wins), mirrors FlashInferSamplingBackend.sample.
         # All-gathered logits are not bit-identical across ranks, so per-rank
@@ -210,7 +222,11 @@ class GreedySamplingBackend(SamplingBackend):
                 logits=logits,
                 vocab_mask=sampling_info.vocab_mask,
             )
-        target_predict = sampling_argmax(logits).reshape(bs, num_tokens_per_req)
+        target_predict = (
+            logits_output.next_token_ids
+            if logits_output.next_token_ids is not None
+            else sampling_argmax(logits)
+        ).reshape(bs, num_tokens_per_req)
 
         if tree is not None:
             # The accepted path rides in accept_index so the TP broadcast below carries it.

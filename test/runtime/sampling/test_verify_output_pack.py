@@ -27,6 +27,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.sampling.backends import base
 from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
 from tokenspeed.runtime.sampling.backends.greedy import GreedySamplingBackend
@@ -115,7 +116,7 @@ def test_verify_lands_all_three_outputs_in_the_pack(monkeypatch) -> None:
     # Row 0's drafts match the target at every step; row 1's second draft does not.
     candidates = torch.tensor([[7, 10, 11], [8, 13, 99]], device="cuda")
     predict, lengths = backend.verify(
-        SimpleNamespace(next_token_logits=logits),
+        LogitsProcessorOutput(next_token_logits=logits),
         SimpleNamespace(vocab_mask=None, req_pool_indices=None),
         candidates,
         tree=None,

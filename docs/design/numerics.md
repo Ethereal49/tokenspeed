@@ -424,6 +424,17 @@ while the prompt-row chunks ask `_get_logits` for a private full-vocab tensor
 log-softmax may still be reading its result when a faster rank issues the next
 chunk's gather. The gathered values are identical either way.
 
+A forward whose sampler reads only each row's argmax
+(`SamplingBackend.reads_argmax_only`: the greedy backend with no output
+logprobs and no grammar mask, and no NaN detection) skips the sampled-row
+gather altogether: each rank reduces its own vocab shard and the ranks keep
+the largest of one `(value, global index)` key per row, so ties resolve to
+the lowest index and NaN follows the local argmax's rule, exactly as the
+argmax over the gathered row would. No logprob reads those rows, and prompt
+rows still gather (`require_full_vocab=True`). Like every distributed argmax
+it is off under the bitwise envelope and `--force-deterministic-rsag`, where
+the gather plus the canonical local argmax stays the verified form.
+
 Prompt logprobs are gathered in position chunks of
 `--input-logprob-chunk-tokens` rows so the transient `[rows, vocab]` logits
 stay bounded. The chunk size is a sizing knob, not a numerics one: the

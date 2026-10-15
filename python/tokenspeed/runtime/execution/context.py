@@ -151,6 +151,9 @@ class ForwardContext:
     forward_mode: ForwardMode | None
     output_layout: ForwardOutputLayout
     capture_hidden_mode: CaptureHiddenMode | None = CaptureHiddenMode.NULL
+    # The sampler reads only each sampled row's argmax token (see
+    # LogitsMetadata.sampler_reads_argmax_only); False keeps full-vocab logits.
+    sampler_reads_argmax_only: bool = False
     # Normalized explicit decode input overrides for this forward, if any.
     decode_input_ids: list[int] | None = None
 

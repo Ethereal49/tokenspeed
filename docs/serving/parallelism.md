@@ -899,7 +899,11 @@ fan-ins and dtypes, and any shape the workspace rejects, fall back to NCCL
 serves AMD only, where no trtllm workspace exists). Single-node token
 all-gather/reduce-scatter runs on the Triton RSAG backend and uses NCCL
 across nodes. Logits all-gather and distributed argmax use the same
-cross-node fallback. Layouts such as attention DP with dense TP or MoE EP
+cross-node fallback. When the sampler reads only the argmax (the `greedy`
+sampling backend without output logprobs, grammar or NaN detection), the
+sampled rows skip the logits all-gather: each rank reduces its vocab shard
+and the ranks exchange one 8-byte key per row, over NVLS multicast on NVIDIA
+and through the Iris heap the TP all-reduce prepared on AMD. Layouts such as attention DP with dense TP or MoE EP
 spanning nodes need this fallback.
 
 Under `--numerics rl-bitwise` (`--batch-invariant-collectives`) the
