@@ -29,8 +29,8 @@ IDs cover different element ranges. Triton RSAG remains independent.
 
 Model preparation, dispatch, and fusions live in `kimi_k3/` and
 `muse_spark/`. General collectives live in `all_reduce.py`,
-`reduce_scatter.py`, `all_gather.py`, and `broadcast.py`; `all_gather_quant.py`
-adds a width-parameterized RMSNorm/MXFP4 fusion. Exchanges with model-specific
+`reduce_scatter.py`, `all_gather.py`, and `broadcast.py`. The all-gather module
+also owns the width-parameterized RMSNorm/MXFP4 fusion. Exchanges with model-specific
 head layouts, route packets, or normalization semantics stay in the model
 package, along with dispatch and capacities.
 
