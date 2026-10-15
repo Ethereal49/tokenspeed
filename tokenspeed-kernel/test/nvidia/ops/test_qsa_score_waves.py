@@ -24,7 +24,6 @@ import math
 
 import pytest
 import torch
-from cuda.bindings import driver as cu
 from tokenspeed_kernel._triton import triton
 from tokenspeed_kernel.ops.attention.qsa import triton as qsa
 from tokenspeed_kernel.platform import current_platform
@@ -36,6 +35,9 @@ pytestmark = pytest.mark.skipif(
 
 
 def _score_launch(graph):
+    # AMD collects this module too; load CUDA bindings only when the tests run.
+    from cuda.bindings import driver as cu
+
     raw = cu.CUgraph(graph.raw_cuda_graph())
     status, nodes, count = cu.cuGraphGetNodes(raw, 1)
     assert status == cu.CUresult.CUDA_SUCCESS

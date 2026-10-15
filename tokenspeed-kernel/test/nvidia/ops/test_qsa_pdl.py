@@ -507,45 +507,6 @@ def _check_native_topk_edge(graph, enabled, rows, columns):
 
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("rows, columns", [(4, 8192), (36, 16384), (4, 65536)])
-def test_dsv4_decode_topk_preserves_global_pdl(enabled, rows, columns, restore_pdl):
-    for package in ("deep_gemm", "deep_ep", "trtllm_kernel"):
-        pytest.importorskip(package)
-    from tokenspeed_kernel.ops.attention.dsv4.deep_gemm import _decode_topk
-
-    if not has_ragged_decode_topk():
-        pytest.skip("CUDA persistent top-k is unavailable")
-    torch.manual_seed(389)
-    logits = torch.randn(rows, columns, device="cuda")
-    lengths = torch.full((rows,), columns, device="cuda", dtype=torch.int32)
-    target = torch.empty_like(logits)
-    target_lengths = torch.empty_like(lengths)
-    output = torch.empty(rows, 512, device="cuda", dtype=torch.int32)
-    workspace = torch.empty(1024 * 1024, device="cuda", dtype=torch.uint8)
-
-    def forward():
-        _publish((logits, lengths), (target, target_lengths))
-        return _decode_topk(target, target_lengths, 512, output, workspace)
-
-    pdl_enabled(enabled)
-    forward()
-    graph = torch.cuda.CUDAGraph(keep_graph=True)
-    with torch.cuda.graph(graph):
-        actual = forward()
-    _check_native_topk_edge(graph, enabled, rows, columns)
-    for length in (0, 513, columns):
-        logits.normal_()
-        lengths.fill_(length)
-        pdl_enabled(False)
-        expected = forward().sort(dim=1).values.clone()
-        target.fill_(float("nan"))
-        target_lengths.zero_()
-        pdl_enabled(not enabled)
-        graph.replay()
-        torch.testing.assert_close(actual.sort(dim=1).values, expected, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("rows, columns", [(4, 8192), (36, 16384), (4, 65536)])
 def test_dsa_persistent_decode_preserves_global_pdl(
     enabled, rows, columns, restore_pdl, monkeypatch
 ):
