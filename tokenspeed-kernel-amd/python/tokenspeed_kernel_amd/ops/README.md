@@ -526,9 +526,9 @@ enough rows, each row stays in one program. The span is a multiple of the
 tile and a runtime argument, so batch-size changes do not recompile the
 scorer. Only the first program of a KPool row writes its `row_ends_out`.
 
-### GFX950 selected-slot sparse attention
+### gfx950 selected-slot sparse attention
 
-For dense BF16, E4M3 and E5M2 query and KV rows with 512 latent values,
+For dense BF16, E4M3, and E5M2 query and KV rows with 512 latent values,
 the Gluon kernel computes score and value products in four 128-column
 phases. Matching dtypes retain their native matrix format; mixed inputs
 convert to BF16. Inside the key loop, it reuses selected indices staged in
@@ -543,7 +543,7 @@ Separate helpers contain the four-phase score/value products and normalized
 output stores. Matching dtypes use two shared buffers and asynchronous
 direct-to-shared transfers. Mixed inputs require conversion and refill their
 shared buffer after each tile. Tile partitioning, selection masks, online
-softmax and split reduction are shared across these inputs. Ordinary
+softmax, and split reduction are shared across these inputs. Ordinary
 shared-memory stores and loads use compiler-inferred synchronization, including
 the selected-index and single-buffer KV handoffs.
 
