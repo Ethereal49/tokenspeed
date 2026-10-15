@@ -223,7 +223,7 @@ if platform.is_amd:
         """
         if out is None:
             out = x.new_empty((x.shape[0], weight.shape[0]))
-        return _gemv_a16w16_impl(x, weight, out)
+        return _gemv_a16w16_impl(x, weight, out, silu_cols=0)
 
     @register_kernel(
         "gemm",

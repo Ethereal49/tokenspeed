@@ -23,13 +23,17 @@
 The mix runs as two launches instead of two GEMMs and two epilogues: a split-K
 down projection whose last split applies the projection scale and SiLU (and
 emits the inject logits), and an up projection whose epilogue gates and sums
-the normalized branches.
+the normalized branches. A single row with a unit projection scale runs the
+down projection on the decode GEMV with its SiLU-head epilogue instead.
 """
 
 from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
+    launch_gluon_gemv_a16w16_gfx950,
+)
 
 cdna4 = gl.amd.cdna4
 
@@ -489,14 +493,30 @@ def launch_gluon_hyperconnection_mix_gfx950(
         )
     device = normalized.device
     dtype = normalized.dtype
+    mixed = torch.empty((rows, hidden_size), dtype=dtype, device=device)
+    if rows == 1 and projection_scale == 1.0:
+        # One row: the decode GEMV streams the down weight over every CU
+        # without split-K partials (5.3 vs 6.8 us cold on MI350X). It
+        # rounds the product before the SiLU, as the split-K epilogue does.
+        projected = torch.empty((1, projection_rows), dtype=dtype, device=device)
+        launch_gluon_gemv_a16w16_gfx950(
+            normalized,
+            projection_weight[:projection_rows],
+            projected,
+            silu_cols=lowrank,
+        )
+        # One-row views, so their row strides are never used.
+        activated = projected[:, :lowrank]
+        inject = projected[:, lowrank:] if projection_rows > lowrank else None
+        _launch_mix_up(activated, up_weight, normalized, mixed, hc_count, lowrank)
+        return mixed, inject
+
     activated = torch.empty((rows, lowrank), dtype=dtype, device=device)
     inject = (
         torch.empty((rows, hc_count), dtype=dtype, device=device)
         if projection_rows > lowrank
         else None
     )
-    mixed = torch.empty((rows, hidden_size), dtype=dtype, device=device)
-
     block_m, block_n, block_k, warps_m, warps_n = _down_config(rows)
     split_k = wide // block_k
     n_tiles = -(-projection_rows // block_n)
@@ -525,7 +545,19 @@ def launch_gluon_hyperconnection_mix_gfx950(
         WARPS_N=warps_n,
         num_warps=warps_m * warps_n,
     )
+    _launch_mix_up(activated, up_weight, normalized, mixed, hc_count, lowrank)
+    return mixed, inject
 
+
+def _launch_mix_up(
+    activated: torch.Tensor,
+    up_weight: torch.Tensor,
+    normalized: torch.Tensor,
+    mixed: torch.Tensor,
+    hc_count: int,
+    lowrank: int,
+) -> None:
+    rows, hidden_size = mixed.shape
     block_m, block_h, block_r, warps_m = _up_config(rows)
     gluon_hyperconnection_mix_up_gfx950[
         (-(-rows // block_m) * (hidden_size // block_h),)
@@ -547,4 +579,3 @@ def launch_gluon_hyperconnection_mix_gfx950(
         WARPS_M=warps_m,
         num_warps=warps_m * hc_count,
     )
-    return mixed, inject

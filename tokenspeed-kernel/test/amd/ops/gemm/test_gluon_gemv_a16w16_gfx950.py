@@ -63,7 +63,7 @@ def test_gemv_matches_reference(m, n, k, dtype):
     x = torch.randn(m, k, device="cuda", dtype=dtype)
     w = torch.randn(n, k, device="cuda", dtype=dtype) / k**0.5
     out = torch.full((m, n), float("nan"), device="cuda", dtype=dtype)
-    launch_gluon_gemv_a16w16_gfx950(x, w, out)
+    launch_gluon_gemv_a16w16_gfx950(x, w, out, silu_cols=0)
     torch.testing.assert_close(out, _reference(x, w), rtol=_RTOL[dtype], atol=_ATOL)
 
 
@@ -73,21 +73,43 @@ def test_gemv_honors_activation_and_output_row_strides():
     x = x_rows[:, :k]
     w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / k**0.5
     out_rows = torch.zeros(m, n + 32, device="cuda", dtype=torch.bfloat16)
-    launch_gluon_gemv_a16w16_gfx950(x, w, out_rows[:, :n])
+    launch_gluon_gemv_a16w16_gfx950(x, w, out_rows[:, :n], silu_cols=0)
     expected = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
-    launch_gluon_gemv_a16w16_gfx950(x.contiguous(), w, expected)
+    launch_gluon_gemv_a16w16_gfx950(x.contiguous(), w, expected, silu_cols=0)
     assert torch.equal(out_rows[:, :n], expected)
     assert torch.count_nonzero(out_rows[:, n:]) == 0
+
+
+# The hyper-connection mix-down (N = 324, K = 10240) runs the LDS-staged tile.
+@pytest.mark.parametrize("n,k,silu_cols", [(324, 10240, 320), (2560, 320, 2560)])
+@pytest.mark.parametrize("m", [1, 4])
+def test_gemv_silu_head_equals_the_gemv_then_silu(m, n, k, silu_cols):
+    torch.manual_seed(m + n)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / k**0.5
+    plain = x.new_empty(m, n)
+    launch_gluon_gemv_a16w16_gfx950(x, w, plain, silu_cols=0)
+    fused = x.new_empty(m, n)
+    launch_gluon_gemv_a16w16_gfx950(x, w, fused, silu_cols=silu_cols)
+    expected = plain.clone()
+    expected[:, :silu_cols] = torch.nn.functional.silu(plain[:, :silu_cols].float()).to(
+        plain.dtype
+    )
+    # The kernel computes SiLU as v / (1 + exp(-v)) in FP32; Torch may round
+    # its own formula differently in the last FP32 bit, which the BF16
+    # output rarely keeps.
+    torch.testing.assert_close(fused, expected, rtol=2**-8, atol=0)
+    assert torch.equal(fused[:, silu_cols:], plain[:, silu_cols:])
 
 
 def test_gemv_rejects_unsupported_shapes():
     w = torch.empty(64, 128, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="does not support"):
         x = torch.empty(17, 128, device="cuda", dtype=torch.bfloat16)
-        launch_gluon_gemv_a16w16_gfx950(x, w, x.new_empty(17, 64))
+        launch_gluon_gemv_a16w16_gfx950(x, w, x.new_empty(17, 64), silu_cols=0)
     with pytest.raises(ValueError, match="contiguous"):
         x = torch.empty(1, 64, device="cuda", dtype=torch.bfloat16)
-        launch_gluon_gemv_a16w16_gfx950(x, w[:, :64], x.new_empty(1, 64))
+        launch_gluon_gemv_a16w16_gfx950(x, w[:, :64], x.new_empty(1, 64), silu_cols=0)
 
 
 def test_gemv_compiles_once_per_row_bucket():
@@ -96,7 +118,7 @@ def test_gemv_compiles_once_per_row_bucket():
 
     def run(m):
         x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-        launch_gluon_gemv_a16w16_gfx950(x, w, x.new_empty(m, n))
+        launch_gluon_gemv_a16w16_gfx950(x, w, x.new_empty(m, n), silu_cols=0)
 
     # Warm the M = 1 and M = 2..16 buckets.
     run(1)
@@ -121,5 +143,5 @@ def test_mm_routes_a_measured_shape_through_the_gemv(m):
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / k**0.5
     expected = x.new_empty(m, n)
-    launch_gluon_gemv_a16w16_gfx950(x, w, expected)
+    launch_gluon_gemv_a16w16_gfx950(x, w, expected, silu_cols=0)
     assert torch.equal(mm(x, w), expected)

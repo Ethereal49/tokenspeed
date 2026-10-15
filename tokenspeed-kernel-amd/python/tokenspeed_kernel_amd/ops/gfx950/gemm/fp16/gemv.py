@@ -100,6 +100,14 @@ def _fma_layout(block_n: int, chunk: int, num_warps: int):
 
 
 @gluon.jit
+def _silu_head(out, col, SILU_COLS: gl.constexpr, dtype: gl.constexpr):
+    """``out`` rounded to ``dtype``, through SiLU in columns below
+    ``SILU_COLS``, as an unfused GEMV and elementwise SiLU would compute it."""
+    value = out.to(dtype).to(gl.float32)
+    return gl.where(col < SILU_COLS, value / (1.0 + gl.exp(-value)), value)
+
+
+@gluon.jit
 def _fma_weight_offsets(
     tile,
     N,
@@ -145,6 +153,7 @@ def _fma_tile(
     K: gl.constexpr,
     BLOCK_N: gl.constexpr,
     KC: gl.constexpr,
+    SILU_COLS: gl.constexpr,
 ):
     L3: gl.constexpr = _fma_layout(BLOCK_N, KC, gl.num_warps())
     LW: gl.constexpr = gl.SliceLayout(2, L3)
@@ -176,6 +185,8 @@ def _fma_tile(
     out = gl.sum(acc, axis=1)
     rn = gl.arange(0, BLOCK_N, gl.SliceLayout(1, LW))
     col = tile * rows + rn
+    if SILU_COLS > 0:
+        out = _silu_head(out, col, SILU_COLS, y_ptr.dtype.element_ty)
     cdna4.buffer_store(
         out.to(y_ptr.dtype.element_ty), y_ptr, col, mask=(rn < rows) & (col < N)
     )
@@ -210,6 +221,7 @@ def _staged_tile(
     K: gl.constexpr,
     BLOCK_N: gl.constexpr,
     STAGES: gl.constexpr,
+    SILU_COLS: gl.constexpr,
 ):
     """M = 1 FMA tile whose weights stream through an LDS ring of ``STAGES``
     512-wide chunks filled by direct-to-LDS copies, which keeps more of a
@@ -278,6 +290,8 @@ def _staged_tile(
     out = gl.sum(acc, axis=1)
     rn = gl.arange(0, BLOCK_N, gl.SliceLayout(1, LW))
     col = tile * rows + rn
+    if SILU_COLS > 0:
+        out = _silu_head(out, col, SILU_COLS, y_ptr.dtype.element_ty)
     cdna4.buffer_store(
         out.to(y_ptr.dtype.element_ty), y_ptr, col, mask=(rn < rows) & (col < N)
     )
@@ -358,6 +372,7 @@ def _mfma_tile(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
+    SILU_COLS: gl.constexpr,
 ):
     KS: gl.constexpr = gl.num_warps()
     KITER: gl.constexpr = KS * BLOCK_K
@@ -396,6 +411,8 @@ def _mfma_tile(
     o_m = gl.arange(0, BLOCK_M, gl.SliceLayout(1, out_l))
     o_n = gl.arange(0, BLOCK_N, gl.SliceLayout(0, out_l))
     col = tile * rows + o_n
+    if SILU_COLS > 0:
+        out = _silu_head(out, col[None, :], SILU_COLS, y_ptr.dtype.element_ty)
     cdna4.buffer_store(
         out.to(y_ptr.dtype.element_ty),
         y_ptr,
@@ -424,6 +441,7 @@ def gluon_gemv_a16w16_gfx950(
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     STAGES: gl.constexpr,
+    SILU_COLS: gl.constexpr,
 ):
     """Output columns ``[pid * rows, (pid + 1) * rows)`` of every row.
 
@@ -431,13 +449,13 @@ def gluon_gemv_a16w16_gfx950(
     ``y`` is ``[M, N]`` (row stride ``stride_ym``). ``BLOCK_N >= rows`` is
     the padded row block; ``BLOCK_K`` is the FMA chunk (``BLOCK_M == 1``) or
     the per-wave MFMA K step; ``STAGES > 0`` selects the LDS-staged M = 1
-    tile.
+    tile. Output columns below ``SILU_COLS`` go through SiLU after rounding.
     """
     tile = gl.program_id(0)
     if BLOCK_M == 1 and STAGES > 0:
-        _staged_tile(tile, x_ptr, w_ptr, y_ptr, N, rows, K, BLOCK_N, STAGES)
+        _staged_tile(tile, x_ptr, w_ptr, y_ptr, N, rows, K, BLOCK_N, STAGES, SILU_COLS)
     elif BLOCK_M == 1:
-        _fma_tile(tile, x_ptr, w_ptr, y_ptr, N, rows, K, BLOCK_N, BLOCK_K)
+        _fma_tile(tile, x_ptr, w_ptr, y_ptr, N, rows, K, BLOCK_N, BLOCK_K, SILU_COLS)
     else:
         _mfma_tile(
             tile,
@@ -453,6 +471,7 @@ def gluon_gemv_a16w16_gfx950(
             BLOCK_M,
             BLOCK_N,
             BLOCK_K,
+            SILU_COLS,
         )
 
 
@@ -508,7 +527,7 @@ def prefers_gluon_gemv_a16w16_gfx950(m: int, n: int, k: int) -> bool:
 
 
 def launch_gluon_gemv_a16w16_gfx950(
-    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor, *, silu_cols: int
 ) -> torch.Tensor:
     """Run the decode GEMV ``out = x @ weight.T``.
 
@@ -517,6 +536,9 @@ def launch_gluon_gemv_a16w16_gfx950(
             ``1 <= M <= 16`` and ``K`` a multiple of 16.
         weight: Contiguous ``[N, K]`` weight in ``x``'s dtype.
         out: ``[M, N]`` destination in ``x``'s dtype with unit inner stride.
+        silu_cols: Leading output columns that go through SiLU, ``0..N``.
+            The product is rounded to ``x``'s dtype first, so the result
+            equals the GEMV followed by an elementwise SiLU of those columns.
 
     Returns:
         ``out``.
@@ -536,6 +558,8 @@ def launch_gluon_gemv_a16w16_gfx950(
         raise ValueError(f"out must be [{m}, {n}] and x and out row-major")
     if not supports_gluon_gemv_a16w16_gfx950(m, n, k):
         raise ValueError(f"decode GEMV does not support M={m}, N={n}, K={k}")
+    if not 0 <= silu_cols <= n:
+        raise ValueError(f"silu_cols={silu_cols} is outside 0..{n}")
     cus = torch.cuda.get_device_properties(x.device).multi_processor_count
     rows, block_m, block_n, block_k, stages = _config(m, n, k, cus)
     gluon_gemv_a16w16_gfx950[(triton.cdiv(n, rows),)](
@@ -552,6 +576,7 @@ def launch_gluon_gemv_a16w16_gfx950(
         BLOCK_N=block_n,
         BLOCK_K=block_k,
         STAGES=stages,
+        SILU_COLS=silu_cols,
         num_warps=NUM_WARPS,
     )
     return out

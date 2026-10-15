@@ -124,6 +124,9 @@ decode batches, `1 <= M <= 16`, with one program per CU.
   GEMM at one row, the decode GEMM or hipBLASLt above) in cold-cache
   standalone sweeps. It is the only `mv` kernel that serves single rows on
   gfx950; direct calls take any supported shape.
+- `silu_cols` rounds the product to the output dtype and applies SiLU to the
+  first `silu_cols` output columns (the hyper-connection mix-down, whose
+  remaining columns are inject logits); 0 leaves every column linear.
 - One binary per (shape, M bucket): M = 1, and M = 2-16. `M` and `N` are
   runtime arguments.
 
@@ -1452,7 +1455,10 @@ first MFMA; the conversion to the MFMA operand layout broadcasts a shared
 operand through LDS rather than re-reading it per wave. Each split writes an
 FP32 partial through to memory and bumps a per-tile counter; the last split
 sums the partials, applies scale and SiLU, and writes the activation (and
-inject logits).
+inject logits). A single row with a unit projection scale instead runs the
+down projection on the decode GEMV (`gluon_gemv_a16w16_gfx950` with
+`silu_cols = R`), which needs no partials: 5.3 against 6.8 us cold. From two
+rows the split-K kernel is as fast or faster.
 
 The up projection gives each workgroup 16 hidden columns of all four
 branches as one MFMA tile, one branch per wave, with the 320-deep reduction
