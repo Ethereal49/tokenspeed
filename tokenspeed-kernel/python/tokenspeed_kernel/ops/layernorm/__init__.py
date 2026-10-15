@@ -22,7 +22,14 @@
 
 from __future__ import annotations
 
+import tokenspeed_kernel.ops.layernorm._triton.weightless  # noqa: F401
 import torch
+from tokenspeed_kernel.ops.layernorm.fused_norm import (
+    affine_rmsnorm,
+    weightless_qk_rmsnorm,
+    weightless_rmsnorm,
+    weightless_rmsnorm_gated_sigmoid,
+)
 from tokenspeed_kernel.ops.layernorm.triton import (
     add_rmsnorm,
 )
@@ -219,6 +226,7 @@ def gated_residual_combine_norm(
 
 __all__ = [
     "add_rmsnorm",
+    "affine_rmsnorm",
     "gated_residual_combine_norm",
     "grouped_gemma_rmsnorm",
     "grouped_rmsnorm",
@@ -226,4 +234,7 @@ __all__ = [
     "qk_rmsnorm",
     "reference_rmsnorm",
     "rmsnorm",
+    "weightless_qk_rmsnorm",
+    "weightless_rmsnorm",
+    "weightless_rmsnorm_gated_sigmoid",
 ]
