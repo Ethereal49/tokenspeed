@@ -249,7 +249,25 @@ actual owner counts remain runtime inputs, including during graph replay.
 Preparation allocates fused state only for TP sizes enabled in automatic dispatch
 and capacities that can reach their minimum row count. Direct kernel APIs may
 support additional TP sizes without allocating their state in ordinary serving.
-When column projection fusion cannot be prepared, the first rank in each subgroup
+The fused KDA output projection follows the same lifetime and ownership rules.
+It replaces `DPRowParallelLinear`'s all-to-all, block-FP8 GEMM, and reduce-scatter
+with one launch. Each owner quantizes 128-channel input groups and sends each
+channel shard only to the rank holding its weights. GEMM produces BF16 partials;
+the owner waits for every contributing producer, sums the partials in FP32, and
+rounds the final output to BF16. TP2 and TP4 share the implementation. Row projection joins block arrivals
+within each GPU, then publishes system-scope epochs to peers. Input and partial
+output readiness are acquired concurrently, one lane per contributing peer.
+Automatic
+selection covers TP2 and TP4 with a subgroup maximum of 128 rows for the
+12288-to-7168 KDA projection on node-local GB300 groups. At 64 rows the ordinary
+path remains preferable or comparable and retains automatic selection.
+Other row counts, batch-invariant collectives, and unsupported configurations use the ordinary
+path. Prepared row-fusion capacity is capped at 128, independently of the larger
+ordinary workspace capacity. Both fused projections require an isolated,
+fully resident grid; concurrent workspace use or competing distributed kernels
+remain unsupported.
+
+When projection fusion cannot be prepared, the first rank in each subgroup
 logs the reason once during workspace preparation, outside the forward path.
 
 ### Padding contract
