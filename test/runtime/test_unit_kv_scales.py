@@ -95,6 +95,17 @@ def test_the_checkpoint_error_names_every_non_unit_scale():
     assert "layers.5.self_attn.v_proj.v_scale" in str(info.value)
 
 
+def test_scales_of_checkpoint_parts_the_model_does_not_load_pass():
+    """An embedded MTP head's scales are its draft model's to check."""
+    weights = [
+        ("mtp.layers.0.mixer.k_proj.k_scale", torch.tensor(0.06)),
+        ("backbone.layers.7.mixer.k_proj.k_scale", torch.tensor(1.0)),
+    ]
+    assert list(require_unit_kv_scales(weights, ("mtp.",))) == weights
+    with pytest.raises(ValueError, match="mtp.layers.0"):
+        list(require_unit_kv_scales(weights))
+
+
 def _scale_file(tmp_path, scales: dict[int, dict[int, float]]) -> str:
     path = tmp_path / "kv_scales.json"
     path.write_text(
@@ -198,6 +209,8 @@ def test_a_checkpoint_load_rejects_a_non_unit_kv_scale(tmp_path):
     )
     with pytest.raises(ValueError, match="k_proj.k_scale"):
         list(loader._get_all_weights(model_config, model))
+    model.unused_checkpoint_prefixes = ("model.layers.0.self_attn.",)
+    assert len(list(loader._get_all_weights(model_config, model))) == 2
 
 
 def test_a_distributed_update_finishes_its_load_before_rejecting_a_scale(monkeypatch):

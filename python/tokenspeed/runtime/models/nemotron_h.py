@@ -831,6 +831,8 @@ class NemotronHModel(nn.Module):
 
 class NemotronHForCausalLM(BaseCausalLM):
     model_cls = NemotronHModel
+    # The MTP head, which NemotronHForCausalLMNextN loads.
+    unused_checkpoint_prefixes = ("mtp.",)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         params = dict(self.named_parameters())

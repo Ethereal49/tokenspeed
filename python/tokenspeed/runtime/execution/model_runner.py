@@ -466,7 +466,13 @@ class ModelRunner:
             # take no session (multimodal wrappers).
             rejected: list[str] = []
             with weight_update_session([self.model]):
-                self.model.load_weights(record_non_unit_kv_scales(_recv(), rejected))
+                self.model.load_weights(
+                    record_non_unit_kv_scales(
+                        _recv(),
+                        rejected,
+                        getattr(self.model, "unused_checkpoint_prefixes", ()),
+                    )
+                )
             torch.cuda.synchronize(device)
             if rejected:
                 return False, (

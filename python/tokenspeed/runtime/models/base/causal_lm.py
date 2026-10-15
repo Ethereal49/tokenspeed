@@ -57,11 +57,15 @@ def _record_loaded_names(load_weights: Callable) -> Callable:
             # The session owns the stream contract whoever drives the calls
             # (the trainer's NCCL receive loop, the Model Updater SDK), so the
             # check lives here rather than at each caller.
+            unused = self.unused_checkpoint_prefixes
             if args:
-                args = (record_non_unit_kv_scales(args[0], rejected), *args[1:])
+                args = (
+                    record_non_unit_kv_scales(args[0], rejected, unused),
+                    *args[1:],
+                )
             else:
                 kwargs["weights"] = record_non_unit_kv_scales(
-                    kwargs["weights"], rejected
+                    kwargs["weights"], rejected, unused
                 )
         loaded = load_weights(self, *args, **kwargs)
         if isinstance(loaded, set):
@@ -121,6 +125,9 @@ class BaseCausalLM(nn.Module):
     """
 
     model_cls: type[BaseTransformerModel]
+    # Checkpoint name prefixes the model does not load, such as an MTP head the
+    # draft model loads; their KV-cache scales are the draft's to check.
+    unused_checkpoint_prefixes: ClassVar[tuple[str, ...]] = ()
     # Whether the model's MoE layers route through the process-global expert
     # placement (redundant replicas, load counters; ``moe/expert_location.py``)
     # and its loader fills every placed slot. ``build_expert_placement``

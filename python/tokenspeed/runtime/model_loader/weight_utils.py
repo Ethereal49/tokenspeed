@@ -1030,12 +1030,19 @@ def initialize_dummy_integer_weights(model: torch.nn.Module, seed: int = 1234) -
 
 
 def record_non_unit_kv_scales(
-    weights: Iterable[tuple[str, torch.Tensor]], rejected: list[str]
+    weights: Iterable[tuple[str, torch.Tensor]],
+    rejected: list[str],
+    unused_prefixes: tuple[str, ...] = (),
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Pass weights through, appending each KV-cache scale other than one to
-    ``rejected``; KV caches are written and read at unit scale."""
+    ``rejected``; KV caches are written and read at unit scale. Scales under
+    ``unused_prefixes``, checkpoint parts the model does not load, pass."""
     for name, tensor in weights:
-        if name.endswith(_KV_SCALE_SUFFIXES) and not bool(torch.all(tensor == 1)):
+        if (
+            name.endswith(_KV_SCALE_SUFFIXES)
+            and not name.startswith(unused_prefixes)
+            and not bool(torch.all(tensor == 1))
+        ):
             rejected.append(f"{name}={tensor.flatten()[:4].tolist()}")
         yield name, tensor
 
@@ -1049,11 +1056,12 @@ def non_unit_kv_scale_message(rejected: list[str]) -> str:
 
 def require_unit_kv_scales(
     weights: Iterable[tuple[str, torch.Tensor]],
+    unused_prefixes: tuple[str, ...] = (),
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Pass checkpoint weights through, raising once the stream is drained if
-    a KV-cache scale is not one."""
+    a KV-cache scale the model loads is not one."""
     rejected: list[str] = []
-    yield from record_non_unit_kv_scales(weights, rejected)
+    yield from record_non_unit_kv_scales(weights, rejected, unused_prefixes)
     if rejected:
         raise ValueError(non_unit_kv_scale_message(rejected))
 

@@ -420,9 +420,7 @@ class DefaultModelLoader(BaseModelLoader):
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files)
 
-        return require_unit_kv_scales(
-            (source.prefix + name, tensor) for (name, tensor) in weights_iterator
-        )
+        return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 
     def _get_all_weights(
         self,
@@ -470,19 +468,28 @@ class DefaultModelLoader(BaseModelLoader):
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", False),
         )
-        yield from self._get_weights_iterator(
-            primary_weights,
-            weight_name_filter,
-            checkpoint_load_group,
-            mapping,
+        # Checkpoint parts another model loads (an embedded MTP head) keep
+        # their KV-cache scales out of this model's unit-scale check.
+        unused_prefixes = getattr(model, "unused_checkpoint_prefixes", ())
+        yield from require_unit_kv_scales(
+            self._get_weights_iterator(
+                primary_weights,
+                weight_name_filter,
+                checkpoint_load_group,
+                mapping,
+            ),
+            unused_prefixes,
         )
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source], getattr(model, "secondary_weights", ())
         )
         for source in secondary_weights:
-            yield from self._get_weights_iterator(
-                source, weight_name_filter, checkpoint_load_group, mapping
+            yield from require_unit_kv_scales(
+                self._get_weights_iterator(
+                    source, weight_name_filter, checkpoint_load_group, mapping
+                ),
+                unused_prefixes,
             )
 
     def download_model(self, model_config: ModelConfig) -> None:

@@ -123,6 +123,7 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronHForCausalLM):  # noqa: N801
 
     # The checkpoint's per-layer quantization names the language model under this prefix.
     quant_module_name_replacements = (("language_model.", ""),)
+    unused_checkpoint_prefixes = ("language_model.mtp.",)
 
     def __init__(
         self,
