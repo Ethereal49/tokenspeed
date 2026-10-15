@@ -534,8 +534,9 @@ def index_topk(
     scores packed FP4 inputs with FP32 accumulation and DeepSelect selects rows
     and block maxima; on Hopper, DeepGEMM scores FP8 ``index_v4`` rows and the
     in-tree CuTe DSL DeepSelect kernel selects. This native accumulation
-    differs from the portable reference's intermediate BF16 rounding. Native query tiles cap logits at
-    32MiB for paged queries and 128MiB for a zero-row-stride request table.
+    differs from the portable reference's intermediate BF16 rounding.
+    Full-scoring query tiles cap logits at 32MiB for paged queries and
+    128MiB for a zero-row-stride request table.
     That broadcast layout gathers packed history once per call and packs Q
     once before the score tiles; no payload survives the call. For unsharded
     68-byte MXFP4 caches, AMD Gluon Full similarly caps each FP32 logits query
@@ -544,10 +545,10 @@ def index_topk(
     Blackwell Reindex uses DeepGEMM's native sparse MQA scorer when the index
     page stride is a multiple of 512 bytes. It reads the owner's cache directly,
     with BF16 head weights, weighted head reduction and logits. DeepSelect
-    consumes those BF16 scores directly. Tiles contain at most 32 queries and
-    1MiB of logits, plus candidate indices and scheduling metadata; no candidate
-    K payload is copied. This applies equally to broadcast and paged query
-    tables, including short final tiles. Other page strides keep full scoring
+    consumes those BF16 scores directly. Tiles follow query_chunk_size, with
+    at most 16384 BF16 logits per query; no candidate K payload is copied.
+    This applies equally to broadcast and paged query tables, including short
+    final tiles. Other page strides keep full scoring
     followed by candidate masking. The candidate selection semantics are the
     same; BF16 scores need not produce the FP32 path's exact Top-K at ties.
     """

@@ -326,9 +326,9 @@ def _sparse_candidate_scores(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return BF16 logits, candidate-row ends and sorted unique 8-row block IDs.
 
-    index_topk supplies 1..32 queries, 1..2048 candidate blocks, BF16 weights
+    index_topk supplies a query tile, 1..2048 candidate blocks, BF16 weights
     and FP4 cache pages with 512-byte aligned sub-2GiB strides. Native scoring
-    reads K in place; each call owns its schedule and at most 1 MiB of logits.
+    reads K in place; each call owns its schedule and BF16 candidate logits.
     Invalid pages, duplicates and future blocks are removed; page zero is valid.
 
     skip_score_topk is the selection width, or zero for all scores. Pools that

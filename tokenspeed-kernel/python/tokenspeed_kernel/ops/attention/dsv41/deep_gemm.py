@@ -271,9 +271,11 @@ def index_topk(
     # Wide histories benefit from skipping wholly future cleaning tiles;
     # combine full-width block preparation only for smaller capacities.
     prepare_blocks = candidate_topk > 0 and capacity <= 65536
-    budget = (128 if dense else 32) << 20
-    # Sparse tiles bound metadata and BF16 logits, independent of history.
-    tile = min(query_chunk_size, 32 if sparse else max(1, budget // (capacity * 4)))
+    # Sparse width is bounded by candidates; use the caller's query tile.
+    tile = query_chunk_size
+    if not sparse:
+        budget = (128 if dense else 32) << 20
+        tile = min(tile, max(1, budget // (capacity * 4)))
     cache = index_cache.as_strided(
         (index_cache.shape[0], 64 * 68), (index_cache.stride(0), 1)
     )

@@ -349,7 +349,10 @@ def test_sparse_scoring_skip_uses_live_pool_count_in_one_graph(
 
 
 @pytest.mark.parametrize("broadcast", [False, True])
-def test_reindex_chunked_graph_matches_sparse_reference(broadcast, monkeypatch):
+@pytest.mark.parametrize("query_chunk_size", [32, 256])
+def test_reindex_chunked_graph_matches_sparse_reference(
+    broadcast, query_chunk_size, monkeypatch
+):
     """Small/partial query tiles use sparse scoring, including shared prefill tables."""
     _, weights, cache, table, lengths, candidates, api = _sparse_inputs(33, 2048, True)
     if broadcast:
@@ -383,7 +386,7 @@ def test_reindex_chunked_graph_matches_sparse_reference(broadcast, monkeypatch):
             512,
             0,
             8,
-            32,
+            query_chunk_size,
             256,
             None,
             None,
