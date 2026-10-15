@@ -34,8 +34,11 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=20, suite="runtime-1gpu")
 
-from tokenspeed.runtime.layers.attention.linear.layernorm_gated import (  # noqa: E402
+from tokenspeed_kernel.ops.layernorm._triton.gated_rmsnorm import (  # noqa: E402
     ROWS_PER_PROGRAM,
+)
+
+from tokenspeed.runtime.layers.attention.linear.layernorm_gated import (  # noqa: E402
     rmsnorm_fn,
 )
 
