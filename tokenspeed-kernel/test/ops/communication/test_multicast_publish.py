@@ -65,7 +65,7 @@ def test_publish_copies_whole_words_into_a_strided_slot(
 @pytest.mark.parametrize("path", ["decode_gemv", "torch.mm"])
 def test_no_gemm_output_spells_the_half_polled_sentinel(path: str) -> None:
     """NaN and Inf inputs, even a 0xFFFF-payload NaN, come out as 0x7FFF."""
-    from tokenspeed_kernel.ops.gemm import decode_gemv
+    from tokenspeed_kernel.ops.gemm import mv
 
     torch.manual_seed(0)
     n, k = 1024, 8192
@@ -76,7 +76,7 @@ def test_no_gemm_output_spells_the_half_polled_sentinel(path: str) -> None:
     x[0, 9] = float("inf")
     x[0, 10] = float("-inf")
     x.view(torch.int16)[0, 7] = -1
-    out = decode_gemv(x, weight) if path == "decode_gemv" else torch.mm(x, weight.t())
+    out = mv(x, weight) if path == "decode_gemv" else torch.mm(x, weight.t())
     torch.cuda.synchronize()
     bits = out.view(torch.int16).to(torch.int32) & 0xFFFF
     assert torch.isnan(out).any()

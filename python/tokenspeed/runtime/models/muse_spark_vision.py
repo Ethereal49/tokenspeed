@@ -168,6 +168,20 @@ def pixel_shuffle_permutation(
     factor: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, int]:
+    """Order a patch grid so each downsample block's factor-by-factor patches are adjacent.
+
+    Args:
+        offset: Global patch id of the grid's first row-major patch.
+        grid_h: Patch rows; must be a multiple of ``factor``.
+        grid_w: Patch columns; must be a multiple of ``factor``.
+        factor: Downsample factor; ``factor**2`` patches merge into one output.
+        device: Device for the returned permutation.
+
+    Returns:
+        The ``(order, next offset)`` tuple: global patch ids permuted from
+        row-major ``(h, w)`` into block-major ``(h // factor, w // factor,
+        in-block h, in-block w)`` order, and the first global id past this grid.
+    """
     if grid_h % factor or grid_w % factor:
         raise ValueError("Vision tower patch grid must align to its downsample factor")
     order = torch.arange(offset, offset + grid_h * grid_w, device=device)
@@ -184,6 +198,20 @@ def downsample_pixel_shuffle(
     permutation: torch.Tensor,
     factor: int,
 ) -> torch.Tensor:
+    """Merge each downsample block's patches into one wider row.
+
+    Args:
+        value: ``[patches, channels]`` features to downsample.
+        permutation: The pixel-shuffle order from
+            :func:`pixel_shuffle_permutation`; each run of ``factor**2``
+            entries covers one output block's patches.
+        factor: Downsample factor; ``factor**2`` rows merge into one.
+
+    Returns:
+        The ``[patches // factor**2, channels * factor**2]`` tensor gathered
+        by ``permutation`` with every block's patch rows concatenated along
+        the channel dimension.
+    """
     pixels_per_output = factor**2
     shuffled = value[permutation]
     return (
@@ -201,6 +229,26 @@ def sparse_permutation(
     block_w: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, list[int], int]:
+    """Order a patch grid block by block for window attention, padding ragged blocks.
+
+    The grid is padded with ``-1`` sentinels up to whole ``block_h``-by-
+    ``block_w`` blocks, the row-major patch ids are regrouped so each block's
+    patches are consecutive, and the sentinels are dropped, leaving blocks of
+    unequal valid length along the tail of the grid.
+
+    Args:
+        offset: Global patch id of the grid's first row-major patch.
+        grid_h: Patch rows.
+        grid_w: Patch columns.
+        block_h: Window rows.
+        block_w: Window columns.
+        device: Device for the returned permutation.
+
+    Returns:
+        The ``(order, lengths, next offset)`` tuple: the compacted global
+        patch ids in block-major order, each block's valid (non-padded)
+        patch count, and the first global id past this grid.
+    """
     padded_h = math.ceil(grid_h / block_h) * block_h
     padded_w = math.ceil(grid_w / block_w) * block_w
     order = torch.arange(offset, offset + grid_h * grid_w, device=device).reshape(
@@ -267,6 +315,8 @@ class MuseSparkVisionMLP(nn.Module):
 
 
 class MuseSparkVisionBlock(nn.Module):
+    """One pre-norm attention-plus-MLP transformer block of the vision tower."""
+
     def __init__(
         self,
         config: MuseSparkVisionConfig,

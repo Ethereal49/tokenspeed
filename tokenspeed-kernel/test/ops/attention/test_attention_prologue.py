@@ -73,6 +73,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 )
 from tokenspeed_kernel.ops.layernorm import qk_rmsnorm
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -820,6 +821,10 @@ def test_a_single_kv_head_cache_may_carry_any_head_stride():
         assert bytes_equal(a, b)
 
 
+@pytest.mark.skipif(
+    not current_platform().is_cdna4,
+    reason="the Triton solution's no-copy prepared store exists only on CDNA4",
+)
 @pytest.mark.parametrize(
     "dtype,cache_dtype,return_kv",
     [(BF16, BF16, False), (torch.float16, BF16, True), (BF16, FP8, False)],

@@ -100,7 +100,6 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     NemotronHConfig.model_type: NemotronHConfig,
     NemotronHOmniConfig.model_type: NemotronHOmniConfig,
     MuseSparkConfig.model_type: MuseSparkConfig,
-    NemotronHConfig.model_type: NemotronHConfig,
     "glm5_next": Glm53FlashConfig,
 }
 

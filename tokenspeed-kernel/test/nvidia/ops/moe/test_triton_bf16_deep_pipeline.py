@@ -25,7 +25,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.moe.triton import bf16
+from tokenspeed_kernel.ops.moe._triton import bf16
 from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(

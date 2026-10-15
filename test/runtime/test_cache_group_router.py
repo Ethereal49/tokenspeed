@@ -669,15 +669,14 @@ class TestCacheGroupRouterTest:
                 forward_mode=ForwardMode.DECODE,
                 block_tables=self._tables(),
             )
-        self.assertEqual(launches, [2])
-        self.assertEqual(batched.seq_lens_buf.tolist(), [9, 4, 1, 1])
-        self.assertEqual(
-            batched.page_table_buf.tolist(),
-            [[5, 6, 0, 0, 0, 0], [9, 0, 2, 0, 0, 0], [0] * 6, [0] * 6],
+        assert launches == [2]
+        assert batched.seq_lens_buf.tolist() == [9, 4, 1, 1]
+        assert batched.page_table_buf.tolist() == (
+            [[5, 6, 0, 0, 0, 0], [9, 0, 2, 0, 0, 0], [0] * 6, [0] * 6]
         )
-        self.assertEqual(batched.calls[-2], ("publish", 4, 0))
+        assert batched.calls[-2] == ("publish", 4, 0)
         # A leaf without targets keeps its own refresh.
-        self.assertEqual(own.calls[-2], ("refresh", 4, 2, 0, False))
+        assert own.calls[-2] == ("refresh", 4, 2, 0, False)
 
     def test_forward_dispatches_by_group_with_group_write_locations(self):
         router, leaves = self._router()

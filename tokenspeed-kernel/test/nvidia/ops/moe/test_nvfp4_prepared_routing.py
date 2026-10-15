@@ -27,11 +27,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.moe import flashinfer as module
 from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.ops.moe._triton.sigmoid_topk_routing import (
     triton_sigmoid_bias_topk_routing,
 )
-from tokenspeed_kernel.ops.moe.flashinfer import trtllm_nvfp4 as module
 from tokenspeed_kernel.platform import current_platform
 
 flashinfer_moe = pytest.importorskip("flashinfer.fused_moe.core")
