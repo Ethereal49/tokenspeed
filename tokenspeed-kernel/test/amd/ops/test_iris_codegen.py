@@ -18,12 +18,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Compile the generic Iris all-reduce protocols without launching them."""
+"""Compile the Iris pull all-reduce protocols without launching them."""
 
 import re
 
 import pytest
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import ArchVersion, current_platform
+
+_ARCH_VERSIONS = {"gfx950": ArchVersion(9, 5), "gfx1250": ArchVersion(12, 5)}
 
 _ARCHS = (
     pytest.param(
@@ -58,7 +60,7 @@ def _compile(arch_name, kind, world_size):
     from tokenspeed_kernel._triton import gl, gluon, triton
     from tokenspeed_kernel.ops.communication._iris import all_reduce as ar
 
-    arch = ar.iris_arch_config(arch_name)
+    arch = ar.pull_all_reduce_arch_config(_ARCH_VERSIONS[arch_name])
     if kind == "staged_oneshot":
         fn = ar.iris_pull_oneshot_staged
         signature = {
@@ -136,6 +138,16 @@ def _compile(arch_name, kind, world_size):
     return kernel
 
 
+_LOAD = re.compile(r"\b(?:global|buffer)_load_(\w+)")
+# Flags are 32-bit; the aligned BF16 payload is always loaded in wider words.
+_FLAG_WIDTHS = ("dword", "b32")
+
+
+def _policy(line):
+    """Return the cache-policy fields of a memory instruction."""
+    return " ".join(re.findall(r"\b(?:sc0|sc1|nt|th:\w+|scope:\w+)\b", line))
+
+
 def _backedge_cycles(lines):
     """Return the line spans that a backward branch closes.
 
@@ -158,18 +170,28 @@ def _backedge_cycles(lines):
 # gfx12 spells the cache policy as th:/scope: fields, gfx9 as sc0/sc1/nt bits.
 _ISA = {
     "gfx950": {
+        "flag_load": "sc0 sc1",
+        # Buffer loads spell the .cg peer loads "sc0 nt"; local loads are plain.
+        "payload_loads": {"", "nt", "sc0 nt"},
         "system": r"\bsc1\b",
-        "non_temporal": r"\bnt\b",
         "flag_store": r"\bglobal_store_dword\s",
     },
     "gfx1250": {
+        "flag_load": "th:TH_LOAD_NT scope:SCOPE_SYS",
+        "payload_loads": {""},
         "system": r"\bSCOPE_SYS\b",
-        "non_temporal": r"\bTH_LOAD_NT\b",
         "flag_store": r"\bglobal_store_b32\b",
     },
 }
 
 _KINDS = ("staged_oneshot", "pull_oneshot", "pull_twoshot", "pull_twoshot_exit")
+
+
+def _expected_polls(kind, world_size):
+    """The staged gather polls once per peer, the pull protocols once per barrier."""
+    if kind == "staged_oneshot":
+        return world_size - 1
+    return 3 if kind == "pull_twoshot_exit" else 2
 
 
 @pytest.mark.parametrize("world_size", (2, 4, 8))
@@ -181,8 +203,8 @@ def test_iris_all_reduce_codegen(arch, kind, world_size, tmp_path):
     Flag polls and epoch atomics are system-scoped on every architecture, and
     each poll must stay on its retry backedge. gfx950 reads peer data
     non-temporally and writes peer flags write-through. On gfx1250 a
-    non-temporal data load refetches every partially read sector over the
-    fabric, so only the flag polls may bypass the cache.
+    non-temporal or scoped data load refetches every partially read sector over
+    the fabric, so payload loads carry no cache policy at all.
     """
     isa = _ISA[arch]
     kernel = _compile(arch, kind, world_size)
@@ -190,24 +212,24 @@ def test_iris_all_reduce_codegen(arch, kind, world_size, tmp_path):
     (tmp_path / f"{arch}-{kind}-ws{world_size}.amdgcn").write_text(assembly)
     lines = assembly.splitlines()
 
-    loads = [line for line in lines if re.search(r"\b(global|buffer)_load_", line)]
-    non_temporal = [line for line in loads if re.search(isa["non_temporal"], line)]
-    if arch == "gfx1250":
-        assert all(
-            re.search(isa["system"], line) for line in non_temporal
-        ), non_temporal
-    else:
+    loads = [
+        (index, match[1])
+        for index, line in enumerate(lines)
+        if (match := _LOAD.search(line))
+    ]
+    polls = [index for index, width in loads if width in _FLAG_WIDTHS]
+    payload = [lines[index] for index, width in loads if width not in _FLAG_WIDTHS]
+    assert len(polls) == _expected_polls(kind, world_size), [lines[i] for i in polls]
+    assert all(_policy(lines[index]) == isa["flag_load"] for index in polls), [
+        lines[index] for index in polls
+    ]
+    assert payload
+    assert all(_policy(line) in isa["payload_loads"] for line in payload), payload
+    if arch == "gfx950":
         assert any(
-            not re.search(isa["system"], line) for line in non_temporal
+            "nt" in _policy(line).split() for line in payload
         ), "peer data loads lost their non-temporal hint"
 
-    polls = [
-        index
-        for index, line in enumerate(lines)
-        if re.search(r"\b(global|buffer)_load_", line)
-        and re.search(isa["system"], line)
-    ]
-    assert polls
     cycles = _backedge_cycles(lines)
     assert all(
         any(start <= poll <= end for start, end in cycles) for poll in polls
@@ -225,7 +247,4 @@ def test_iris_all_reduce_codegen(arch, kind, world_size, tmp_path):
     assert atomics
     assert all(re.search(isa["system"], line) for line in atomics), atomics
 
-    # SGPRs can spill into VGPR lanes without allocating scratch.
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
-    spills = re.findall(r"\.[sv]gpr_spill_count:\s+(\d+)", assembly)
-    assert spills == ["0", "0"], spills

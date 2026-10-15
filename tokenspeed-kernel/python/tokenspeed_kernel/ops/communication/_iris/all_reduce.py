@@ -35,7 +35,9 @@ from tokenspeed_kernel.ops.communication.iris import (
     _use_two_stage_producer_direct,
     producer_direct_all_reduce_can_run,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import ArchVersion, current_platform
+
+hip_utils = triton.language.extra.hip.utils
 
 _PULL_MAX_PROGRAMS = 84
 _PULL_WORDS_PER_LANE = 2
@@ -43,8 +45,8 @@ _TWO_SHOT_NUM_SUBGROUPS = 8
 
 
 @dataclasses.dataclass(frozen=True)
-class IrisArchConfig:
-    """Per-architecture code generation for the generic Iris protocols.
+class PullAllReduceArchConfig:
+    """Per-architecture code generation for the pull all-reduce protocols.
 
     Attributes:
         subgroup_size: Lanes per subgroup the Gluon layouts are built for.
@@ -59,8 +61,10 @@ class IrisArchConfig:
     remote_store_cache: str
 
 
-_ARCH_CONFIGS = {
-    "gfx950": IrisArchConfig(
+_GFX950 = ArchVersion(9, 5)
+
+_PULL_ALL_REDUCE_ARCH_CONFIGS = {
+    _GFX950: PullAllReduceArchConfig(
         subgroup_size=64,
         peer_load_cache=".cg",
         remote_store_cache=".wt",
@@ -68,7 +72,7 @@ _ARCH_CONFIGS = {
     # On gfx1250 a ".cg" load lowers to a non-temporal load that refetches every
     # partially read sector over the fabric, and ".wt" peer stores are an order
     # of magnitude slower than plain ones.
-    "gfx1250": IrisArchConfig(
+    ArchVersion(12, 5): PullAllReduceArchConfig(
         subgroup_size=32,
         peer_load_cache="",
         remote_store_cache="",
@@ -76,15 +80,18 @@ _ARCH_CONFIGS = {
 }
 
 
-def iris_arch_name() -> str:
-    """Name the ``_ARCH_CONFIGS`` entry for this device; others keep gfx950's."""
-    return "gfx1250" if current_platform().is_cdna5 else "gfx950"
-
-
 @functools.cache
-def iris_arch_config(arch: str | None = None) -> IrisArchConfig:
-    """Return the configuration for ``arch``, or for the current device."""
-    return _ARCH_CONFIGS[arch or iris_arch_name()]
+def pull_all_reduce_arch_config(
+    arch: ArchVersion | None = None,
+) -> PullAllReduceArchConfig:
+    """Return the configuration for ``arch``, or for the current device.
+
+    Architectures without an entry keep gfx950's code generation.
+    """
+    arch = arch or current_platform().arch_version
+    return _PULL_ALL_REDUCE_ARCH_CONFIGS.get(
+        arch, _PULL_ALL_REDUCE_ARCH_CONFIGS[_GFX950]
+    )
 
 
 def _pull_scratch_numel(max_numel: int, world_size: int) -> int:
@@ -192,7 +199,7 @@ class StagedPullOneShot:
             BLOCK_SIZE=self.block_size,
             SLOT_STRIDE=self.slots.shape[1],
             NUM_SLOTS=self.slots.shape[0],
-            PEER_LOAD_CACHE=iris_arch_config().peer_load_cache,
+            PEER_LOAD_CACHE=pull_all_reduce_arch_config().peer_load_cache,
             num_warps=self.num_subgroups,
         )
 
@@ -206,7 +213,7 @@ def _launch_pull_twoshot(
     *,
     exit_barrier: bool,
 ) -> None:
-    arch = iris_arch_config()
+    arch = pull_all_reduce_arch_config()
     elements_per_word = _PACKED_WORD_BYTES // inputs.element_size()
     partition_words = out.numel() // peers.world_size // elements_per_word
     block_words = (
@@ -338,7 +345,7 @@ class ProducerPull:
                 peers, inputs, self.scratch, self.ready_flags, out, exit_barrier=False
             )
             return
-        arch = iris_arch_config()
+        arch = pull_all_reduce_arch_config()
         num_tiles = triton.cdiv(out.numel(), self.BLOCK_SIZE)
         num_programs = min(num_tiles, _PULL_MAX_PROGRAMS)
         iris_pull_oneshot[(num_programs,)](
@@ -832,6 +839,8 @@ def _iris_sync_rank_epoch(
     REMOTE_STORE_CACHE: gl.constexpr,
 ):
     """Synchronize by polling peer epochs or publishing them locally."""
+    # The host sizes the grid from the same subgroup size.
+    gl.static_assert(NUM_WARPS * SUBGROUP_SIZE == hip_utils.num_threads())
     ready_layout: gl.constexpr = gl.BlockedLayout(
         [1], [SUBGROUP_SIZE], [NUM_WARPS], [0]
     )
