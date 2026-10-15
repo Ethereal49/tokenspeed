@@ -371,6 +371,10 @@ def load_per_expert_input_scale(
 ) -> None:
     """Keep one activation scale per expert, broadcasting a checkpoint that ships one.
 
+    Checkpoints that ship a scalar scale per expert load it once per expert
+    with ``local_expert_id=None``; accumulate the running maximum so every
+    expert uses the global maximum, matching ``load_per_tensor_input_scale``.
+
     Args:
         param: The layer's ``[num_local_experts]`` activation scale.
         loaded_weight: A scalar, or one scale per expert.
@@ -384,7 +388,7 @@ def load_per_expert_input_scale(
         param.data[local_expert_id] = value.amax()
         return
     if value.numel() == 1:
-        param.data.fill_(float(value))
+        torch.maximum(param.data, value, out=param.data)
         return
     if value.numel() != param.data.numel():
         raise ValueError(
