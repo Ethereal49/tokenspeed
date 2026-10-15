@@ -1036,10 +1036,10 @@ class GDNStatePagingGPUTest(unittest.TestCase):
             CAUSAL_CONV1D_BLOCK_M,
             build_causal_conv1d_prefill_metadata,
         )
-
-        from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
+        from tokenspeed_kernel.ops.conv import (
             causal_conv1d_fn,
         )
+
         from tokenspeed.runtime.layers.attention.linear.gdn import fused_gdn_gating
 
         H, D = self.H, self.D
