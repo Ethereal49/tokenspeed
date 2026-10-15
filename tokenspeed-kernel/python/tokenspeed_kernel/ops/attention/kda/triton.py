@@ -418,15 +418,12 @@ def triton_nvidia_kda_fused_paged_verify_split(
             dt_bias,
             checkpoint_state=state_pool[:, :num_heads],
             correction_cache=replay_records.correction,
-            kd_cache=replay_records.key_decay,
+            kg_cache=replay_records.key_gate,
             query_start_loc=replay_records.query_start_loc,
             state_indices=read_indices,
             spec_query_len=draft_token_num,
             lower_bound=lower_bound,
             out=torch.empty_like(v),
-            replay_inputs=replay_records.replay_inputs,
-            verify_decay=replay_records.verify_decay,
-            verify_qk=replay_records.verify_qk,
             record_metadata=replay_records.metadata,
             record_stamps=replay_records.stamps,
         )
@@ -635,7 +632,7 @@ def triton_nvidia_kda_batched_replay_commit(
     record_metadata: torch.Tensor,
     record_stamps: torch.Tensor,
 ) -> None:
-    """Recover every KDA layer from the FP32 records saved by verify.
+    """Recover every KDA layer from FP32 U and BF16 K/raw-gate records.
 
     Args:
         descriptors: Device pointers for every layer's inputs, weights, and state.
@@ -650,12 +647,11 @@ def triton_nvidia_kda_batched_replay_commit(
         qkv_stride: Token stride of the packed QKV payload.
         conv_stride: Page stride of the convolution state.
         f_a_stride: Token stride of the FP32 correction payload.
-        beta_stride: Token stride of normalized key/decay records.
+        beta_stride: Token stride of BF16 unnormalized key/raw-gate records.
         state_stride: Page stride of the recurrent state.
         gate_stride: Shared adapter field; no gate scratch is read here.
         conv_width: Width of the depthwise convolution kernel.
-        lower_bound: Shared adapter field; the producer already applied this
-            gate bound when it saved multiplicative decay.
+        lower_bound: Bound used to transform saved raw gates during commit.
 
     Returns:
         None.
@@ -665,8 +661,8 @@ def triton_nvidia_kda_batched_replay_commit(
     )
 
     # Keep the shared NVIDIA/AMD adapter signature. This backend consumes
-    # canonical records, so these producer-only fields cannot affect commit.
-    del f_a_dim, gate_stride, lower_bound
+    # raw records; the gate bound is forwarded to the recovery kernel.
+    del f_a_dim, gate_stride
 
     batched_recoverssm_commit(
         descriptors,
@@ -680,11 +676,12 @@ def triton_nvidia_kda_batched_replay_commit(
         qkv_stride=qkv_stride,
         conv_stride=conv_stride,
         correction_stride=f_a_stride,
-        key_decay_stride=beta_stride,
+        key_gate_stride=beta_stride,
         state_stride=state_stride,
         conv_width=conv_width,
         record_metadata=record_metadata,
         record_stamps=record_stamps,
+        lower_bound=lower_bound,
     )
 
 

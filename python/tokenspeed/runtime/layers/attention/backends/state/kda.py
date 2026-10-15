@@ -42,6 +42,7 @@ from tokenspeed_kernel.ops.attention.kda import (
 )
 from tokenspeed_kernel.ops.attention.kda import (
     kda_replay_commit_supported,
+    kda_verify_conv_update,
     resolve_kda_batched_replay_commit,
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
@@ -377,11 +378,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                             *payload_shape,
                             2 * hv * head_dim if self._verify_split_producers else hv,
                         ),
-                        dtype=(
-                            torch.float32
-                            if self._verify_split_producers
-                            else self.dtype
-                        ),
+                        dtype=self.dtype,
                         device=self.device,
                     ),
                     torch.empty(
@@ -939,47 +936,30 @@ class KdaAttnBackend(CapacityPrefillBackend):
                     "replay_beta": beta[:rows, : beta_raw.shape[-1]],
                 }
             elif self._verify_split_producers:
-                from tokenspeed_kernel.ops.attention.kda.vllm_recoverssm import (
-                    prepare_recoverssm_conv,
-                    prepare_recoverssm_gate,
-                )
-
                 heads = value_dim // attn_tp_size // head_v_dim
                 fork = self._verify_producer_forks[layer_id]
                 with fork.scope(enable=True) as producer_fork:
                     with producer_fork.branch():
-                        g_raw, replay_gate, verify_decay = prepare_recoverssm_gate(
-                            f_a_out[:rows],
-                            f_b_weight,
-                            A_log,
-                            dt_bias,
-                            num_heads=heads,
-                            num_layers=len(self._descriptor_row_by_layer),
-                            head_dim=head_v_dim,
-                            lower_bound=lower_bound,
-                        )
-                    conv_qkv, replay_key, replay_value, verify_qk = (
-                        prepare_recoverssm_conv(
-                            mixed_qkv[:rows],
-                            qkv[:rows, : mixed_qkv.shape[-1]],
-                            conv_weights,
-                            conv_comp,
-                            state_in_blocks[:batch_size],
-                            num_heads=heads,
-                            head_dim=head_v_dim,
-                            width=draft_token_num,
-                        )
+                        g_raw = torch.nn.functional.linear(f_a_out[:rows], f_b_weight)
+                    # Conv commit needs the original projection rows, not activated QKV.
+                    qkv[:rows, : mixed_qkv.shape[-1]].copy_(mixed_qkv[:rows])
+                    conv_qkv = kda_verify_conv_update(
+                        mixed_qkv[:rows],
+                        conv_weights,
+                        conv_comp,
+                        state_in_blocks[:batch_size],
+                        num_heads=heads,
+                        head_dim=head_v_dim,
+                        draft_token_num=draft_token_num,
+                        recurrent_layout=self.kda_recurrent_layout,
                     )
                 # Eager allocations on the producer stream stay live through
                 # the consumer's verify. Graph capture owns its allocations.
                 if not torch.cuda.is_current_stream_capturing():
                     consumer_stream = torch.cuda.current_stream()
                     g_raw.record_stream(consumer_stream)
-                    replay_gate.record_stream(consumer_stream)
-                    verify_decay.record_stream(consumer_stream)
-                record_inputs = (replay_key, replay_value, replay_gate)
                 split_producers = {"g_raw": g_raw, "conv_qkv": conv_qkv}
-                # NVIDIA saves corrections and normalized key/decay records.
+                # NVIDIA saves FP32 corrections and BF16 unnormalized K/raw gates.
                 # Request rows, not pool block IDs, size the per-round cache.
                 assert self._replay_record_metadata is not None
                 assert self._replay_record_stamps is not None
@@ -991,15 +971,12 @@ class KdaAttnBackend(CapacityPrefillBackend):
                     correction=f_a[:rows, : heads * head_v_dim]
                     .view(batch_size, draft_token_num, heads, head_v_dim)
                     .transpose(1, 2),
-                    key_decay=beta[:rows, : 2 * heads * head_v_dim]
+                    key_gate=beta[:rows, : 2 * heads * head_v_dim]
                     .view(batch_size, draft_token_num, heads, 2 * head_v_dim)
                     .transpose(1, 2),
                     query_start_loc=self.forward_metadata.query_start_loc[
                         : batch_size + 1
                     ],
-                    replay_inputs=record_inputs,
-                    verify_decay=verify_decay,
-                    verify_qk=verify_qk,
                 )
             else:
                 capture_replay_payload(

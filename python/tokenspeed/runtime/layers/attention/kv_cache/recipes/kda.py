@@ -113,10 +113,12 @@ def kda_verify_workspace_bytes(
         * (torch.bfloat16.itemsize if raw_gate else torch.float32.itemsize)
     )
     if records:
-        # Raw QKV retains the accepted convolution window; FP32 U/K/D
-        # replaces the old low-rank gate input, beta and gate scratch.
+        # Raw QKV retains the accepted convolution window. Records store
+        # FP32 U and activation-dtype unnormalized K/raw gate.
         row_bytes = linear.conv_state_shape[0] * config.dtype.itemsize
-        row_bytes += 3 * heads * head_dim * torch.float32.itemsize
+        row_bytes += (
+            heads * head_dim * (torch.float32.itemsize + 2 * config.dtype.itemsize)
+        )
     group_count = sum(spec.family == "state" for spec, _ in groups)
     metadata_bytes = 0
     if draft_token_num > 1:

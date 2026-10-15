@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kimi-K3 RecoverSSM kernels, adapted to FP32 token-local K/U/D records.
+"""Kimi-K3 RecoverSSM kernels with TokenSpeed record stamps and cache groups.
 
-See README.md for the upstream revision and the TokenSpeed adaptations.
+Based on vLLM c77b3faa1cc2c39edbe82365f28ce96981af1438. Raw records save
+activation-dtype K/gate and FP32 U. Verify and commit recompute normalization
+and gate decay; record stamps protect slot reuse and retained intervals.
 """
 
 from typing import Any
@@ -10,8 +12,6 @@ from typing import Any
 import torch
 from tokenspeed_kernel._triton import gl, gluon, tl, triton
 
-# vLLM reserves page zero as a null page. TokenSpeed adapters pass the same
-# page convention to these copied kernels.
 NULL_BLOCK_ID = 0
 
 
@@ -21,122 +21,38 @@ def _sigmoid(value):
 
 
 @gluon.jit
-def _kda_gate(
-    raw_g,
-    dt_bias,
-    A,
-    lower_bound,
-    USE_LOWER_BOUND: gl.constexpr,
-):
+def _kda_gate(raw_g, dt_bias, A, lower_bound, USE_LOWER_BOUND: gl.constexpr):
     gate_input = raw_g + dt_bias
     if USE_LOWER_BOUND:
         return lower_bound * _sigmoid(A * gate_input)
     softplus_gate = gl.where(
-        gate_input > 20.0,
-        gate_input,
-        gl.log(1.0 + gl.exp(gate_input)),
+        gate_input > 20.0, gate_input, gl.log(1.0 + gl.exp(gate_input))
     )
     return -A * softplus_gate
 
 
 @gluon.jit
-def _verify_projection(state, key):
-    # Main's four-warp tile holds two value rows per warp. Its reduction
-    # contracts opposite products in those rows before the warp reduction.
-    BV: gl.constexpr = state.type.shape[0]
-    gl.static_assert(BV == 8 and gl.num_warps() == 4)
-    even, odd = gl.split(state.reshape((BV, 32, 2, 2)))
-    s0, s2 = gl.split(even)
-    s1, s3 = gl.split(odd)
-    ke, ko = gl.split(key.reshape((32, 2, 2)))
-    k0, k2 = gl.split(ke)
-    k1, k3 = gl.split(ko)
-    k0 = gl.convert_layout(k0, gl.SliceLayout(0, s0.type.layout))
-    k1 = gl.convert_layout(k1, gl.SliceLayout(0, s0.type.layout))
-    k2 = gl.convert_layout(k2, gl.SliceLayout(0, s0.type.layout))
-    k3 = gl.convert_layout(k3, gl.SliceLayout(0, s0.type.layout))
-    first = gl.fma(s0, k0[None, :], s2 * k2[None, :]) + gl.fma(
-        s1, k1[None, :], s3 * k3[None, :]
-    )
-    second = gl.fma(s2, k2[None, :], s0 * k0[None, :]) + gl.fma(
-        s3, k3[None, :], s1 * k1[None, :]
-    )
-    rows = gl.arange(0, BV, layout=gl.SliceLayout(1, first.type.layout))
-    partial = gl.where(
-        (rows % (2 * gl.num_warps()))[:, None] < gl.num_warps(), second, first
-    )
-    result = gl.sum(partial, axis=1)
-    return gl.convert_layout(result, gl.SliceLayout(1, state.type.layout))
-
-
-@gluon.jit
-def _verify_packed_projection(state, key):
-    # Main rounds each product before combining its four adjacent keys.
-    BV: gl.constexpr = state.type.shape[0]
-    products = gl.extra.libdevice.mul_rn(state, key[None, :])
-    even, odd = gl.split(products.reshape((BV, 32, 2, 2)))
-    p0, p2 = gl.split(even)
-    p1, p3 = gl.split(odd)
-    partial = (p0 + p2) + (p1 + p3)
-    partial = gl.convert_layout(
-        partial, gl.BlockedLayout([1, 1], [4, 8], [1, 1], [1, 0])
-    )
-    return gl.convert_layout(
-        gl.sum(partial, axis=1), gl.SliceLayout(1, state.type.layout)
-    )
-
-
-@gluon.jit
 def _kda_recurrent_step(
-    state,
-    k,
-    v,
-    raw_g,
-    raw_beta,
-    dt_bias,
-    A,
-    lower_bound,
-    USE_LOWER_BOUND: gl.constexpr,
-    PREPARED_GATE: gl.constexpr,
-    PREPARED_QK: gl.constexpr,
+    state, k, v, raw_g, raw_beta, dt_bias, A, lower_bound, USE_LOWER_BOUND: gl.constexpr
 ):
-    if PREPARED_QK:
-        normalized_k = k
-    else:
-        normalized_k = k * gl.rsqrt(gl.sum(k * k) + 1e-6)
-    if PREPARED_GATE:
-        decay = raw_g
-    else:
-        gate = _kda_gate(raw_g, dt_bias, A, lower_bound, USE_LOWER_BOUND)
-        decay = gl.exp(gate)
+    normalized_k = k * gl.rsqrt(gl.sum(k * k) + 1e-06)
+    gate = _kda_gate(raw_g, dt_bias, A, lower_bound, USE_LOWER_BOUND)
+    decay = gl.exp(gate)
     state *= decay[None, :]
-    if PREPARED_QK and gl.num_warps() == 4 and state.type.shape == [8, 128]:
-        projection = _verify_projection(state, normalized_k)
-    elif PREPARED_QK and gl.num_warps() == 1 and state.type.shape[1] == 128:
-        projection = _verify_packed_projection(state, normalized_k)
-    else:
-        projection = gl.sum(state * normalized_k[None, :], axis=1)
+    projection = gl.sum(state * normalized_k[None, :], axis=1)
     correction = v - projection
     correction *= _sigmoid(raw_beta)
     return (
         state + correction[:, None] * normalized_k[None, :],
         correction,
-        normalized_k,
-        decay,
     )
 
 
 @triton.heuristics(
     {
-        # Use smaller value tiles to expose enough CTAs at small batches.
-        # Larger batches amortize input loads across more values per CTA.
         "BV": lambda args: min(
             triton.next_power_of_2(args["V"]),
-            (
-                8
-                if args["SEPARATE_REPLAY_INPUTS"]
-                else 4 if args["BATCH"] <= 4 else 8 if args["BATCH"] <= 8 else 16
-            ),
+            4 if args["BATCH"] <= 4 else 8 if args["BATCH"] <= 8 else 16,
         )
     }
 )
@@ -147,14 +63,11 @@ def _kda_recoverssm_verify_kernel(
     v_ptr,
     raw_g_ptr,
     raw_beta_ptr,
-    replay_k_ptr,
-    replay_v_ptr,
-    replay_decay_ptr,
     A_log_ptr,
     dt_bias_ptr,
     state_ptr,
     correction_cache_ptr,
-    kd_cache_ptr,
+    kg_cache_ptr,
     out_ptr,
     query_start_loc_ptr,
     state_indices_ptr,
@@ -169,8 +82,6 @@ def _kda_recoverssm_verify_kernel(
     stride_v_token: gl.constexpr,
     stride_g_token: gl.constexpr,
     stride_beta_token: gl.constexpr,
-    stride_replay_token: gl.constexpr,
-    stride_replay_gate_token: gl.constexpr,
     stride_state_block: gl.constexpr,
     stride_state_head: gl.constexpr,
     stride_state_v: gl.constexpr,
@@ -193,26 +104,16 @@ def _kda_recoverssm_verify_kernel(
     SPEC_QUERY_LEN: gl.constexpr,
     USE_LOWER_BOUND: gl.constexpr,
     BATCH: gl.constexpr,
-    SEPARATE_REPLAY_INPUTS: gl.constexpr,
-    PREPARED_GATE: gl.constexpr,
-    PREPARED_QK: gl.constexpr,
 ):
     pid_v = gl.program_id(0)
     pid_b = gl.program_id(1)
     pid_h = gl.program_id(2)
-    record_only = False
-    if SEPARATE_REPLAY_INPUTS:
-        record_only = (pid_h % 2) != 0
-        pid_h = pid_h // 2
-
     bos = gl.load(query_start_loc_ptr + pid_b * stride_query_start_loc).to(gl.int64)
     eos = gl.load(query_start_loc_ptr + (pid_b + 1) * stride_query_start_loc).to(
         gl.int64
     )
     query_len = eos - bos
     state_idx = gl.load(state_indices_ptr + pid_b * stride_state_indices).to(gl.int64)
-
-    # Packed rows retain main's arithmetic through explicit partial sums.
     state_layout: gl.constexpr = (
         gl.BlockedLayout([1, 4], [4, 8], [1, 1], [1, 0])
         if gl.num_warps() == 1
@@ -225,10 +126,7 @@ def _kda_recoverssm_verify_kernel(
     mask_k = offs_k < K
     mask_v = offs_v < V
     mask_state = mask_v[:, None] & mask_k[None, :]
-
     if state_idx <= null_block_id:
-        if record_only:
-            return
         for token_offset in gl.static_range(SPEC_QUERY_LEN):
             token_valid = token_offset < query_len
             gl.store(
@@ -237,11 +135,10 @@ def _kda_recoverssm_verify_kernel(
                 mask=token_valid & mask_v,
             )
         return
-
     record_slot = pid_b.to(gl.int64)
     record_start = record_slot * 0
     record_generation = record_start
-    if record_metadata_ptr is not None and (not SEPARATE_REPLAY_INPUTS or record_only):
+    if record_metadata_ptr is not None:
         record_slot = gl.load(record_metadata_ptr + pid_b * 3)
         record_generation = gl.load(record_metadata_ptr + pid_b * 3 + 1)
         record_start = gl.load(record_metadata_ptr + pid_b * 3 + 2)
@@ -251,16 +148,10 @@ def _kda_recoverssm_verify_kernel(
         gl.device_assert(
             (record_generation >= 0) & (record_start >= 0), "invalid replay metadata"
         )
-
-    # A later recovery launch observes stamps only after this entire producer
-    # completes. Write them before loading state so generation is not live
-    # across the recurrent updates.
+    # Commit runs after verify completes; stamps identify the slot generation
+    # and absolute token position before the payload can be consumed.
     if record_stamps_ptr is not None:
-        if (
-            (not SEPARATE_REPLAY_INPUTS or record_only)
-            and (pid_v == 0)
-            and (pid_h == 0)
-        ):
+        if pid_v == 0 and pid_h == 0:
             for token_offset in gl.static_range(SPEC_QUERY_LEN):
                 position = record_start + token_offset
                 stamp = (
@@ -269,134 +160,6 @@ def _kda_recoverssm_verify_kernel(
                 )
                 gl.store(stamp, position, mask=token_offset < query_len)
                 gl.store(stamp + 1, record_generation, mask=token_offset < query_len)
-
-    # Each CTA keeps one state tile. Separate head-grid entries preserve the
-    # independent precision chains without doubling per-thread state storage.
-    # Verify and record production use different inputs but the same initial
-    # checkpoint. Independent CTAs avoid keeping both state tiles live.
-    if SEPARATE_REPLAY_INPUTS:
-        if record_only:
-            replay_layout: gl.constexpr = (
-                gl.BlockedLayout([1, 4], [4, 8], [1, 1], [1, 0])
-                if gl.num_warps() == 1
-                else gl.BlockedLayout([1, 1], [1, 32], [gl.num_warps(), 1], [1, 0])
-            )
-            replay_offs_k = gl.arange(0, BK, layout=gl.SliceLayout(0, replay_layout))
-            replay_offs_v = pid_v * BV + gl.arange(
-                0, BV, layout=gl.SliceLayout(1, replay_layout)
-            )
-            replay_mask_k = replay_offs_k < K
-            replay_mask_v = replay_offs_v < V
-            replay_state = gl.load(
-                state_ptr
-                + state_idx * stride_state_block
-                + pid_h * stride_state_head
-                + replay_offs_v[:, None] * stride_state_v
-                + replay_offs_k[None, :] * stride_state_k,
-                mask=replay_mask_v[:, None] & replay_mask_k[None, :],
-                other=0.0,
-            ).to(gl.float32)
-            for token_offset in gl.static_range(SPEC_QUERY_LEN):
-                token_valid = token_offset < query_len
-                token = bos + token_offset
-                replay_k = gl.load(
-                    replay_k_ptr
-                    + token * stride_replay_token
-                    + pid_h * K
-                    + replay_offs_k,
-                    mask=token_valid & replay_mask_k,
-                    other=0.0,
-                )
-                replay_v = gl.load(
-                    replay_v_ptr
-                    + token * stride_replay_token
-                    + pid_h * V
-                    + replay_offs_v,
-                    mask=token_valid & replay_mask_v,
-                    other=0.0,
-                )
-                replay_g = gl.load(
-                    replay_decay_ptr
-                    + token * stride_replay_gate_token
-                    + pid_h * K
-                    + replay_offs_k,
-                    mask=token_valid & replay_mask_k,
-                    other=0.0,
-                )
-                raw_beta = gl.load(
-                    raw_beta_ptr + token * stride_beta_token + pid_h,
-                    mask=token_valid,
-                    other=0.0,
-                ).to(gl.float32)
-                normalized_k = replay_k
-                decay = replay_g
-                decayed_state = replay_state * decay[None, :]
-                # Preserve main's 0/64 and 32/96 FMA pairs. Split key groups
-                # before reducing so vectorized loads do not change rounding.
-                s02, s13 = gl.split(
-                    decayed_state.reshape((BV, 2, 2, BK // 4)).permute((0, 3, 1, 2))
-                )
-                s0, s2 = gl.split(s02)
-                s1, s3 = gl.split(s13)
-                k02, k13 = gl.split(
-                    normalized_k.reshape((2, 2, BK // 4)).permute((2, 0, 1))
-                )
-                k0, k2 = gl.split(k02)
-                k1, k3 = gl.split(k13)
-                k0 = gl.convert_layout(k0, gl.SliceLayout(0, s0.type.layout))
-                k1 = gl.convert_layout(k1, gl.SliceLayout(0, s0.type.layout))
-                k2 = gl.convert_layout(k2, gl.SliceLayout(0, s0.type.layout))
-                k3 = gl.convert_layout(k3, gl.SliceLayout(0, s0.type.layout))
-                partial = gl.fma(s0, k0[None, :], s2 * k2[None, :]) + gl.fma(
-                    s1, k1[None, :], s3 * k3[None, :]
-                )
-                if gl.num_warps() == 1:
-                    # Only the 32 projection partials need redistribution.
-                    partial = gl.convert_layout(
-                        partial, gl.BlockedLayout([1, 1], [4, 8], [1, 1], [1, 0])
-                    )
-                projection = gl.convert_layout(
-                    gl.sum(partial, axis=1), gl.SliceLayout(1, replay_layout)
-                )
-                # Main contracts SiLU's multiply with this subtraction.
-                # replay_v holds the pre-activation convolution value.
-                correction = gl.fma(replay_v, _sigmoid(replay_v), -projection)
-                correction *= _sigmoid(raw_beta)
-                updated = decayed_state + correction[:, None] * normalized_k[None, :]
-                # Invalid tokens form a suffix; no later result observes this state.
-                replay_state = updated
-                correction_ptr = (
-                    correction_cache_ptr
-                    + record_slot * stride_correction_block
-                    + pid_h * stride_correction_head
-                    + ((record_start + token_offset) % RECORD_CAPACITY)
-                    * stride_correction_pos
-                )
-                gl.store(
-                    correction_ptr + replay_offs_v * stride_correction_dim,
-                    correction,
-                    mask=token_valid & replay_mask_v,
-                )
-                if pid_v == 0:
-                    kd_ptr = (
-                        kd_cache_ptr
-                        + record_slot * stride_kg_block
-                        + pid_h * stride_kg_head
-                        + ((record_start + token_offset) % RECORD_CAPACITY)
-                        * stride_kg_pos
-                    )
-                    gl.store(
-                        kd_ptr + replay_offs_k * stride_kg_dim,
-                        normalized_k,
-                        mask=token_valid & replay_mask_k,
-                    )
-                    gl.store(
-                        kd_ptr + (K + replay_offs_k) * stride_kg_dim,
-                        decay,
-                        mask=token_valid & replay_mask_k,
-                    )
-            return
-
     state_ptrs = (
         state_ptr
         + state_idx * stride_state_block
@@ -405,16 +168,10 @@ def _kda_recoverssm_verify_kernel(
         + offs_k[None, :] * stride_state_k
     )
     state = gl.load(state_ptrs, mask=mask_state, other=0.0).to(gl.float32)
-
     A = gl.exp(gl.load(A_log_ptr + pid_h).to(gl.float32))
-    dt_bias = gl.load(
-        dt_bias_ptr + pid_h * K + offs_k,
-        mask=mask_k,
-        other=0.0,
-    ).to(gl.float32)
-
-    # Keep the four-warp recurrence loop intact. The one-warp launch retains
-    # its existing static expansion; both execute the same token update.
+    dt_bias = gl.load(dt_bias_ptr + pid_h * K + offs_k, mask=mask_k, other=0.0).to(
+        gl.float32
+    )
     for token_group in gl.static_range(SPEC_QUERY_LEN if gl.num_warps() == 1 else 1):
         for token_step in range(1 if gl.num_warps() == 1 else SPEC_QUERY_LEN):
             token_offset = token_group + token_step
@@ -450,68 +207,45 @@ def _kda_recoverssm_verify_kernel(
                 other=0.0,
                 eviction_policy="evict_last",
             ).to(gl.float32)
-
-            if not PREPARED_QK:
-                q *= gl.rsqrt(gl.sum(q * q) + 1e-6) * (K**-0.5)
-            updated_state, correction, normalized_k, decay = _kda_recurrent_step(
-                state,
-                k,
-                v,
-                raw_g,
-                raw_beta,
-                dt_bias,
-                A,
-                lower_bound,
-                USE_LOWER_BOUND,
-                PREPARED_GATE,
-                PREPARED_QK,
+            q *= gl.rsqrt(gl.sum(q * q) + 1e-06) * K ** (-0.5)
+            updated_state, correction = _kda_recurrent_step(
+                state, k, v, raw_g, raw_beta, dt_bias, A, lower_bound, USE_LOWER_BOUND
             )
-            # Output and record stores mask the suffix. Preserving its state would
-            # add a full-tile select without changing any observable result.
+            # Invalid tokens form a suffix; masked stores make their state unobservable.
             state = updated_state
-
-            if PREPARED_QK and gl.num_warps() == 1 and BK == 128:
-                out = _verify_packed_projection(state, q)
-            else:
-                out = gl.sum(state * q[None, :], axis=1)
+            out = gl.sum(state * q[None, :], axis=1)
             gl.store(
                 out_ptr + token * stride_out_token + pid_h * V + offs_v,
                 out,
                 mask=token_valid & mask_v,
                 eviction_policy="evict_first",
             )
-
-            if not SEPARATE_REPLAY_INPUTS:
-                correction_ptr = (
-                    correction_cache_ptr
-                    + record_slot * stride_correction_block
-                    + pid_h * stride_correction_head
-                    + ((record_start + token_offset) % RECORD_CAPACITY)
-                    * stride_correction_pos
+            correction_ptr = (
+                correction_cache_ptr
+                + record_slot * stride_correction_block
+                + pid_h * stride_correction_head
+                + (record_start + token_offset)
+                % RECORD_CAPACITY
+                * stride_correction_pos
+            )
+            gl.store(
+                correction_ptr + offs_v * stride_correction_dim,
+                correction,
+                mask=token_valid & mask_v,
+            )
+            if pid_v == 0:
+                kg_ptr = (
+                    kg_cache_ptr
+                    + record_slot * stride_kg_block
+                    + pid_h * stride_kg_head
+                    + (record_start + token_offset) % RECORD_CAPACITY * stride_kg_pos
                 )
+                gl.store(kg_ptr + offs_k * stride_kg_dim, k, mask=token_valid & mask_k)
                 gl.store(
-                    correction_ptr + offs_v * stride_correction_dim,
-                    correction,
-                    mask=token_valid & mask_v,
+                    kg_ptr + (K + offs_k) * stride_kg_dim,
+                    raw_g,
+                    mask=token_valid & mask_k,
                 )
-                if pid_v == 0:
-                    kg_ptr = (
-                        kd_cache_ptr
-                        + record_slot * stride_kg_block
-                        + pid_h * stride_kg_head
-                        + ((record_start + token_offset) % RECORD_CAPACITY)
-                        * stride_kg_pos
-                    )
-                    gl.store(
-                        kg_ptr + offs_k * stride_kg_dim,
-                        normalized_k,
-                        mask=token_valid & mask_k,
-                    )
-                    gl.store(
-                        kg_ptr + (K + offs_k) * stride_kg_dim,
-                        decay,
-                        mask=token_valid & mask_k,
-                    )
 
 
 @triton.heuristics(
@@ -565,7 +299,6 @@ def _prepare_commit_plan_kernel(
     query_len = (eos - bos).to(tl.int32)
     commit_len = tl.minimum(tl.maximum(num_accepted, 0), query_len)
     commit_len = tl.minimum(commit_len, SPEC_QUERY_LEN)
-
     final_state_idx = source_state_idx
     boundary_state_idx = null_block_id
     boundary_recovery_len = 0
@@ -603,8 +336,7 @@ def _prepare_commit_plan_kernel(
         tl.where(valid, boundary_state_idx, null_block_id),
     )
     tl.store(
-        boundary_recovery_lens_ptr + spec_idx,
-        tl.where(valid, boundary_recovery_len, 0),
+        boundary_recovery_lens_ptr + spec_idx, tl.where(valid, boundary_recovery_len, 0)
     )
 
 
@@ -623,12 +355,7 @@ def _commit_kda_num_warps(args: dict[str, Any]) -> int:
     return 4 if args["BATCH"] == 1 else 2 if args["BATCH"] == 2 else 1
 
 
-@triton.heuristics(
-    {
-        "BV": _commit_kda_value_block,
-        "num_warps": _commit_kda_num_warps,
-    }
-)
+@triton.heuristics({"BV": _commit_kda_value_block, "num_warps": _commit_kda_num_warps})
 @triton.jit(do_not_specialize=["BATCH", "RECORD_SLOTS"])
 def _commit_kda_state_kernel(
     state_ref_ptr,
@@ -637,9 +364,9 @@ def _commit_kda_state_kernel(
     correction_cache_ref_ptr,
     correction_cache_base_addrs_ptr,
     correction_cache_block_stride: tl.constexpr,
-    kd_cache_ref_ptr,
-    kd_cache_base_addrs_ptr,
-    kd_cache_block_stride: tl.constexpr,
+    kg_cache_ref_ptr,
+    kg_cache_base_addrs_ptr,
+    kg_cache_block_stride: tl.constexpr,
     state_indices_ptr,
     commit_lens_ptr,
     final_state_indices_ptr,
@@ -652,9 +379,9 @@ def _commit_kda_state_kernel(
     stride_correction_cache_head: tl.constexpr,
     stride_correction_cache_pos: tl.constexpr,
     stride_correction_cache_dim: tl.constexpr,
-    stride_kd_cache_head: tl.constexpr,
-    stride_kd_cache_pos: tl.constexpr,
-    stride_kd_cache_dim: tl.constexpr,
+    stride_kg_cache_head: tl.constexpr,
+    stride_kg_cache_pos: tl.constexpr,
+    stride_kg_cache_dim: tl.constexpr,
     stride_state_indices: tl.constexpr,
     group_indices_ptr,
     stride_state_group,
@@ -672,20 +399,18 @@ def _commit_kda_state_kernel(
     ALIGN_MODE: tl.constexpr,
     BATCH,
     LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
+    a_base_addrs_ptr,
+    bias_base_addrs_ptr,
+    lower_bound,
+    USE_LOWER_BOUND: tl.constexpr,
 ):
     if LAUNCH_DEPENDENT_KERNELS:
-        # Expected operation is plan -> KDA commit -> conv where plan and KDA
-        # are launched normally, conv is launched as a dependent kernel and KDA
-        # immediately releases conv.  This guarantees correctness as both KDA
-        # and conv depend on the plan but not each other.  Better than two
-        # streams as we want to make sure KDA goes first, as it is longer tailed.
         tl.extra.cuda.gdc_launch_dependents()
     pid_v = tl.program_id(0)
     pid_b = tl.program_id(1)
     pid_lh = tl.program_id(2)
     pid_l = pid_lh // NUM_HEADS
     pid_h = pid_lh % NUM_HEADS
-
     group = 0
     if group_indices_ptr is not None:
         group = tl.load(group_indices_ptr + pid_l).to(tl.int64)
@@ -700,10 +425,8 @@ def _commit_kda_state_kernel(
     if ALIGN_MODE:
         boundary_state_idx = tl.load(boundary_state_indices_ptr + plan_row).to(tl.int64)
         boundary_recovery_len = tl.load(boundary_recovery_lens_ptr + plan_row)
-
     if final_state_idx <= null_block_id:
         return
-
     record_slot = pid_b
     record_start = 0
     if record_metadata_ptr is not None:
@@ -718,7 +441,7 @@ def _commit_kda_state_kernel(
             & (generation >= 0)
         )
         tl.device_assert(slot_valid & interval_valid, "invalid replay interval")
-        if not (slot_valid & interval_valid):
+        if not slot_valid & interval_valid:
             return
         offsets = tl.arange(0, triton.next_power_of_2(RECORD_CAPACITY))
         positions = record_start + offsets
@@ -745,13 +468,11 @@ def _commit_kda_state_kernel(
         tl.device_assert(valid, "stale replay record")
         if not valid:
             return
-
     state_base_addr = tl.load(state_base_addrs_ptr + pid_l * stride_pointer_layer)
     state_ptr = state_base_addr.to(tl.pointer_type(state_ref_ptr.dtype.element_ty))
     source_state_ptr = (
         state_ptr + source_state_idx * state_block_stride + pid_h * stride_state_head
     )
-
     correction_cache_base_addr = tl.load(
         correction_cache_base_addrs_ptr + pid_l * stride_pointer_layer
     )
@@ -762,12 +483,11 @@ def _commit_kda_state_kernel(
         record_slot * correction_cache_block_stride
         + pid_h * stride_correction_cache_head
     )
-    kd_cache_base_addr = tl.load(kd_cache_base_addrs_ptr + pid_l * stride_pointer_layer)
-    kd_cache_ptr = kd_cache_base_addr.to(
-        tl.pointer_type(kd_cache_ref_ptr.dtype.element_ty)
+    kg_cache_base_addr = tl.load(kg_cache_base_addrs_ptr + pid_l * stride_pointer_layer)
+    kg_cache_ptr = kg_cache_base_addr.to(
+        tl.pointer_type(kg_cache_ref_ptr.dtype.element_ty)
     )
-    kd_cache_ptr += record_slot * kd_cache_block_stride + pid_h * stride_kd_cache_head
-
+    kg_cache_ptr += record_slot * kg_cache_block_stride + pid_h * stride_kg_cache_head
     offs_k = tl.arange(0, BK)
     offs_v = pid_v * BV + tl.arange(0, BV)
     mask_k = offs_k < K
@@ -780,6 +500,14 @@ def _commit_kda_state_kernel(
     )
     initial_state = tl.load(state_ptrs, mask=mask_state, other=0.0).to(tl.float32)
     state = initial_state
+    a_ptr = tl.load(a_base_addrs_ptr + pid_l * stride_pointer_layer).to(
+        tl.pointer_type(tl.float32)
+    )
+    bias_ptr = tl.load(bias_base_addrs_ptr + pid_l * stride_pointer_layer).to(
+        tl.pointer_type(tl.float32)
+    )
+    A = tl.exp(tl.load(a_ptr + pid_h))
+    dt_bias = tl.load(bias_ptr + pid_h * K + offs_k, mask=mask_k, other=0.0)
     if ALIGN_MODE:
         boundary_ptrs = (
             state_ptr
@@ -788,39 +516,42 @@ def _commit_kda_state_kernel(
             + offs_v[:, None] * stride_state_v
             + offs_k[None, :] * stride_state_k
         )
-
     for token_offset in range(commit_len):
         correction_ptr = (
             correction_cache_ptr
-            + ((record_start + token_offset) % RECORD_CAPACITY)
+            + (record_start + token_offset)
+            % RECORD_CAPACITY
             * stride_correction_cache_pos
         )
         kg_ptr = (
-            kd_cache_ptr
-            + ((record_start + token_offset) % RECORD_CAPACITY) * stride_kd_cache_pos
+            kg_cache_ptr
+            + (record_start + token_offset) % RECORD_CAPACITY * stride_kg_cache_pos
         )
-        k = tl.load(
-            kg_ptr + offs_k * stride_kd_cache_dim,
-            mask=mask_k,
-            other=0.0,
-        ).to(tl.float32)
+        k = tl.load(kg_ptr + offs_k * stride_kg_cache_dim, mask=mask_k, other=0.0).to(
+            tl.float32
+        )
         correction = tl.load(
             correction_ptr + offs_v * stride_correction_cache_dim,
             mask=mask_v,
             other=0.0,
         ).to(tl.float32)
         decay = tl.load(
-            kg_ptr + (K + offs_k) * stride_kd_cache_dim,
-            mask=mask_k,
-            other=0.0,
+            kg_ptr + (K + offs_k) * stride_kg_cache_dim, mask=mask_k, other=0.0
         ).to(tl.float32)
-        # Main rounds the decayed state before adding the rank-one update.
-        state *= decay[None, :]
-        state += correction[:, None] * k[None, :]
-        if ALIGN_MODE:  # noqa: SIM102
+        k = k * tl.rsqrt(tl.sum(k * k) + 1e-06)
+        gate_input = decay + dt_bias
+        if USE_LOWER_BOUND:
+            gate = lower_bound * tl.sigmoid(A * gate_input)
+        else:
+            gate = -A * tl.where(
+                gate_input > 20.0, gate_input, tl.log(1.0 + tl.exp(gate_input))
+            )
+        decay = tl.exp(gate)
+        update = correction[:, None] * k[None, :]
+        state = state * decay[None, :] + update
+        if ALIGN_MODE:
             if token_offset == boundary_recovery_len - 1:
                 tl.store(boundary_ptrs, state)
-
     final_ptrs = (
         state_ptr
         + final_state_idx * state_block_stride
@@ -842,14 +573,11 @@ def kda_recoverssm_verify(
     lower_bound: float | None,
     checkpoint_state: torch.Tensor,
     correction_cache: torch.Tensor,
-    kd_cache: torch.Tensor,
+    kg_cache: torch.Tensor,
     query_start_loc: torch.Tensor,
     state_indices: torch.Tensor,
     spec_query_len: int,
     out: torch.Tensor,
-    replay_inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
-    verify_decay: torch.Tensor | None,
-    verify_qk: tuple[torch.Tensor, torch.Tensor] | None,
     record_metadata: torch.Tensor | None,
     record_stamps: torch.Tensor | None,
 ) -> torch.Tensor:
@@ -858,21 +586,15 @@ def kda_recoverssm_verify(
         raise ValueError("KDA RecoverSSM q must have shape [1, tokens, heads, dim]")
     _, total_tokens, num_heads, key_dim = q.shape
     value_dim = v.shape[-1]
-    if replay_inputs is not None and key_dim != 128:
-        raise ValueError("main replay records require 128-dimensional keys")
     if k.shape != q.shape or v.shape != (1, total_tokens, num_heads, value_dim):
         raise ValueError("KDA RecoverSSM q, k, and v shapes are incompatible")
     if raw_g.shape != q.shape or raw_beta.shape != (1, total_tokens, num_heads):
         raise ValueError("KDA RecoverSSM gate or beta shape is incompatible")
-    if any(tensor.stride()[2:] != (key_dim, 1) for tensor in (q, k, raw_g)):
+    if any((tensor.stride()[2:] != (key_dim, 1) for tensor in (q, k, raw_g))):
         raise ValueError("KDA RecoverSSM q, k, and gate heads must be contiguous")
     if v.stride()[2:] != (value_dim, 1) or raw_beta.stride(2) != 1:
         raise ValueError("KDA RecoverSSM v and beta heads must be contiguous")
-    if checkpoint_state.shape[1:] != (
-        num_heads,
-        value_dim,
-        key_dim,
-    ):
+    if checkpoint_state.shape[1:] != (num_heads, value_dim, key_dim):
         raise ValueError("KDA RecoverSSM checkpoint shape is incompatible")
     expected_correction_shape = (
         correction_cache.shape[0],
@@ -890,14 +612,14 @@ def kda_recoverssm_verify(
         correction_cache.shape[2],
         2 * key_dim,
     )
-    if kd_cache.shape != expected_kg_shape:
+    if kg_cache.shape != expected_kg_shape:
         raise ValueError(
             f"KDA RecoverSSM key/gate buffer needs shape {expected_kg_shape}"
         )
     if correction_cache.dtype != torch.float32:
         raise ValueError("KDA RecoverSSM correction buffer must use float32")
-    if kd_cache.dtype != torch.float32:
-        raise ValueError("KDA RecoverSSM normalized key/decay buffer must use float32")
+    if kg_cache.dtype != k.dtype:
+        raise ValueError("KDA RecoverSSM record dtype does not match its format")
     if A_log.shape != (num_heads,) or dt_bias.numel() != num_heads * key_dim:
         raise ValueError("KDA RecoverSSM gate parameters are incompatible")
     if not A_log.is_contiguous() or not dt_bias.is_contiguous():
@@ -918,8 +640,10 @@ def kda_recoverssm_verify(
                 "replay metadata needs [batch, 3] and stamps [slots, capacity, 2]"
             )
         if any(
-            x.dtype != torch.int64 or not x.is_contiguous() or x.device != q.device
-            for x in (record_metadata, record_stamps)
+            (
+                x.dtype != torch.int64 or not x.is_contiguous() or x.device != q.device
+                for x in (record_metadata, record_stamps)
+            )
         ):
             raise ValueError(
                 "replay metadata and stamps must be contiguous INT64 on the input device"
@@ -938,89 +662,40 @@ def kda_recoverssm_verify(
         raise ValueError("KDA RecoverSSM output heads must be contiguous")
     device = q.device
     if any(
-        tensor.device != device
-        for tensor in (
-            k,
-            v,
-            raw_g,
-            raw_beta,
-            A_log,
-            dt_bias,
-            checkpoint_state,
-            correction_cache,
-            kd_cache,
-            query_start_loc,
-            state_indices,
-            out,
+        (
+            tensor.device != device
+            for tensor in (
+                k,
+                v,
+                raw_g,
+                raw_beta,
+                A_log,
+                dt_bias,
+                checkpoint_state,
+                correction_cache,
+                kg_cache,
+                query_start_loc,
+                state_indices,
+                out,
+            )
         )
     ):
         raise ValueError("KDA RecoverSSM inputs must be on the same device")
     if total_tokens == 0:
         return out
-
-    if replay_inputs is None:
-        replay_k, replay_v, replay_decay = k, v, raw_g
-    else:
-        replay_k, replay_v, replay_decay = replay_inputs
-        if any(tensor.dtype != torch.float32 for tensor in replay_inputs):
-            raise ValueError("replay producers must retain FP32 precision")
-        if (
-            replay_k.shape != k.shape
-            or replay_v.shape != v.shape
-            or replay_decay.shape != raw_g.shape
-        ):
-            raise ValueError("replay producer shapes must match verify inputs")
-        if any(tensor.device != device for tensor in replay_inputs):
-            raise ValueError("replay inputs must use the verify device")
-        if (
-            replay_k.stride()[2:] != (key_dim, 1)
-            or replay_v.stride()[2:] != (value_dim, 1)
-            or replay_decay.stride()[2:] != (key_dim, 1)
-            or replay_v.stride(1) != replay_k.stride(1)
-        ):
-            raise ValueError(
-                "replay inputs require contiguous heads and matching K/V token strides"
-            )
-    if verify_decay is not None:
-        if verify_decay.shape != raw_g.shape or verify_decay.dtype != torch.float32:
-            raise ValueError("prepared verify decay must match raw gates in FP32")
-        if verify_decay.device != device or verify_decay.stride()[2:] != (key_dim, 1):
-            raise ValueError(
-                "prepared verify decay must use the input device and contiguous heads"
-            )
-        raw_g = verify_decay
-    if verify_qk is not None:
-        for tensor in verify_qk:
-            if (
-                tensor.shape != q.shape
-                or tensor.dtype != torch.float32
-                or tensor.device != device
-                or tensor.stride()[2:] != (key_dim, 1)
-            ):
-                raise ValueError(
-                    "prepared Q/K must match input shapes, device and contiguous FP32 heads"
-                )
-        q, k = verify_qk
     block_k = triton.next_power_of_2(key_dim)
-    grid = lambda meta: (
-        triton.cdiv(value_dim, meta["BV"]),
-        batch,
-        num_heads * (2 if replay_inputs is not None else 1),
-    )
+    grid = lambda meta: (triton.cdiv(value_dim, meta["BV"]), batch, num_heads * 1)
     _kda_recoverssm_verify_kernel[grid](
         q,
         k,
         v,
         raw_g,
         raw_beta,
-        replay_k,
-        replay_v,
-        replay_decay,
         A_log,
         dt_bias,
         checkpoint_state,
         correction_cache,
-        kd_cache,
+        kg_cache,
         out,
         query_start_loc,
         state_indices,
@@ -1028,15 +703,13 @@ def kda_recoverssm_verify(
         record_stamps,
         capacity,
         correction_cache.shape[0],
-        lower_bound or 0.0,
+        lower_bound,
         NULL_BLOCK_ID,
         q.stride(1),
         k.stride(1),
         v.stride(1),
         raw_g.stride(1),
         raw_beta.stride(1),
-        replay_k.stride(1),
-        replay_decay.stride(1),
         checkpoint_state.stride(0),
         checkpoint_state.stride(1),
         checkpoint_state.stride(2),
@@ -1045,10 +718,10 @@ def kda_recoverssm_verify(
         correction_cache.stride(1),
         correction_cache.stride(2),
         correction_cache.stride(3),
-        kd_cache.stride(0),
-        kd_cache.stride(1),
-        kd_cache.stride(2),
-        kd_cache.stride(3),
+        kg_cache.stride(0),
+        kg_cache.stride(1),
+        kg_cache.stride(2),
+        kg_cache.stride(3),
         out.stride(1),
         query_start_loc.stride(0),
         state_indices.stride(0),
@@ -1058,10 +731,7 @@ def kda_recoverssm_verify(
         SPEC_QUERY_LEN=spec_query_len,
         USE_LOWER_BOUND=lower_bound is not None,
         BATCH=triton.next_power_of_2(batch),
-        SEPARATE_REPLAY_INPUTS=replay_inputs is not None,
-        PREPARED_GATE=verify_decay is not None,
-        PREPARED_QK=verify_qk is not None,
-        num_warps=4 if batch < 4 else 1,
+        num_warps=4,
         debug=True,
         num_stages=2,
     )

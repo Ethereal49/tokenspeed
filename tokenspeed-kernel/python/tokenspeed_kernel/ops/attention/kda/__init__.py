@@ -111,29 +111,23 @@ class KdaPrefillResult:
 
 @dataclass(frozen=True)
 class KdaReplayRecords:
-    """Current-round recovery destinations and FP32 producer inputs.
+    """Current-round recovery destinations and record metadata.
 
-    correction and key_decay use slot/head/ring-position/channel order.
+    correction and key_gate use slot/head/ring-position/channel order.
+    key_gate holds activation-dtype unnormalized K and raw gate.
+    Correction is always FP32.
     metadata is INT64 [batch, 3]: physical slot, generation, absolute start.
     stamps is INT64 [slots, capacity, 2]: absolute position and generation.
     Position i maps to i % capacity. PR1 allocates one slot per batch row
     and assigns a new generation on each metadata refresh.
-    query_start_loc maps packed tokens to request rows. replay_inputs are
-    normalized K, pre-SiLU convolution V and multiplicative decay in
-    [1, tokens, heads, dim] order.
-    verify_decay preserves the gate transform after main's BF16 rounding.
-    verify_qk contains normalized/scaled Q and normalized K, also computed
-    after the original BF16 convolution rounding. All prepared values are FP32.
+    query_start_loc maps packed tokens to request rows.
     """
 
     correction: torch.Tensor
     metadata: torch.Tensor
     stamps: torch.Tensor
-    key_decay: torch.Tensor
+    key_gate: torch.Tensor
     query_start_loc: torch.Tensor
-    replay_inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-    verify_decay: torch.Tensor
-    verify_qk: tuple[torch.Tensor, torch.Tensor]
 
 
 @dataclass(frozen=True)
