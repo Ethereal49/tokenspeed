@@ -66,14 +66,23 @@ from tokenspeed.runtime.multimodal.inputs import (
 )
 
 _RADIO_PREFIX = "vision_model.radio_model.model."
+_VISION_NORM_PREFIX = "vision_projector.vision_final_layernorm."
 _PARAKEET_PREFIX = "sound_encoder.encoder."
-# Pixel normalization and log-mel buffers; the gateway preprocesses media.
-_PREPROCESSING_PREFIXES = (
+# Pixel normalization and log-mel buffers (the gateway preprocesses media), and
+# the RADIO summary-token indices (the encoder keeps patch features only).
+_UNUSED_PREFIXES = (
     "vision_model.radio_model.input_conditioner.",
     "sound_encoder.encoder.feature_extractor.",
+    "vision_model.summary_idxs",
 )
 # Encoder and projector tensors, skipped when the encoders are disabled.
-_ENCODER_PREFIXES = (_RADIO_PREFIX, "mlp1.", _PARAKEET_PREFIX, "sound_projection.")
+_ENCODER_PREFIXES = (
+    _RADIO_PREFIX,
+    _VISION_NORM_PREFIX,
+    "mlp1.",
+    _PARAKEET_PREFIX,
+    "sound_projection.",
+)
 # The vision projector's checkpoint indices into its nn.Sequential.
 _MLP1_NAMES = {"0": "norm", "1": "linear1", "3": "linear2"}
 
@@ -130,6 +139,7 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronHForCausalLM):  # noqa: N801
         self.omni_config = config
         self.is_multimodal_active = is_multimodal_active
         self.visual: RadioVisionModel | None = None
+        self.vision_final_norm: nn.LayerNorm | None = None
         self.vision_projector: NemotronOmniProjector | None = None
         self.audio_tower: ParakeetEncoder | None = None
         self.audio_projector: NemotronOmniProjector | None = None
@@ -145,6 +155,14 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronHForCausalLM):  # noqa: N801
             mm_attention_backend=mm_attention_backend,
             prefix="visual",
         )
+        if config.vision_final_layernorm:
+            if vision.final_norm:
+                raise NotImplementedError(
+                    "C-RADIO with both its own final norm and the projector's"
+                )
+            self.vision_final_norm = nn.LayerNorm(
+                vision.hidden_size, eps=vision.layer_norm_eps
+            )
         merge = round(1 / config.downsample_ratio)
         if merge != 2:
             raise NotImplementedError(f"Nemotron-H Omni {merge}x{merge} pixel shuffle")
@@ -175,6 +193,8 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronHForCausalLM):  # noqa: N801
     def _project_vision(
         self, features: torch.Tensor, grids: list[tuple[int, int]]
     ) -> torch.Tensor:
+        if self.vision_final_norm is not None:
+            features = self.vision_final_norm(features)
         shuffled = []
         start = 0
         for rows, cols in grids:
@@ -315,12 +335,17 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronHForCausalLM):  # noqa: N801
         for name, loaded in weights:
             if name.startswith("language_model."):
                 yield name.removeprefix("language_model."), loaded
-            elif name.startswith(_PREPROCESSING_PREFIXES) or (
+            elif name.startswith(_UNUSED_PREFIXES) or (
                 self.visual is None and name.startswith(_ENCODER_PREFIXES)
             ):
                 continue
             elif name.startswith(_RADIO_PREFIX):
                 self.visual.load_weight(name.removeprefix(_RADIO_PREFIX), loaded)
+            elif name.startswith(_VISION_NORM_PREFIX):
+                suffix = name.removeprefix(_VISION_NORM_PREFIX)
+                default_weight_loader(
+                    self.vision_final_norm.get_parameter(suffix), loaded
+                )
             elif name.startswith("mlp1."):
                 index, suffix = name.removeprefix("mlp1.").split(".", 1)
                 self.vision_projector.load_weight(
@@ -338,4 +363,8 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronHForCausalLM):  # noqa: N801
                 raise KeyError(f"Nemotron-H Omni has no tensor {name!r}")
 
 
-EntryClass = [NemotronH_Nano_Omni_Reasoning_V3]
+class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_Omni_Reasoning_V3):  # noqa: N801
+    """The same model under the architecture name of later checkpoints."""
+
+
+EntryClass = [NemotronH_Nano_Omni_Reasoning_V3, NemotronH_Omni_Reasoning_V3]
