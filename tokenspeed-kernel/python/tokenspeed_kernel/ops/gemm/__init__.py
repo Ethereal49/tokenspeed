@@ -1471,9 +1471,12 @@ def _use_mv(x: torch.Tensor, weight: torch.Tensor) -> bool:
     platform = current_platform()
     n = weight.shape[0]
     if platform.is_cdna4:
-        return m >= 2 and _select_mv(
-            m, n, k, True, x.dtype, weight.dtype, False
-        ) is not (torch_decode_gemv)
+        impl = _select_mv(m, n, k, True, x.dtype, weight.dtype, False)
+        # Single rows keep mm's own path (Torch's skinny GEMM) unless a gfx950
+        # kernel claims the shape: the portable row-CTA GEMV is not tuned here.
+        return impl is not torch_decode_gemv and (
+            m >= 2 or impl is not triton_rowcta_gemv
+        )
     if not platform.is_cdna5 or k < 256:
         return False
     return (
@@ -3422,6 +3425,7 @@ from tokenspeed_kernel.ops.gemm.native import torch_decode_gemv  # noqa: E402
 from tokenspeed_kernel.ops.gemm.triton import (  # noqa: E402
     MXFP4_LINEAR_LINEAR_LAYOUT,
     MXFP4_LINEAR_SIGNATURE,
+    triton_rowcta_gemv,
 )
 
 # isort: on
