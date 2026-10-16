@@ -5,47 +5,64 @@
 Based on vLLM c77b3faa1cc2c39edbe82365f28ce96981af1438. Raw records save
 activation-dtype K/gate and FP32 U. Verify and commit recompute normalization
 and gate decay; record stamps protect slot reuse and retained intervals.
+
+Verify follows the upstream Triton recurrence, static token loop, and one-warp
+launch. TokenSpeed adapts record addressing and stamps to request slots instead
+of state pages. The batch specialization stays bucketed for graph padding.
 """
 
 from typing import Any
 
 import torch
-from tokenspeed_kernel._triton import gl, gluon, tl, triton
+from tokenspeed_kernel._triton import tl, triton
 
 NULL_BLOCK_ID = 0
 
 
-@gluon.jit
-def _sigmoid(value):
-    return 1.0 / (1.0 + gl.exp(-value))
-
-
-@gluon.jit
-def _kda_gate(raw_g, dt_bias, A, lower_bound, USE_LOWER_BOUND: gl.constexpr):
+@triton.jit
+def _kda_gate(
+    raw_g,
+    dt_bias,
+    A,
+    lower_bound,
+    USE_LOWER_BOUND: tl.constexpr,
+):
     gate_input = raw_g + dt_bias
     if USE_LOWER_BOUND:
-        return lower_bound * _sigmoid(A * gate_input)
-    softplus_gate = gl.where(
-        gate_input > 20.0, gate_input, gl.log(1.0 + gl.exp(gate_input))
+        return lower_bound * tl.sigmoid(A * gate_input)
+    softplus_gate = tl.where(
+        gate_input > 20.0,
+        gate_input,
+        tl.log(1.0 + tl.exp(gate_input)),
     )
     return -A * softplus_gate
 
 
-@gluon.jit
+@triton.jit
 def _kda_recurrent_step(
-    state, k, v, raw_g, raw_beta, dt_bias, A, lower_bound, USE_LOWER_BOUND: gl.constexpr
+    state,
+    k,
+    v,
+    raw_g,
+    raw_beta,
+    dt_bias,
+    A,
+    lower_bound,
+    USE_LOWER_BOUND: tl.constexpr,
 ):
-    normalized_k = k * gl.rsqrt(gl.sum(k * k) + 1e-06)
-    gate = _kda_gate(raw_g, dt_bias, A, lower_bound, USE_LOWER_BOUND)
-    decay = gl.exp(gate)
-    state *= decay[None, :]
-    projection = gl.sum(state * normalized_k[None, :], axis=1)
-    correction = v - projection
-    correction *= _sigmoid(raw_beta)
-    return (
-        state + correction[:, None] * normalized_k[None, :],
-        correction,
+    normalized_k = k * tl.rsqrt(tl.sum(k * k) + 1e-6)
+    gate = _kda_gate(
+        raw_g,
+        dt_bias,
+        A,
+        lower_bound,
+        USE_LOWER_BOUND,
     )
+
+    state *= tl.exp(gate)[None, :]
+    correction = v - tl.sum(state * normalized_k[None, :], axis=1)
+    correction *= tl.sigmoid(raw_beta)
+    return state + correction[:, None] * normalized_k[None, :], correction
 
 
 @triton.heuristics(
@@ -56,7 +73,7 @@ def _kda_recurrent_step(
         )
     }
 )
-@gluon.jit(do_not_specialize=["RECORD_SLOTS"])
+@triton.jit(do_not_specialize=["RECORD_SLOTS"])
 def _kda_recoverssm_verify_kernel(
     q_ptr,
     k_ptr,
@@ -73,93 +90,90 @@ def _kda_recoverssm_verify_kernel(
     state_indices_ptr,
     record_metadata_ptr,
     record_stamps_ptr,
-    RECORD_CAPACITY: gl.constexpr,
+    RECORD_CAPACITY: tl.constexpr,
     RECORD_SLOTS,
     lower_bound,
     null_block_id,
-    stride_q_token: gl.constexpr,
-    stride_k_token: gl.constexpr,
-    stride_v_token: gl.constexpr,
-    stride_g_token: gl.constexpr,
-    stride_beta_token: gl.constexpr,
-    stride_state_block: gl.constexpr,
-    stride_state_head: gl.constexpr,
-    stride_state_v: gl.constexpr,
-    stride_state_k: gl.constexpr,
-    stride_correction_block: gl.constexpr,
-    stride_correction_head: gl.constexpr,
-    stride_correction_pos: gl.constexpr,
-    stride_correction_dim: gl.constexpr,
-    stride_kg_block: gl.constexpr,
-    stride_kg_head: gl.constexpr,
-    stride_kg_pos: gl.constexpr,
-    stride_kg_dim: gl.constexpr,
-    stride_out_token: gl.constexpr,
-    stride_query_start_loc: gl.constexpr,
-    stride_state_indices: gl.constexpr,
-    K: gl.constexpr,
-    V: gl.constexpr,
-    BK: gl.constexpr,
-    BV: gl.constexpr,
-    SPEC_QUERY_LEN: gl.constexpr,
-    USE_LOWER_BOUND: gl.constexpr,
-    BATCH: gl.constexpr,
+    stride_q_token,
+    stride_k_token,
+    stride_v_token,
+    stride_g_token,
+    stride_beta_token,
+    stride_state_block,
+    stride_state_head,
+    stride_state_v,
+    stride_state_k,
+    stride_correction_block,
+    stride_correction_head,
+    stride_correction_pos,
+    stride_correction_dim,
+    stride_kg_block,
+    stride_kg_head,
+    stride_kg_pos,
+    stride_kg_dim,
+    stride_out_token,
+    stride_query_start_loc,
+    stride_state_indices,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    SPEC_QUERY_LEN: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
+    BATCH: tl.constexpr,
 ):
-    pid_v = gl.program_id(0)
-    pid_b = gl.program_id(1)
-    pid_h = gl.program_id(2)
-    bos = gl.load(query_start_loc_ptr + pid_b * stride_query_start_loc).to(gl.int64)
-    eos = gl.load(query_start_loc_ptr + (pid_b + 1) * stride_query_start_loc).to(
-        gl.int64
+    pid_v = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    pid_h = tl.program_id(2)
+
+    bos = tl.load(query_start_loc_ptr + pid_b * stride_query_start_loc).to(tl.int64)
+    eos = tl.load(query_start_loc_ptr + (pid_b + 1) * stride_query_start_loc).to(
+        tl.int64
     )
     query_len = eos - bos
-    state_idx = gl.load(state_indices_ptr + pid_b * stride_state_indices).to(gl.int64)
-    state_layout: gl.constexpr = (
-        gl.BlockedLayout([1, 4], [4, 8], [1, 1], [1, 0])
-        if gl.num_warps() == 1
-        else gl.BlockedLayout([1, 4], [1, 32], [gl.num_warps(), 1], [1, 0])
-    )
-    key_layout: gl.constexpr = gl.SliceLayout(0, state_layout)
-    value_layout: gl.constexpr = gl.SliceLayout(1, state_layout)
-    offs_k = gl.arange(0, BK, layout=key_layout)
-    offs_v = pid_v * BV + gl.arange(0, BV, layout=value_layout)
+    state_idx = tl.load(state_indices_ptr + pid_b * stride_state_indices).to(tl.int64)
+
+    offs_k = tl.arange(0, BK)
+    offs_v = pid_v * BV + tl.arange(0, BV)
     mask_k = offs_k < K
     mask_v = offs_v < V
     mask_state = mask_v[:, None] & mask_k[None, :]
+
     if state_idx <= null_block_id:
-        for token_offset in gl.static_range(SPEC_QUERY_LEN):
+        for token_offset in tl.static_range(SPEC_QUERY_LEN):
             token_valid = token_offset < query_len
-            gl.store(
+            tl.store(
                 out_ptr + (bos + token_offset) * stride_out_token + pid_h * V + offs_v,
-                gl.zeros([BV], dtype=gl.float32, layout=value_layout),
+                tl.zeros([BV], dtype=tl.float32),
                 mask=token_valid & mask_v,
             )
         return
-    record_slot = pid_b.to(gl.int64)
+
+    record_slot = pid_b.to(tl.int64)
     record_start = record_slot * 0
     record_generation = record_start
     if record_metadata_ptr is not None:
-        record_slot = gl.load(record_metadata_ptr + pid_b * 3)
-        record_generation = gl.load(record_metadata_ptr + pid_b * 3 + 1)
-        record_start = gl.load(record_metadata_ptr + pid_b * 3 + 2)
-        gl.device_assert(
+        record_slot = tl.load(record_metadata_ptr + pid_b * 3)
+        record_generation = tl.load(record_metadata_ptr + pid_b * 3 + 1)
+        record_start = tl.load(record_metadata_ptr + pid_b * 3 + 2)
+        tl.device_assert(
             (record_slot >= 0) & (record_slot < RECORD_SLOTS), "invalid replay slot"
         )
-        gl.device_assert(
+        tl.device_assert(
             (record_generation >= 0) & (record_start >= 0), "invalid replay metadata"
         )
     # Commit runs after verify completes; stamps identify the slot generation
     # and absolute token position before the payload can be consumed.
     if record_stamps_ptr is not None:
         if pid_v == 0 and pid_h == 0:
-            for token_offset in gl.static_range(SPEC_QUERY_LEN):
+            for token_offset in tl.static_range(SPEC_QUERY_LEN):
                 position = record_start + token_offset
                 stamp = (
                     record_stamps_ptr
                     + (record_slot * RECORD_CAPACITY + position % RECORD_CAPACITY) * 2
                 )
-                gl.store(stamp, position, mask=token_offset < query_len)
-                gl.store(stamp + 1, record_generation, mask=token_offset < query_len)
+                tl.store(stamp, position, mask=token_offset < query_len)
+                tl.store(stamp + 1, record_generation, mask=token_offset < query_len)
     state_ptrs = (
         state_ptr
         + state_idx * stride_state_block
@@ -167,85 +181,98 @@ def _kda_recoverssm_verify_kernel(
         + offs_v[:, None] * stride_state_v
         + offs_k[None, :] * stride_state_k
     )
-    state = gl.load(state_ptrs, mask=mask_state, other=0.0).to(gl.float32)
-    A = gl.exp(gl.load(A_log_ptr + pid_h).to(gl.float32))
-    dt_bias = gl.load(dt_bias_ptr + pid_h * K + offs_k, mask=mask_k, other=0.0).to(
-        gl.float32
-    )
-    for token_group in gl.static_range(SPEC_QUERY_LEN if gl.num_warps() == 1 else 1):
-        for token_step in range(1 if gl.num_warps() == 1 else SPEC_QUERY_LEN):
-            token_offset = token_group + token_step
-            token_valid = token_offset < query_len
-            token = bos + token_offset
-            q = gl.load(
-                q_ptr + token * stride_q_token + pid_h * K + offs_k,
+    A = tl.exp(tl.load(A_log_ptr + pid_h).to(tl.float32))
+    dt_bias = tl.load(
+        dt_bias_ptr + pid_h * K + offs_k,
+        mask=mask_k,
+        other=0.0,
+    ).to(tl.float32)
+    state = tl.load(state_ptrs, mask=mask_state, other=0.0).to(tl.float32)
+
+    for token_offset in tl.static_range(SPEC_QUERY_LEN):
+        token_valid = token_offset < query_len
+        token = bos + token_offset
+        q = tl.load(
+            q_ptr + token * stride_q_token + pid_h * K + offs_k,
+            mask=token_valid & mask_k,
+            other=0.0,
+            eviction_policy="evict_last",
+        ).to(tl.float32)
+        k = tl.load(
+            k_ptr + token * stride_k_token + pid_h * K + offs_k,
+            mask=token_valid & mask_k,
+            other=0.0,
+            eviction_policy="evict_last",
+        ).to(tl.float32)
+        v = tl.load(
+            v_ptr + token * stride_v_token + pid_h * V + offs_v,
+            mask=token_valid & mask_v,
+            other=0.0,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
+        raw_g = tl.load(
+            raw_g_ptr + token * stride_g_token + pid_h * K + offs_k,
+            mask=token_valid & mask_k,
+            other=0.0,
+            eviction_policy="evict_last",
+        ).to(tl.float32)
+        raw_beta = tl.load(
+            raw_beta_ptr + token * stride_beta_token + pid_h,
+            mask=token_valid,
+            other=0.0,
+            eviction_policy="evict_last",
+        ).to(tl.float32)
+
+        q *= tl.rsqrt(tl.sum(q * q) + 1e-6) * (K**-0.5)
+        updated_state, correction = _kda_recurrent_step(
+            state,
+            k,
+            v,
+            raw_g,
+            raw_beta,
+            dt_bias,
+            A,
+            lower_bound,
+            USE_LOWER_BOUND,
+        )
+        state = tl.where(token_valid, updated_state, state)
+
+        out = tl.sum(state * q[None, :], axis=1)
+        tl.store(
+            out_ptr + token * stride_out_token + pid_h * V + offs_v,
+            out,
+            mask=token_valid & mask_v,
+            eviction_policy="evict_first",
+        )
+
+        correction_ptr = (
+            correction_cache_ptr
+            + record_slot * stride_correction_block
+            + pid_h * stride_correction_head
+            + (record_start + token_offset) % RECORD_CAPACITY * stride_correction_pos
+        )
+        tl.store(
+            correction_ptr + offs_v * stride_correction_dim,
+            correction,
+            mask=token_valid & mask_v,
+        )
+        if pid_v == 0:
+            kg_ptr = (
+                kg_cache_ptr
+                + record_slot * stride_kg_block
+                + pid_h * stride_kg_head
+                + (record_start + token_offset) % RECORD_CAPACITY * stride_kg_pos
+            )
+            tl.store(
+                kg_ptr + offs_k * stride_kg_dim,
+                k,
                 mask=token_valid & mask_k,
-                other=0.0,
-                eviction_policy="evict_last",
-            ).to(gl.float32)
-            k = gl.load(
-                k_ptr + token * stride_k_token + pid_h * K + offs_k,
+            )
+            tl.store(
+                kg_ptr + (K + offs_k) * stride_kg_dim,
+                raw_g,
                 mask=token_valid & mask_k,
-                other=0.0,
-                eviction_policy="evict_last",
-            ).to(gl.float32)
-            v = gl.load(
-                v_ptr + token * stride_v_token + pid_h * V + offs_v,
-                mask=token_valid & mask_v,
-                other=0.0,
-                eviction_policy="evict_first",
-            ).to(gl.float32)
-            raw_g = gl.load(
-                raw_g_ptr + token * stride_g_token + pid_h * K + offs_k,
-                mask=token_valid & mask_k,
-                other=0.0,
-                eviction_policy="evict_last",
-            ).to(gl.float32)
-            raw_beta = gl.load(
-                raw_beta_ptr + token * stride_beta_token + pid_h,
-                mask=token_valid,
-                other=0.0,
-                eviction_policy="evict_last",
-            ).to(gl.float32)
-            q *= gl.rsqrt(gl.sum(q * q) + 1e-06) * K ** (-0.5)
-            updated_state, correction = _kda_recurrent_step(
-                state, k, v, raw_g, raw_beta, dt_bias, A, lower_bound, USE_LOWER_BOUND
             )
-            # Invalid tokens form a suffix; masked stores make their state unobservable.
-            state = updated_state
-            out = gl.sum(state * q[None, :], axis=1)
-            gl.store(
-                out_ptr + token * stride_out_token + pid_h * V + offs_v,
-                out,
-                mask=token_valid & mask_v,
-                eviction_policy="evict_first",
-            )
-            correction_ptr = (
-                correction_cache_ptr
-                + record_slot * stride_correction_block
-                + pid_h * stride_correction_head
-                + (record_start + token_offset)
-                % RECORD_CAPACITY
-                * stride_correction_pos
-            )
-            gl.store(
-                correction_ptr + offs_v * stride_correction_dim,
-                correction,
-                mask=token_valid & mask_v,
-            )
-            if pid_v == 0:
-                kg_ptr = (
-                    kg_cache_ptr
-                    + record_slot * stride_kg_block
-                    + pid_h * stride_kg_head
-                    + (record_start + token_offset) % RECORD_CAPACITY * stride_kg_pos
-                )
-                gl.store(kg_ptr + offs_k * stride_kg_dim, k, mask=token_valid & mask_k)
-                gl.store(
-                    kg_ptr + (K + offs_k) * stride_kg_dim,
-                    raw_g,
-                    mask=token_valid & mask_k,
-                )
 
 
 @triton.heuristics(
@@ -535,19 +562,13 @@ def _commit_kda_state_kernel(
             mask=mask_v,
             other=0.0,
         ).to(tl.float32)
-        decay = tl.load(
+        raw_g = tl.load(
             kg_ptr + (K + offs_k) * stride_kg_cache_dim, mask=mask_k, other=0.0
         ).to(tl.float32)
-        k = k * tl.rsqrt(tl.sum(k * k) + 1e-06)
-        gate_input = decay + dt_bias
-        if USE_LOWER_BOUND:
-            gate = lower_bound * tl.sigmoid(A * gate_input)
-        else:
-            gate = -A * tl.where(
-                gate_input > 20.0, gate_input, tl.log(1.0 + tl.exp(gate_input))
-            )
+        normalized_k = k * tl.rsqrt(tl.sum(k * k) + 1e-06)
+        gate = _kda_gate(raw_g, dt_bias, A, lower_bound, USE_LOWER_BOUND)
         decay = tl.exp(gate)
-        update = correction[:, None] * k[None, :]
+        update = correction[:, None] * normalized_k[None, :]
         state = state * decay[None, :] + update
         if ALIGN_MODE:
             if token_offset == boundary_recovery_len - 1:
@@ -731,7 +752,7 @@ def kda_recoverssm_verify(
         SPEC_QUERY_LEN=spec_query_len,
         USE_LOWER_BOUND=lower_bound is not None,
         BATCH=triton.next_power_of_2(batch),
-        num_warps=4,
+        num_warps=1,
         debug=True,
         num_stages=2,
     )

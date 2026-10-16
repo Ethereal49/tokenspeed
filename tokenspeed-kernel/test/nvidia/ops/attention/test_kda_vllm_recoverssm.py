@@ -300,11 +300,14 @@ def test_record_chain_uses_verify_inputs() -> None:
     assert not torch.equal(results[0][2], results[1][2])
 
 
-def test_recoverssm_ragged_prefix_and_null_rows() -> None:
-    """Padded suffix state is unobservable; only valid prefix records change."""
+@pytest.mark.parametrize("batch", [4, 6, 9, 17])
+@pytest.mark.parametrize("captured", [False, True])
+def test_recoverssm_ragged_prefix_and_null_rows(batch: int, captured: bool) -> None:
+    """Verify valid prefixes and preserve unwritten records in every value tile."""
     torch.manual_seed(1209)
-    lengths = [4, 2, 0, 1, 3, 4]
-    batch, heads, dim, width = (len(lengths), 12, 128, 4)
+    lengths = ([4, 2, 0, 1, 3, 4] * ((batch + 5) // 6))[:batch]
+    lengths[-1] = 4
+    heads, dim, width = (12, 128, 4)
     starts_cpu = [0]
     for length in lengths:
         starts_cpu.append(starts_cpu[-1] + length)
@@ -318,7 +321,8 @@ def test_recoverssm_ragged_prefix_and_null_rows() -> None:
     bias = torch.randn(heads, dim, device="cuda") * 0.1
     state = torch.randn(batch + 1, heads, dim, dim, device="cuda") * 0.02
     initial = state.clone()
-    indices = torch.tensor([1, 2, 3, 4, 5, 0], device="cuda", dtype=torch.int32)
+    indices = torch.arange(1, batch + 1, device="cuda", dtype=torch.int32)
+    indices[-1] = 0
     starts = torch.tensor(starts_cpu, device="cuda", dtype=torch.int32)
     u = torch.full((batch, heads, width, dim), float("nan"), device="cuda")
     kd = torch.full(
@@ -337,25 +341,40 @@ def test_recoverssm_ragged_prefix_and_null_rows() -> None:
     record_d = torch.exp(
         -5.0 * torch.sigmoid(A.exp()[None, None, :, None] * (g.float() + bias))
     )
-    vllm_triton_kda_recoverssm_verify(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        A,
-        bias,
-        checkpoint_state=state,
-        correction_cache=u,
-        kg_cache=kd,
-        query_start_loc=starts,
-        state_indices=indices,
-        spec_query_len=width,
-        lower_bound=-5.0,
-        out=out,
-        record_metadata=metadata,
-        record_stamps=stamps,
-    )
+
+    def verify() -> None:
+        vllm_triton_kda_recoverssm_verify(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A,
+            bias,
+            checkpoint_state=state,
+            correction_cache=u,
+            kg_cache=kd,
+            query_start_loc=starts,
+            state_indices=indices,
+            spec_query_len=width,
+            lower_bound=-5.0,
+            out=out,
+            record_metadata=metadata,
+            record_stamps=stamps,
+        )
+
+    verify()
+    if captured:
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            verify()
+        # Only replay writes may satisfy the checks below.
+        out.fill_(float("nan"))
+        u.fill_(float("nan"))
+        kd.fill_(float("nan"))
+        stamps.fill_(-1)
+        graph.replay()
     torch.testing.assert_close(state, initial, atol=0, rtol=0)
     for request, length in enumerate(lengths):
         begin, end = starts_cpu[request : request + 2]
@@ -379,7 +398,7 @@ def test_recoverssm_ragged_prefix_and_null_rows() -> None:
                     -5.0,
                 )
                 torch.testing.assert_close(
-                    out[:, begin:end].float(), expected_out, atol=0.02, rtol=0.02
+                    out[:, begin:end].float(), expected_out, atol=2e-3, rtol=8e-3
                 )
                 current = initial[request + 1].clone()
                 for offset in range(length):
