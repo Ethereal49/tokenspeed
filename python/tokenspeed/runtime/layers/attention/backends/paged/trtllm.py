@@ -392,6 +392,14 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
 
         return k_cache, v_cache
 
+    def _bmm_scales(self, layer: PagedAttention) -> tuple[float, float]:
+        """trtllm-gen's logit and output scales; a per-tensor scaled FP8 cache
+        holds K / k and V / v, so k joins the logit scale and v the output's."""
+        scales = layer.fp8_kv_scales
+        if scales is None or self.kv_cache_dtype != torch.float8_e4m3fn:
+            return layer.scaling, 1.0
+        return layer.scaling * scales.k, scales.v
+
     def _prepare_q(self, q: torch.Tensor, layer: PagedAttention) -> torch.Tensor:
         if self.kv_cache_dtype == torch.float8_e4m3fn:
             q = fp8_cast_contiguous(q)
@@ -453,6 +461,7 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         if attention_sink is not None:
             attention_sink = attention_sink.float()
 
+        bmm1_scale, bmm2_scale = self._bmm_scales(layer)
         o = trtllm_batch_decode_with_kv_cache(
             query=q,
             kv_cache=(k_cache, v_cache),
@@ -460,8 +469,8 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             block_tables=metadata.page_table,
             seq_lens=metadata.cache_seqlens_int32,
             max_seq_len=self.max_context_len,
-            bmm1_scale=layer.scaling,
-            bmm2_scale=1.0,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
             window_left=layer.sliding_window_size,
             sinks=attention_sink,
             out_dtype=self.dtype,
@@ -500,6 +509,10 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         if layer.sliding_window_size >= 0 or sinks is not None:
             raise NotImplementedError(
                 "draft trees have no sliding-window or attention-sink path yet"
+            )
+        if self._bmm_scales(layer) != (layer.scaling, 1.0):
+            raise NotImplementedError(
+                "draft trees have no path over a per-tensor scaled FP8 KV cache yet"
             )
         k_cache, v_cache = self._get_kv_cache_permuted(layer, token_to_kv_pool)
         # trtllm-gen also loads the key right after the prefix: the window's first slot, written this forward.
@@ -553,6 +566,7 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         if attention_sink is not None:
             attention_sink = attention_sink.float()
 
+        bmm1_scale, bmm2_scale = self._bmm_scales(layer)
         o = trtllm_batch_context_with_kv_cache(
             query=q,
             kv_cache=(k_cache, v_cache),
@@ -561,8 +575,8 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             seq_lens=metadata.cache_seqlens_int32,
             max_q_len=metadata.max_seq_len_q,
             max_kv_len=self.max_context_len,
-            bmm1_scale=layer.scaling,
-            bmm2_scale=1.0,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
             batch_size=metadata.cu_seqlens_q.shape[0] - 1,
             cum_seq_lens_q=metadata.cu_seqlens_q,
             cum_seq_lens_kv=metadata.cu_seqlens_k,

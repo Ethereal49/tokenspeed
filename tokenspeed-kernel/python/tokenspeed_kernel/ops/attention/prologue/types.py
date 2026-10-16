@@ -23,6 +23,7 @@ solutions declare."""
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import Enum
 
@@ -122,25 +123,43 @@ class MXFP8Scales:
 
 
 @dataclass(frozen=True)
+class FP8TensorScales:
+    """Per-tensor scales of an FP8 cache: its rows hold ``K / k`` and ``V / v``.
+
+    Attributes:
+        k: Key scale, positive and finite.
+        v: Value scale, positive and finite.
+    """
+
+    k: float
+    v: float
+
+    def __post_init__(self) -> None:
+        if not all(math.isfinite(s) and s > 0 for s in (self.k, self.v)):
+            raise ValueError(f"FP8 KV-cache scales must be positive: {self}")
+
+
+@dataclass(frozen=True)
 class HeadKVCache:
     """One GQA layer's KV cache destination.
 
     Attributes:
         k_cache: ``[slots, num_kv_heads, head_dim]``, FP8 e4m3 or native rows.
         v_cache: ``[slots, num_kv_heads, head_dim]`` in the same dtype.
-        scales: The scale planes of an MXFP8 cache, else ``None``.
+        scales: The scale planes of an MXFP8 cache, the per-tensor scales of
+            an FP8 one, or ``None`` for a unit-scale cache.
         slots: Dense 1-D destination slot of each written row; rows past its
             length (graph padding) are not written.
     """
 
     k_cache: torch.Tensor
     v_cache: torch.Tensor
-    scales: MXFP8Scales | None
+    scales: MXFP8Scales | FP8TensorScales | None
     slots: torch.Tensor
 
     @property
     def format(self) -> KVCacheFormat:
-        if self.scales is not None:
+        if isinstance(self.scales, MXFP8Scales):
             return KVCacheFormat.MXFP8
         if self.k_cache.dtype == torch.float8_e4m3fn:
             return KVCacheFormat.FP8

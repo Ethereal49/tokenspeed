@@ -296,6 +296,7 @@ def mha_extend_with_kvcache(
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    fp8_kv_scales: tuple[float, float] | None = None,
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
@@ -329,6 +330,9 @@ def mha_extend_with_kvcache(
             (interleaved [num_pages, num_kv_heads, 32, 4, 4] atom at
             page_size 128).
         v_scale: MXFP8 block scales for v_cache, same layout as k_scale.
+        fp8_kv_scales: ``(k_scale, v_scale)`` of a per-tensor scaled FP8
+            cache, whose rows hold ``K / k_scale`` and ``V / v_scale``;
+            ``None`` for a unit-scale cache.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -347,6 +351,7 @@ def mha_extend_with_kvcache(
         "return_lse": return_lse,
         "sinks": sinks is not None,
         "sliding_window": window_left >= 0,
+        "kv_scaled": fp8_kv_scales is not None,
     }
     kernel = select_kernel(
         "attention",
@@ -404,6 +409,8 @@ def mha_extend_with_kvcache(
             max_seqlen_k=max_seqlen_k,
             enable_pdl=pdl_enabled(),
             **scale_kwargs,
+            # Only kernels serving the kv_scaled trait take the scales.
+            **({} if fp8_kv_scales is None else {"fp8_kv_scales": fp8_kv_scales}),
         )
 
 
@@ -425,6 +432,7 @@ def mha_decode_with_kvcache(
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    fp8_kv_scales: tuple[float, float] | None = None,
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
@@ -455,6 +463,9 @@ def mha_decode_with_kvcache(
             (interleaved [num_pages, num_kv_heads, 32, 4, 4] atom at
             page_size 128).
         v_scale: MXFP8 block scales for v_cache, same layout as k_scale.
+        fp8_kv_scales: ``(k_scale, v_scale)`` of a per-tensor scaled FP8
+            cache, whose rows hold ``K / k_scale`` and ``V / v_scale``;
+            ``None`` for a unit-scale cache.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
     """
@@ -471,6 +482,7 @@ def mha_decode_with_kvcache(
         "return_lse": return_lse,
         "sinks": sinks is not None,
         "sliding_window": window_left >= 0,
+        "kv_scaled": fp8_kv_scales is not None,
     }
     kernel = select_kernel(
         "attention",
@@ -525,6 +537,8 @@ def mha_decode_with_kvcache(
             max_seqlen_q=max_seqlen_q,
             enable_pdl=pdl_enabled(),
             **scale_kwargs,
+            # Only kernels serving the kv_scaled trait take the scales.
+            **({} if fp8_kv_scales is None else {"fp8_kv_scales": fp8_kv_scales}),
         )
 
 

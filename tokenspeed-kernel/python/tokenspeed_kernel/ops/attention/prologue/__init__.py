@@ -50,6 +50,7 @@ from tokenspeed_kernel.ops.attention.prologue.checks import (
     check_mla_request,
 )
 from tokenspeed_kernel.ops.attention.prologue.types import (
+    FP8TensorScales,
     GQAPrologueOutput,
     HeadKVCache,
     HeadNorm,
@@ -151,6 +152,7 @@ def gqa_prologue(
         "token_heads": num_tokens * num_q_heads,
         "has_norm": norm is not None,
         "kv_format": cache.format.value,
+        "kv_scaled": isinstance(cache.scales, FP8TensorScales),
         "kv_convert": cache.format is KVCacheFormat.NATIVE
         and cache.k_cache.dtype is not q.dtype,
         "mrope": rotary is not None and rotary.positions.ndim == 2,
@@ -368,6 +370,7 @@ def latent_store(
 
 
 __all__ = [
+    "FP8TensorScales",
     "GQAPrologueOutput",
     "HeadKVCache",
     "HeadNorm",

@@ -34,9 +34,11 @@ from typing import Protocol
 
 import torch
 from tokenspeed_kernel.ops.attention.prologue import (
+    FP8TensorScales,
     GQAPrologueOutput,
     HeadKVCache,
     HeadNorm,
+    KVCacheFormat,
     LatentKVCache,
     MLAExpandedKV,
     MLAPrologueOutput,
@@ -156,6 +158,31 @@ class PagedAttention(nn.Module):
         self._group_id: str | None = None
         self.rotary_emb = rotary_emb
         self.qk_norm = qk_norm
+        # Per-tensor scales of an FP8 KV cache from the checkpoint
+        # (load_kv_cache_scale); None at unit scale. A cache of another dtype
+        # ignores them, as the write and the attention reads both do.
+        self.fp8_kv_scales: FP8TensorScales | None = None
+
+    def load_kv_cache_scale(self, name: str, scale: torch.Tensor) -> None:
+        """Take a checkpoint's ``...k_scale`` or ``...v_scale`` tensor."""
+        if scale.numel() != 1:
+            raise NotImplementedError(
+                f"PagedAttention layer_id={self.layer_id}: {name} holds "
+                f"{scale.numel()} scales; only per-tensor KV-cache scales are "
+                "supported"
+            )
+        k, v = (
+            (1.0, 1.0)
+            if self.fp8_kv_scales is None
+            else (self.fp8_kv_scales.k, self.fp8_kv_scales.v)
+        )
+        if name.endswith(".k_scale"):
+            k = float(scale.item())
+        elif name.endswith(".v_scale"):
+            v = float(scale.item())
+        else:
+            raise KeyError(f"{name!r} is not a k_scale or v_scale tensor")
+        self.fp8_kv_scales = None if k == v == 1.0 else FP8TensorScales(k, v)
 
     @property
     def group_id(self) -> str:
@@ -289,7 +316,14 @@ class PagedAttention(nn.Module):
         slots, owned = resolve_cache_slots(
             slots, ctx.attn_backend.cache_placement(self)
         )
-        return ctx.token_to_kv_pool.kv_write_target(self.layer_id, slots, owned)
+        target = ctx.token_to_kv_pool.kv_write_target(self.layer_id, slots, owned)
+        if (
+            self.fp8_kv_scales is not None
+            and isinstance(target, HeadKVCache)
+            and target.format is KVCacheFormat.FP8
+        ):
+            target = replace(target, scales=self.fp8_kv_scales)
+        return target
 
     def attend_live_rows(
         self,

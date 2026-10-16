@@ -156,6 +156,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "kv_scaled": frozenset({False, True}),
             "head_dim": frozenset({64, 128, 256}),
             "is_causal": frozenset({False, True}),
             "logit_cap": frozenset({False}),
@@ -183,10 +184,13 @@ if platform.is_nvidia and platform.is_hopper_plus:
         q_scale: torch.Tensor | None = None,
         k_scale: torch.Tensor | None = None,
         v_scale: torch.Tensor | None = None,
+        fp8_kv_scales: tuple[float, float] | None = None,
         enable_pdl: bool | None = None,
     ) -> torch.Tensor:
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+        # A scaled cache's rows are K / k and V / v: k joins the logit scale, v the output's.
+        k_descale, v_descale = (1.0, 1.0) if fp8_kv_scales is None else fp8_kv_scales
         global _workspace_buffer
         if _workspace_buffer is None:
             _workspace_buffer = torch.zeros(
@@ -209,8 +213,8 @@ if platform.is_nvidia and platform.is_hopper_plus:
             seq_lens=cache_seqlens,
             max_q_len=max_seqlen_q,
             max_kv_len=max_seqlen_k,
-            bmm1_scale=softmax_scale,
-            bmm2_scale=1.0,
+            bmm1_scale=softmax_scale * k_descale,
+            bmm2_scale=v_descale,
             batch_size=cache_seqlens.shape[0],
             cum_seq_lens_q=cu_seqlens_q,
             cum_seq_lens_kv=cu_seqlens_kv,
@@ -237,6 +241,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "kv_scaled": frozenset({False, True}),
             "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
             "sinks": frozenset({False, True}),
@@ -259,10 +264,13 @@ if platform.is_nvidia and platform.is_hopper_plus:
         q_scale: torch.Tensor | None = None,
         k_scale: torch.Tensor | None = None,
         v_scale: torch.Tensor | None = None,
+        fp8_kv_scales: tuple[float, float] | None = None,
         enable_pdl: bool | None = None,
     ) -> torch.Tensor:
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+        # A scaled cache's rows are K / k and V / v: k joins the logit scale, v the output's.
+        k_descale, v_descale = (1.0, 1.0) if fp8_kv_scales is None else fp8_kv_scales
         global _workspace_buffer
         if _workspace_buffer is None:
             _workspace_buffer = torch.zeros(
@@ -285,8 +293,8 @@ if platform.is_nvidia and platform.is_hopper_plus:
             block_tables=page_table,
             seq_lens=cache_seqlens,
             max_seq_len=max_seqlen_k,
-            bmm1_scale=softmax_scale,
-            bmm2_scale=1.0,
+            bmm1_scale=softmax_scale * k_descale,
+            bmm2_scale=v_descale,
             window_left=window_left,
             sinks=sinks,
             out_dtype=(torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype),

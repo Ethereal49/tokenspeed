@@ -89,7 +89,11 @@ def backend(monkeypatch):
 
 def _layer():
     return SimpleNamespace(
-        tp_q_head_num=HEADS, head_dim=HEAD_DIM, scaling=1.0, sliding_window_size=-1
+        tp_q_head_num=HEADS,
+        head_dim=HEAD_DIM,
+        scaling=1.0,
+        sliding_window_size=-1,
+        fp8_kv_scales=None,
     )
 
 

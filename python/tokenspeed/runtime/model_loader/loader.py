@@ -172,6 +172,26 @@ def _initialize_model(
     )
 
 
+def _warn_kv_cache_scales(model: nn.Module) -> None:
+    """Name the attention layers a checkpoint gave non-unit KV-cache scales."""
+    from tokenspeed.runtime.layers.paged_attention import PagedAttention
+
+    scales = [
+        module.fp8_kv_scales
+        for module in model.modules()
+        if isinstance(module, PagedAttention) and module.fp8_kv_scales is not None
+    ]
+    if scales:
+        k = [s.k for s in scales]
+        v = [s.v for s in scales]
+        logger.warning(
+            f"{type(model).__name__}: {len(scales)} attention layers carry "
+            f"non-unit KV-cache scales (k_scale {min(k):.4g}..{max(k):.4g}, "
+            f"v_scale {min(v):.4g}..{max(v):.4g}); an FP8 KV cache stores "
+            "K / k_scale and V / v_scale, a cache of another dtype ignores them"
+        )
+
+
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 
@@ -420,9 +440,7 @@ class DefaultModelLoader(BaseModelLoader):
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files)
 
-        return require_unit_kv_scales(
-            (source.prefix + name, tensor) for (name, tensor) in weights_iterator
-        )
+        return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 
     def _get_all_weights(
         self,
@@ -470,20 +488,23 @@ class DefaultModelLoader(BaseModelLoader):
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", False),
         )
-        yield from self._get_weights_iterator(
+        sources = [
             primary_weights,
-            weight_name_filter,
-            checkpoint_load_group,
-            mapping,
-        )
-
-        secondary_weights = cast(
-            Iterable[DefaultModelLoader.Source], getattr(model, "secondary_weights", ())
-        )
-        for source in secondary_weights:
-            yield from self._get_weights_iterator(
+            *cast(
+                Iterable[DefaultModelLoader.Source],
+                getattr(model, "secondary_weights", ()),
+            ),
+        ]
+        for source in sources:
+            weights = self._get_weights_iterator(
                 source, weight_name_filter, checkpoint_load_group, mapping
             )
+            # A model that loads KV-cache scales into its attention layers
+            # takes any value; others run their caches at unit scale.
+            if getattr(model, "loads_kv_cache_scales", False):
+                yield from weights
+            else:
+                yield from require_unit_kv_scales(weights)
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(
@@ -507,6 +528,7 @@ class DefaultModelLoader(BaseModelLoader):
 
             with startup_phase("weights.read_copy"):
                 model.load_weights(self._get_all_weights(model_config, model))
+            _warn_kv_cache_scales(model)
 
             with startup_phase("weights.postprocess"):
                 # post_load_transformed_modules must recognise every hook run here.

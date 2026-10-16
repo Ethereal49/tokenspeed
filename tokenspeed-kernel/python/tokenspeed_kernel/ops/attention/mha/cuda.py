@@ -140,6 +140,7 @@ if platform.is_nvidia and platform.is_blackwell:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "kv_scaled": frozenset({False}),
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
             "is_causal": frozenset({False, True}),
             "logit_cap": frozenset({False}),
@@ -205,6 +206,7 @@ if platform.is_nvidia and platform.is_blackwell:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "kv_scaled": frozenset({False}),
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
             "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
@@ -271,6 +273,7 @@ if platform.is_nvidia and platform.is_blackwell:
         signatures=_FA4_FP8_DENSE_SIGNATURES,
         priority=Priority.SPECIALIZED,
         traits={
+            "kv_scaled": frozenset({False}),
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
             "is_causal": frozenset({False, True}),
             "logit_cap": frozenset({False}),
@@ -331,6 +334,7 @@ if platform.is_nvidia and platform.is_blackwell:
         signatures=_FA4_FP8_DENSE_SIGNATURES,
         priority=Priority.SPECIALIZED,
         traits={
+            "kv_scaled": frozenset({False}),
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
             "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
@@ -409,6 +413,7 @@ if platform.is_nvidia and platform.is_blackwell:
             signatures=_MXFP8_ATTENTION_SIGNATURES,
             priority=Priority.SPECIALIZED,
             traits={
+                "kv_scaled": frozenset({False}),
                 "head_dim": frozenset({128}),
                 "page_size": frozenset({128}),
                 "logit_cap": frozenset({False}),
@@ -476,6 +481,7 @@ if platform.is_nvidia and platform.is_blackwell:
             signatures=_MXFP8_ATTENTION_SIGNATURES,
             priority=Priority.SPECIALIZED,
             traits={
+                "kv_scaled": frozenset({False}),
                 "head_dim": frozenset({128}),
                 "page_size": frozenset({128}),
                 "is_causal": frozenset({True}),
@@ -609,6 +615,7 @@ elif platform.is_nvidia and platform.is_hopper:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "kv_scaled": frozenset({False}),
             "is_causal": frozenset({False, True}),
             "logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
@@ -672,6 +679,7 @@ elif platform.is_nvidia and platform.is_hopper:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "kv_scaled": frozenset({False}),
             "logit_cap": frozenset({False, True}),
             "return_lse": frozenset({False}),
             "sinks": frozenset({False, True}),

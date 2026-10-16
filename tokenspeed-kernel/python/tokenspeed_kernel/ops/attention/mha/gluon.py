@@ -70,6 +70,7 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "kv_scaled": frozenset({False}),
             "head_dim": frozenset({64, 128}),
             "page_size": frozenset({64}),
             "logit_cap": frozenset({False}),
@@ -103,6 +104,7 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "kv_scaled": frozenset({False}),
             "q_len": frozenset({1}),
             "head_dim": frozenset({64, 128}),
             "page_size": frozenset({64, 128}),
@@ -203,6 +205,7 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "kv_scaled": frozenset({False}),
             "head_dim": frozenset({64, 128}),
             "page_size": frozenset({64}),
             "is_causal": frozenset({False, True}),

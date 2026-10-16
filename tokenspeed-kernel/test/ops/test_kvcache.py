@@ -334,11 +334,38 @@ def test_fused_fp8_set_kv_buffer_matches_qsa_store(device: str, tokens: int) -> 
         v_cache,
         cache_locs,
         page_size=page_size,
+        inv_scales=None,
     )
     torch.cuda.synchronize()
 
     assert torch.equal(k_cache.view(torch.uint8), expected_k.view(torch.uint8))
     assert torch.equal(v_cache.view(torch.uint8), expected_v.view(torch.uint8))
+
+
+def test_fused_fp8_set_kv_buffer_stores_rows_over_their_scale():
+    device = "cuda"
+    tokens, num_slots = 9, 32
+    g = torch.Generator(device=device).manual_seed(5)
+    k = (
+        torch.randn(tokens, 2, 64, device=device, dtype=torch.bfloat16, generator=g)
+        * 40
+    )
+    v = torch.randn(tokens, 2, 64, device=device, dtype=torch.bfloat16, generator=g)
+    cache_locs = torch.randperm(num_slots, device=device)[:tokens].to(torch.int32)
+    k_cache = torch.zeros((num_slots, 2, 64), device=device, dtype=torch.float8_e4m3fn)
+    v_cache = torch.zeros_like(k_cache)
+    inv_k, inv_v = 1.0 / 0.0614, 1.0 / 0.0513
+
+    fused_fp8_set_kv_buffer(
+        k, v, k_cache, v_cache, cache_locs, page_size=1, inv_scales=(inv_k, inv_v)
+    )
+    torch.cuda.synchronize()
+
+    locs = cache_locs.to(torch.long)
+    for cache, x, inv in ((k_cache, k, inv_k), (v_cache, v, inv_v)):
+        expected = (x.float() * inv).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        assert torch.equal(cache[locs].view(torch.uint8), expected.view(torch.uint8))
+    assert (k_cache[locs].float().abs() == 448).any()
 
 
 @pytest.mark.parametrize(

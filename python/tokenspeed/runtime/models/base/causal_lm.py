@@ -127,6 +127,10 @@ class BaseCausalLM(nn.Module):
     # refuses the placement flags for a model that does not, so a placement
     # is never installed only to be ignored.
     supports_expert_placement: ClassVar[bool] = False
+    # Whether ``load_weights`` hands checkpoint KV-cache scales to its
+    # attention layers (``PagedAttention.load_kv_cache_scale``); the loader
+    # otherwise requires every scale to be one.
+    loads_kv_cache_scales: ClassVar[bool] = False
 
     @property
     def routed_experts_weights_of_layer(self) -> dict[int, list[torch.Tensor]]:

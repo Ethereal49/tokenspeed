@@ -239,9 +239,20 @@ step writes every row itself and skips the pre-break prologue.
 
 ## Formats and scales
 
-KV caches run at unit scale. `require_unit_kv_scales` rejects a checkpoint KV
-scale other than one. `require_unit_kv_scale_file` does the same for an
-FP8 KV cache's `--quantization-param-path`. No layer carries a KV scale.
+KV caches run at unit scale unless a layer carries per-tensor scales. A model
+whose `load_weights` hands a checkpoint's `k_scale` / `v_scale` to its
+`PagedAttention` (`loads_kv_cache_scales`, `load_kv_cache_scale`) takes any
+value; for every other model `require_unit_kv_scales` rejects a scale other than
+one, and `require_unit_kv_scale_file` does the same for an FP8 KV cache's
+`--quantization-param-path`. A weight update may not change a scale.
+
+An FP8 cache of a scaled layer holds `K / k_scale` and `V / v_scale` saturated
+to e4m3's range: the layer passes `FP8TensorScales` as the write target's
+`scales`, and the prologue solutions that declare the `kv_scaled` trait write
+them. Attention reads them through kernels that declare `kv_scaled`: trtllm-gen
+folds `k_scale` into the logit scale and `v_scale` into the output's. A cache of
+another dtype ignores the scales on both sides. Per-head scales, MLA caches and
+draft-tree attention over a scaled cache are refused.
 
 An MLA layer reads its query in the activation dtype, except that an FP8
 latent cache gets an FP8 query, and FP8 expanded keys and values, whichever MLA

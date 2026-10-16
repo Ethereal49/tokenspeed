@@ -198,6 +198,51 @@ def test_a_checkpoint_load_rejects_a_non_unit_kv_scale(tmp_path):
     )
     with pytest.raises(ValueError, match="k_proj.k_scale"):
         list(loader._get_all_weights(model_config, model))
+    # A model that loads KV-cache scales into its layers takes any value.
+    model.loads_kv_cache_scales = True
+    assert len(list(loader._get_all_weights(model_config, model))) == 2
+
+
+def _attention():
+    from tokenspeed.runtime.layers.paged_attention import PagedAttention
+
+    return PagedAttention(4, 16, 0.25, 2, 0, rotary_emb=None, qk_norm=None)
+
+
+def test_a_layer_takes_per_tensor_kv_scales_and_drops_unit_ones():
+    from tokenspeed_kernel.ops.attention.prologue import FP8TensorScales
+
+    attn = _attention()
+    attn.load_kv_cache_scale("layers.0.mixer.k_proj.k_scale", torch.tensor([0.5]))
+    assert attn.fp8_kv_scales == FP8TensorScales(0.5, 1.0)
+    attn.load_kv_cache_scale("layers.0.mixer.v_proj.v_scale", torch.tensor(0.25))
+    assert attn.fp8_kv_scales == FP8TensorScales(0.5, 0.25)
+    unit = _attention()
+    unit.load_kv_cache_scale("layers.0.mixer.k_proj.k_scale", torch.tensor(1.0))
+    assert unit.fp8_kv_scales is None
+    with pytest.raises(NotImplementedError, match="per-tensor"):
+        unit.load_kv_cache_scale("layers.0.mixer.k_proj.k_scale", torch.ones(2))
+
+
+@pytest.mark.parametrize("cache_dtype", [torch.float8_e4m3fn, torch.bfloat16])
+def test_only_an_fp8_cache_is_written_at_the_layer_scales(cache_dtype):
+    from tokenspeed_kernel.ops.attention.prologue import FP8TensorScales, HeadKVCache
+
+    attn = _attention()
+    attn.load_kv_cache_scale("a.k_scale", torch.tensor(0.5))
+    rows = torch.zeros(8, 2, 16, dtype=cache_dtype)
+    pool = SimpleNamespace(
+        kv_write_target=lambda layer_id, slots, owned: HeadKVCache(
+            rows, rows, None, slots
+        )
+    )
+    ctx = SimpleNamespace(
+        attn_backend=SimpleNamespace(cache_placement=lambda layer: None),
+        token_to_kv_pool=pool,
+    )
+    target = attn._local_target(torch.arange(3), ctx)
+    expected = FP8TensorScales(0.5, 1.0) if cache_dtype is torch.float8_e4m3fn else None
+    assert target.scales == expected
 
 
 def test_a_distributed_update_finishes_its_load_before_rejecting_a_scale(monkeypatch):

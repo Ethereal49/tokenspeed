@@ -28,6 +28,7 @@ import torch
 from tokenspeed_kernel.ops.attention.prologue.types import (
     BOOLS,
     ROPE_STYLES,
+    FP8TensorScales,
     GQAPrologueOutput,
     HeadKVCache,
     HeadNorm,
@@ -94,6 +95,7 @@ def _write_kv(
             k, v, cache.k_cache, cache.v_cache, cache.slots, enable_pdl=enable_pdl
         )
     elif cache.format is KVCacheFormat.FP8:
+        scales = cache.scales
         fused_fp8_set_kv_buffer(
             k,
             v,
@@ -101,6 +103,11 @@ def _write_kv(
             cache.v_cache,
             cache.slots,
             page_size=1,
+            inv_scales=(
+                (1.0 / scales.k, 1.0 / scales.v)
+                if isinstance(scales, FP8TensorScales)
+                else None
+            ),
             enable_pdl=enable_pdl,
         )
     else:
@@ -128,6 +135,7 @@ def _write_kv(
     traits={
         "has_norm": BOOLS,
         "kv_format": frozenset({"native", "fp8", "mxfp8"}),
+        "kv_scaled": BOOLS,
         "kv_convert": BOOLS,
         "mrope": BOOLS,
         "partial_rotary": BOOLS,

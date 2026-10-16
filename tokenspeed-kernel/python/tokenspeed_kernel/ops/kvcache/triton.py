@@ -1930,8 +1930,10 @@ def _process_fp8_kv_tensor(
     cache_stride_offset: tl.constexpr,
     cache_stride_head: tl.constexpr,
     cache_stride_dim: tl.constexpr,
+    inv_scale,
     BLOCK_HEAD: tl.constexpr,
     BLOCK_DIM: tl.constexpr,
+    SCALED: tl.constexpr,
 ):
     head_idx = head_block_id * BLOCK_HEAD
     num_heads_in_block = min(BLOCK_HEAD, num_kv_heads - head_idx)
@@ -1952,6 +1954,9 @@ def _process_fp8_kv_tensor(
             + dim_offsets[None, :] * input_stride_dim
         )
         block = tl.load(input_ptr + input_offsets, mask=mask, other=0.0)
+        if SCALED:
+            # A per-tensor scaled cache holds x / scale, saturated to e4m3's range.
+            block = tl.clamp(block.to(tl.float32) * inv_scale, -448.0, 448.0)
 
         cache_offsets = (
             page_id * cache_stride_page
@@ -1986,8 +1991,11 @@ def _fused_fp8_set_kv_buffer_kernel(
     v_cache_stride_offset: tl.constexpr,
     v_cache_stride_head: tl.constexpr,
     v_cache_stride_dim: tl.constexpr,
+    k_inv_scale,
+    v_inv_scale,
     BLOCK_HEAD: tl.constexpr,
     BLOCK_DIM: tl.constexpr,
+    SCALED: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
     token_id = tl.program_id(0).to(tl.int64)
@@ -2018,8 +2026,10 @@ def _fused_fp8_set_kv_buffer_kernel(
             k_cache_stride_offset,
             k_cache_stride_head,
             k_cache_stride_dim,
+            k_inv_scale,
             BLOCK_HEAD,
             BLOCK_DIM,
+            SCALED,
         )
     else:
         _process_fp8_kv_tensor(
@@ -2038,8 +2048,10 @@ def _fused_fp8_set_kv_buffer_kernel(
             v_cache_stride_offset,
             v_cache_stride_head,
             v_cache_stride_dim,
+            v_inv_scale,
             BLOCK_HEAD,
             BLOCK_DIM,
+            SCALED,
         )
 
     if ENABLE_PDL:
@@ -2053,6 +2065,8 @@ def fused_fp8_set_kv_buffer(
     v_cache: torch.Tensor,
     cache_loc: torch.Tensor,
     page_size: int = 16,
+    *,
+    inv_scales: tuple[float, float] | None,
     enable_pdl: bool | None = None,
 ) -> None:
     """Quantize K/V tensors to FP8 and scatter them into a paged KV cache.
@@ -2068,6 +2082,9 @@ def fused_fp8_set_kv_buffer(
             ``k_cache``.
         cache_loc: Cache slot index for each input token.
         page_size: Number of tokens per cache page.
+        inv_scales: ``(1 / k_scale, 1 / v_scale)`` of a per-tensor scaled
+            cache, whose rows hold ``K / k_scale`` and ``V / v_scale``
+            saturated to e4m3's range; ``None`` for a unit-scale cache.
         enable_pdl: Whether to use Programmatic Dependent Launch. Defaults to
             the platform policy; pass ``False`` to disable it explicitly.
     """
@@ -2164,8 +2181,11 @@ def fused_fp8_set_kv_buffer(
         v_cache_stride_offset,
         v_cache_stride_head,
         v_cache_stride_dim,
+        1.0 if inv_scales is None else inv_scales[0],
+        1.0 if inv_scales is None else inv_scales[1],
         BLOCK_HEAD=block_head,
         BLOCK_DIM=block_dim,
+        SCALED=inv_scales is not None,
         ENABLE_PDL=use_pdl,
         **kwargs,
     )
