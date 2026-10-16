@@ -670,9 +670,11 @@ def _solve_packing(fields):
 
 
 def _packing_by_group_ratio(raw_by_group):
+    # Unrelated page counts must not multiply into enormous parent alignment.
+    # Exact shared-plane constraints and explicit recipe packing override this.
     largest_payload = max(raw_by_group.values())
     return {
-        group_id: max(1, largest_payload // raw_by_group[group_id])
+        group_id: 1 << ((largest_payload // raw_by_group[group_id]).bit_length() - 1)
         for group_id in raw_by_group
     }
 

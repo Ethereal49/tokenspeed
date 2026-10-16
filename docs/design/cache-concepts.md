@@ -1098,6 +1098,9 @@ layers ──group──▶ groups ──pack──▶ CacheLayout ──bind─
   group's CacheBlocks share a parent (`cache_blocks_per_lcm_block`). The
   result, `CacheLayout`, is **capacity-independent** — it describes one
   parent, not an allocation.
+  Unconstrained group byte ratios round down to powers of two so unrelated
+  page counts do not multiply the parent alignment. Exact shared-plane stride
+  constraints and explicit recipe packing remain authoritative.
 * **`bind`** (`CacheLayout.bind(num_lcm_blocks)`) multiplies that parent out
   by a count and yields the `CacheMemoryPlan` the arena allocates from and
   the PD wire carries.

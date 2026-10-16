@@ -66,6 +66,32 @@ def _group(group_id: str, *fields, **spec_kwargs):
 
 
 class TestCacheMemoryPlanTest:
+    def test_independent_side_groups_do_not_inflate_parent_alignment(self):
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+            CacheGroupSpec,
+        )
+
+        field = self.plan_module.CacheFieldSpec
+        groups = tuple(
+            (
+                CacheGroupSpec(
+                    group_id=name,
+                    attn_kind="state",
+                    sliding_window_tokens=None,
+                    replayable=False,
+                ),
+                (field(name, name, (size,), "uint8", exact_page_stride=False),),
+            )
+            for name, size in (("main", 4096), ("side_a", 13), ("side_b", 23))
+        )
+        layout = self.plan_module.pack(
+            groups, prefix_granularity=64, max_padding_fraction=float("inf")
+        )
+        # Three independent planes of at most 4 KiB must fit a small arena.
+        assert layout.lcm_block_bytes <= 16384
+        plan = layout.bind(2)
+        assert plan.lcm_block_bytes * 3 <= 49152
+
     def _plan_fields(
         self,
         fields,
