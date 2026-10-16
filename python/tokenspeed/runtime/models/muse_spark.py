@@ -288,7 +288,7 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         if self.workspace is None:
             return (
                 self._project(x, weight, None)
-                if current_platform().is_cdna4
+                if current_platform().is_cdna4 or self.gather_column_view
                 else super().forward(x)[0]
             )
         tokens = x.shape[0]
