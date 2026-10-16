@@ -33,6 +33,9 @@ from tokenspeed.runtime.execution.model_executor import (
 )
 from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.layers.attention.configs.base import is_block_drafter
+from tokenspeed.runtime.layers.logits_processor import (
+    should_apply_lm_head_quant_method,
+)
 from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.sampling.registry import create_sampling_backend
 from tokenspeed.runtime.utils.nvtx import set_nvtx_enabled
@@ -108,6 +111,18 @@ def _share_target_embed_and_head(model_runner: ModelRunner, draft_model) -> None
     else:
         if head is None:
             raise ValueError("Draft model requires the target's lm_head weight.")
+        # A quantized head computes logits through its quant method and scales;
+        # aliasing its weight alone would read the quantized weight as a plain one.
+        target_head = getattr(model_runner.model, "lm_head", None)
+        if target_head is not None and should_apply_lm_head_quant_method(
+            target_head, getattr(target_head, "quant_method", None)
+        ):
+            raise ValueError(
+                f"The target's lm_head is quantized "
+                f"({type(target_head.quant_method).__name__}); "
+                f"{type(draft_model).__name__} shares only its weight and must "
+                "share the complete module (set_embed_and_head_module)."
+            )
         draft_model.set_embed_and_head(embed, head)
     if embed is None:
         _require_draft_embedding(draft_model)

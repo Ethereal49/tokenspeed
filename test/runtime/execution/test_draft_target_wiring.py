@@ -237,6 +237,36 @@ def test_wire_mtp_module_sharing_requires_target_lm_head():
         factory.configure_draft_target(_server_args("MTP"), target, draft)
 
 
+def test_wire_refuses_to_alias_the_weight_of_a_quantized_target_head():
+    class Fp8HeadMethod:
+        def apply(self, layer, x, bias=None):
+            raise AssertionError("not called while wiring")
+
+    head = SimpleNamespace(weight="FP8_WEIGHT", quant_method=Fp8HeadMethod())
+    target = _target_runner(
+        SimpleNamespace(
+            lm_head=head,
+            get_embed_and_head=lambda: ("EMBED", head.weight),
+            logits_processor=_head_layout(),
+        )
+    )
+    draft_model = _WeightSharingDraft()
+    draft = _draft_runner(draft_model)
+
+    with (
+        mock.patch.object(factory, "get_drafter_impl", return_value=Eagle),
+        pytest.raises(ValueError, match="Fp8HeadMethod.*complete module"),
+    ):
+        factory.configure_draft_target(_server_args("MTP"), target, draft)
+    # A module-sharing draft takes the quantized head whole.
+    module_draft = _ModuleSharingDraft()
+    with mock.patch.object(factory, "get_drafter_impl", return_value=Mtp):
+        factory.configure_draft_target(
+            _server_args("MTP"), target, _draft_runner(module_draft)
+        )
+    assert module_draft.shared == ("EMBED", head)
+
+
 def test_wire_off_pipeline_requires_both_target_weights():
     draft = _draft_runner(_WeightSharingDraft())
     for embed, head, message in (
