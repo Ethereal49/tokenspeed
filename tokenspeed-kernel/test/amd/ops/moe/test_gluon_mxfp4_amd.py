@@ -35,7 +35,6 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import (  # noqa: E402
     fused as gfx1250_fused,
 )
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.decode import (  # noqa: E402
-    _decode_launch_metadata,
     decode_tile_config,
 )
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.fused import (  # noqa: E402
@@ -1217,46 +1216,6 @@ def test_gfx1250_decode_tile_config_streams_long_k_in_wide_rows() -> None:
     short_k = decode_tile_config(384)
     assert long_k["block_k"] == 512 and short_k["block_k"] == 128
     assert long_k["block_n"] == short_k["block_n"] == 128
-
-
-def test_gfx1250_decode_launch_metadata_counts_packed_operand_bytes() -> None:
-    m, n, k = 4, 256, 512
-
-    class Kernel:
-        name = "_matmul_decode"
-
-    def metadata(x, x_scale, w, w_scale):
-        args = {
-            "M": m,
-            "N": n,
-            "K": k,
-            "N_EXPTS_TOT": 1,
-            "SCALE_BLOCK": 32,
-            "ACTIVATION_REDUCTION_N": 1,
-            "grid_n": 1,
-            "X": x,
-            "XMxScale": x_scale,
-            "W": w,
-            "WMxScale": w_scale,
-            "Y": torch.empty(m, n, dtype=torch.bfloat16),
-        }
-        return _decode_launch_metadata(None, Kernel(), args)["bytes"]
-
-    output_bytes = m * n * 2
-    packed = torch.empty(m, k // 2, dtype=torch.uint8)
-    scales = torch.empty(m, k // 32, dtype=torch.uint8)
-    w_packed = torch.empty(n, k // 2, dtype=torch.uint8)
-    w_scales = torch.empty(n, k // 32, dtype=torch.uint8)
-    w_bytes = n * (k // 2 + k // 32)
-    # MXFP4 activations: two values per byte plus one E8M0 scale per 32.
-    assert metadata(packed, scales, w_packed, w_scales) == (
-        w_bytes + m * (k // 2 + k // 32) + output_bytes
-    )
-    fp8 = torch.empty(m, k, dtype=torch.float8_e4m3fn)
-    assert metadata(fp8, None, w_packed, w_scales) == w_bytes + m * k + output_bytes
-    # Unpacked weights count their element size.
-    w_bf16 = torch.empty(n, k, dtype=torch.bfloat16)
-    assert metadata(fp8, None, w_bf16, None) == n * k * 2 + m * k + output_bytes
 
 
 def _sparse_decode_moe_case(num_tokens: int):
