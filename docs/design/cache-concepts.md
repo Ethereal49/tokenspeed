@@ -1599,6 +1599,8 @@ including QSA's full-KV, compressed and recent cache groups. Verify-state layer
 ownership and cache addresses come from the bound plan's layer window,
 including under PP and target/draft sharing. Cache recipes reserve verify
 workspace before sizing the arena.
+A Qwen4 PD prefill role retains the target/draft cache layout for transfer,
+but reserves no speculative verify workspace: only the decode role verifies.
 
 Qwen4-Exp selects its cache recipe by model family, including targets with
 only full-attention layers. PLE and QSA fields and their verify budget do

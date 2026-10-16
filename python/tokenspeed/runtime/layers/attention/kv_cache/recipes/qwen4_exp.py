@@ -208,6 +208,10 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         if (
             not self.num_draft_layers
             or self.attn_config.speculative_num_draft_tokens <= 1
+            or (
+                self.pd_disaggregation_enabled
+                and self.server_args.disaggregation_mode == "prefill"
+            )
         ):
             return 0
         num_ple_layers = sum(

@@ -563,8 +563,9 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
 
 @pytest.mark.parametrize("speculative,width", [(False, 1), (True, 1), (True, 3)])
 @pytest.mark.parametrize("ple_enabled", (False, True))
+@pytest.mark.parametrize("role", ("null", "prefill", "decode"))
 def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
-    speculative: bool, width: int, ple_enabled: bool
+    speculative: bool, width: int, ple_enabled: bool, role: str
 ) -> None:
     text_config = SimpleNamespace(
         ple_layer_ids=(0, 1) if ple_enabled else (),
@@ -590,6 +591,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         speculative_num_draft_tokens=width,
         **_model_wide_kwargs(),
     )
+    attn_config = replace(attn_config, pd_disaggregation_enabled=role != "null")
     draft_config = (
         replace(
             attn_config,
@@ -605,6 +607,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         speculative_num_draft_tokens=width,
         speculative_eagle_topk=1,
         enable_replay_ssm=False,
+        disaggregation_mode=role,
     )
     setup = prepare_cache_setup(
         family="qwen4_exp",
@@ -622,7 +625,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )
-    if not speculative:
+    if not speculative or role == "prefill":
         assert setup.fixed_workspace_bytes == 0
         return
 
