@@ -847,7 +847,11 @@ Its responsibilities:
   finished local backup must not `CacheHostBlock` on one mirrored
   scheduler while a CP/PP peer still has the op pending. A truncated
   `batch_is_exist` reply is a failed put, not an implicit success:
-  `WriteBackDone` follows only a completed backup. A backup future that
+  `WriteBackDone` follows only a completed backup. Mooncake allocation
+  pressure (`NO_AVAILABLE_HANDLE`) retries only unwritten pages on the
+  backup worker, with at most three retries after 10, 50, and 200 ms.
+  Host pages remain pinned until success; exhausted retries, other errors,
+  and malformed replies retain the failure path. A backup future that
   fails is MAX-reduced with the replica idle/work flag before the
   completion gather so every rank raises together. Every rank
   stays in every replica-group gather even when an earlier intersection
