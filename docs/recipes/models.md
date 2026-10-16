@@ -63,9 +63,7 @@ ts serve \
     --port 8000
 ```
 
-Prefill stays eager and overlap scheduling is off. The AMD evaluation jobs set
-`DEBUG_HIP_GRAPH_BATCH_SIZE=1`, a HIP runtime workaround for images that
-replay large graphs unreliably.
+Prefill stays eager and overlap scheduling is off.
 
 ### Blackwell NVFP4
 
