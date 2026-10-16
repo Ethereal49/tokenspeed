@@ -1826,7 +1826,7 @@ void CacheCoordinator::rememberStorageKey(const CacheKey& key) {
 }
 
 void CacheCoordinator::evictStorageKeysToLimit() {
-    compactStorageKeyOrder();
+    // Bulk removals compact the order themselves; a Host publication only appends.
     while (storage_keys_.size() > storage_key_limit_) {
         if (storage_key_order_.empty()) {
             break;

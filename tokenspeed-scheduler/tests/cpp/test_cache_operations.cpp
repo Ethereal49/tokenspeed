@@ -986,6 +986,45 @@ TEST(CacheOperationTest, L3UnregisterPrunesStorageKeyOrder) {
     EXPECT_EQ(CacheCoordinatorTestAccess::NumStorageKeyOrder(coordinator), 1u);
 }
 
+TEST(CacheOperationTest, L3HostPublicationPreservesEvictionOrderAfterUnregister) {
+    BlockPool device_pool{4, {1}};
+    BlockPool host_pool{4, {1}};
+    const std::array specs{CacheGroupSpec{
+        .attn_kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true);
+    const auto key = [](const char* hash) { return CacheKey{.group_id = 0, .content_hash = hash}; };
+    coordinator.RegisterStorageKeys(std::array{key("a"), key("b"), key("c"), key("d")});
+    coordinator.UnregisterStorageKeys(std::array{key("b")});
+    for (const char* hash : {"b", "e", "f"}) {
+        CacheBlockRef block = host_pool.AcquireBlock(0);
+        ASSERT_TRUE(block);
+        coordinator.CacheHostBlock(block, key(hash));
+    }
+    EXPECT_EQ(coordinator.NumStorageKeys(), 4);
+    EXPECT_FALSE(coordinator.ContainsStorageKey(key("a")));
+    EXPECT_FALSE(coordinator.ContainsStorageKey(key("c")));
+    for (const char* hash : {"d", "b", "e", "f"}) {
+        EXPECT_TRUE(coordinator.ContainsStorageKey(key(hash))) << hash;
+    }
+
+    // A bulk probe protects its retained prefix while replacing unrelated keys.
+    coordinator.RegisterStorageKeys(std::array{key("d"), key("g"), key("h"), key("i"), key("j")});
+    EXPECT_FALSE(coordinator.ContainsStorageKey(key("j")));
+    CacheBlockRef block = host_pool.AcquireBlock(0);
+    ASSERT_TRUE(block);
+    coordinator.CacheHostBlock(block, key("j"));
+    EXPECT_EQ(coordinator.NumStorageKeys(), 4);
+    EXPECT_FALSE(coordinator.ContainsStorageKey(key("d")));
+    for (const char* hash : {"g", "h", "i", "j"}) {
+        EXPECT_TRUE(coordinator.ContainsStorageKey(key(hash))) << hash;
+    }
+}
+
 TEST(CacheOperationTest, APrefetchPageIsPlannedForEveryGroupOrNotAtAll) {
     BlockPool device_pool{8, {1, 1}};
     BlockPool host_pool{1, {1, 1}};

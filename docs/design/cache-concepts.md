@@ -993,7 +993,10 @@ Its responsibilities:
   shadow with this prompt's suffix; later unrelated keys LRU-evict older
   prompts. Unregister removes keys from both the live set and the LRU
   order deque so a vanished object cannot accumulate tombstones
-  while the live set stays below capacity. Submit-time registration
+  while the live set stays below capacity. Bulk removals maintain that order;
+  publishing one Host block only appends its key and trims excess keys from
+  the front, without scanning the whole shadow for every block.
+  Submit-time registration
   restores keys that were dropped from the shadow.
   That probe is not a lease: an object can vanish between `batch_exists`
   and the fetch. So the fetch happens before admission, where a miss costs
