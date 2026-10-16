@@ -61,6 +61,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     state_verify_commit_rows,
     store_state_rows,
 )
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     scrub_padding_tail,
@@ -152,8 +153,16 @@ def _prepare_gdn_decode_state_path(
     Until that kernel supports a padding mask, route BF16 state through
     Triton and keep ``-1`` unchanged.
     """
-    solution = "triton" if ssm_states.dtype == torch.bfloat16 else None
-    return initial_state_indices, output_state_indices, solution
+    return (
+        initial_state_indices,
+        output_state_indices,
+        gdn_decode_solution(ssm_states.dtype),
+    )
+
+
+def gdn_decode_solution(ssm_dtype: torch.dtype) -> str | None:
+    """The GDN decode/verify solution forced for a state dtype (see above)."""
+    return "triton" if ssm_dtype == torch.bfloat16 else None
 
 
 def _build_cu_extend_seq_lens_cpu(
@@ -257,12 +266,12 @@ _StateLayerGeometry = tuple[
 class MambaAttnBackend(AttentionBackend):
     """Attention backend for Mamba/GDN linear attention layers."""
 
-    # This backend consumes state-family tables (two slots per request, see
-    # ``state.checkpoint``); history-family groups belong to the
+    # This backend consumes state tables (two slots per request, see
+    # ``state.checkpoint``); history groups belong to the
     # full-attention sub-backend. The hybrid wrapper unions the sub-backends'
     # declarations, so a Kimi-K3 contract (history + state) is covered once
     # both consumers exist.
-    cache_consumer_families = frozenset({"state"})
+    cache_consumer_attn_kinds = frozenset({"state"})
     _verify_reads_committed_recurrent_state: bool = False
     _verify_packed_qkv_views: bool = False
     _decode_packed_qkv_views: bool = False
@@ -344,12 +353,12 @@ class MambaAttnBackend(AttentionBackend):
         state_specs = tuple(
             spec
             for spec in contract.group_specs
-            if spec.group_id in claimed_groups and spec.family == "state"
+            if spec.group_id in claimed_groups and spec.attn_kind == "state"
         )
         state_group_ids = tuple(spec.group_id for spec in state_specs)
         if not state_group_ids or set(state_group_ids) != claimed_groups:
             raise RuntimeError(
-                "MambaAttnBackend requires a state-family group for every recurrent layer"
+                "MambaAttnBackend requires a state group for every recurrent layer"
             )
         layer_geometry = tuple(
             (
@@ -450,9 +459,7 @@ class MambaAttnBackend(AttentionBackend):
         try:
             return self.kv_pool.state_group_by_layer[layer_id]
         except KeyError as exc:
-            raise RuntimeError(
-                f"layer {layer_id} has no state-family cache group"
-            ) from exc
+            raise RuntimeError(f"layer {layer_id} has no state cache group") from exc
 
     def _state_components(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
         return (
@@ -1400,9 +1407,6 @@ class MambaAttnBackend(AttentionBackend):
         f_b_weight = kwargs.get("f_b_weight")
         g_raw = kwargs.get("g_raw")
         beta_raw = kwargs.get("beta_raw")
-        output_gate = kwargs.get("output_gate")
-        norm_weight = kwargs.get("norm_weight")
-        norm_eps = kwargs.get("norm_eps")
         gate_lower_bound = kwargs.get("lower_bound")
         A_log = kwargs["A_log"]
         dt_bias = kwargs["dt_bias"]
@@ -1432,18 +1436,15 @@ class MambaAttnBackend(AttentionBackend):
             attn_tp_size=attn_tp_size,
             head_v_dim=head_v_dim,
             lower_bound=gate_lower_bound,
-            output_gate=output_gate,
-            norm_weight=norm_weight,
-            norm_eps=norm_eps,
         )
         if fused_out is not None:
             return fused_out
 
-        # A family whose model hands over projection views makes them dense here.
-        mixed_qkv, a, b = self._pack_projection(mixed_qkv, a, b)
-        # Stride-aware fused decoders consume packed projection views directly.
-        # Preserve the shared fallback's established compact input layout.
+        # Stride-aware decoders consume packed projection views directly.
+        # Otherwise a family whose model hands over projection views makes them
+        # dense here, and the shared fallback keeps its compact input layout.
         if not self._decode_packed_qkv_views:
+            mixed_qkv, a, b = self._pack_projection(mixed_qkv, a, b)
             mixed_qkv = mixed_qkv.contiguous()
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
@@ -1491,9 +1492,6 @@ class MambaAttnBackend(AttentionBackend):
             f_b_weight=f_b_weight,
             beta_raw=beta_raw,
             lower_bound=gate_lower_bound,
-            output_gate=output_gate,
-            norm_weight=norm_weight,
-            norm_eps=norm_eps,
         )
 
     def _decode(
@@ -1514,9 +1512,6 @@ class MambaAttnBackend(AttentionBackend):
         attn_tp_size: int,
         head_v_dim: int,
         lower_bound: float | None,
-        output_gate: torch.Tensor | None,
-        norm_weight: torch.Tensor | None,
-        norm_eps: float | None,
     ) -> torch.Tensor | None:
         """Whole-step decode attempt; ``None`` falls through to the shared flow.
 
@@ -1544,9 +1539,6 @@ class MambaAttnBackend(AttentionBackend):
             attn_tp_size: Attention tensor-parallel size.
             head_v_dim: Value head dimension.
             lower_bound: KDA decay clamp.
-            output_gate: Optional KDA gated-norm logits.
-            norm_weight: Optional KDA output RMSNorm weight.
-            norm_eps: Optional KDA output RMSNorm epsilon.
 
         Returns:
             The layer output when a fused kernel ran, else None.
@@ -1572,9 +1564,6 @@ class MambaAttnBackend(AttentionBackend):
         f_b_weight: torch.Tensor | None,
         beta_raw: torch.Tensor | None,
         lower_bound: float | None,
-        output_gate: torch.Tensor | None,
-        norm_weight: torch.Tensor | None,
-        norm_eps: float | None,
     ) -> torch.Tensor:
         """Single-token recurrent scan over the split, conv'd projections.
 
@@ -1601,9 +1590,6 @@ class MambaAttnBackend(AttentionBackend):
             f_b_weight: KDA second gate projection.
             beta_raw: KDA raw per-head beta logits.
             lower_bound: KDA decay clamp.
-            output_gate: Optional KDA gated-norm logits.
-            norm_weight: Optional KDA output RMSNorm weight.
-            norm_eps: Optional KDA output RMSNorm epsilon.
 
         Returns:
             ``[1, B, Hv, V]`` layer output.
@@ -1714,7 +1700,7 @@ class MambaAttnBackend(AttentionBackend):
             )
             if fused_out is not None:
                 return fused_out
-            if self.tree_verify is None:
+            if self.tree_verify is None and not self._verify_packed_qkv_views:
                 # A chain verifies through the dense MTP kernels (FlashInfer's).
                 mixed_qkv, a, b = self._pack_projection(mixed_qkv, a, b)
             # Read the committed window and write per-position states into the
@@ -1830,6 +1816,11 @@ class MambaAttnBackend(AttentionBackend):
                 head_v=head_v_dim,
             )
         else:
+            valid_tokens = (
+                query_start_loc[-1:]
+                if current_platform().is_hopper and not is_target_verify
+                else None
+            )
             query, key, value = fused_qkv_split_gdn_prefill(
                 mixed_qkv,
                 num_q_heads=num_heads,
@@ -1839,6 +1830,7 @@ class MambaAttnBackend(AttentionBackend):
                 head_k=head_k_dim,
                 head_v=head_v_dim,
                 replay=replay_inputs,
+                valid_tokens=valid_tokens,
             )
 
         if is_target_verify:
@@ -2041,12 +2033,20 @@ class MambaAttnBackend(AttentionBackend):
         b_b = b.view(batch_size, draft_token_num, -1)
 
         intermediate_states = None
+        output_state = None
         if self.replay_ssm:
             initial_state = ssm_comp
             initial_indices = state_in_blocks[:batch_size]
             output_state_indices = None
             if self._tree_node_states is not None:
                 intermediate_states = self._tree_node_states[:batch_size]
+        elif self._verify_reads_committed_recurrent_state:
+            # Read the committed page in place and stage each position's state
+            # in the scratch: no seed copy of the committed state.
+            initial_state = ssm_comp
+            initial_indices = state_in_blocks[:batch_size]
+            output_state_indices = output_indices
+            output_state = ssm_scratch
         else:
             initial_state = ssm_scratch
             initial_indices = self._verify_scratch_base_rows(
@@ -2074,6 +2074,7 @@ class MambaAttnBackend(AttentionBackend):
             initial_state_indices=mtp_initial_indices,
             use_qk_l2norm=True,
             output_state_indices=mtp_output_indices,
+            output_state=output_state,
             intermediate_states_buffer=intermediate_states,
             tree_ancestors=self._verify_ancestors(
                 batch_size, draft_token_num, num_value_heads
