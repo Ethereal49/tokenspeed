@@ -49,6 +49,7 @@ def _require_iris():
 
 
 def _aligned(fn, names):
+    """Mark the named pointers and every heap base 16-byte aligned, as at launch."""
     return {
         (index,): [["tt.divisibility", 16]]
         for index, name in enumerate(fn.arg_names)
@@ -57,6 +58,17 @@ def _aligned(fn, names):
 
 
 def _compile(arch_name, kind, world_size):
+    """Compile one all-reduce protocol for ``arch_name`` without launching it.
+
+    Args:
+        arch_name: Target architecture, "gfx950" or "gfx1250".
+        kind: "staged_oneshot", "pull_oneshot", "pull_twoshot", or
+            "pull_twoshot_exit" (two-shot with the exit barrier).
+        world_size: Number of ranks the protocol is specialized for.
+
+    Returns:
+        The compiled kernel, with its assembly in ``asm["amdgcn"]``.
+    """
     from tokenspeed_kernel._triton import gl, gluon, triton
     from tokenspeed_kernel.ops.communication._iris import all_reduce as ar
 
