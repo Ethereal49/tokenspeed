@@ -278,15 +278,11 @@ def kernel(
                 (query.shape[0] // query_group,), dtype=torch.int32, device=query.device
             )
             _prepare_query_groups(
-                query,
                 selected_slots,
-                prepared_query,
                 prefix_shared,
                 num_kv_heads,
-                query_head_tile,
                 query_group,
                 enable_pdl,
-                False,
             )
     head_tiles_per_row = num_kv_heads * cute.ceil_div(heads_per_kv, head_tile)
     num_clusters = query.shape[0] * head_tiles_per_row

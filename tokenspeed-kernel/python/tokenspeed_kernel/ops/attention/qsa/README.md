@@ -39,6 +39,9 @@ IDs and writes fresh flags; it does not copy KV or retain request state. Large
 twelve-head groups use preparation plus one attention launch. Other groups
 classify inside their single attention launch. CUDA graph replay recomputes
 all decisions from live inputs, including changed masks and private tails.
+Preparation accepts non-contiguous slot views with runtime row counts and
+strides, so changing the batch size or workspace layout reuses its compilation.
+Grouped attention reads Q directly through TMA strides without a packed copy.
 PDL synchronization remains explicit at producer-owned reads.
 Separate even/odd QK-ready and PV notifications protect pipeline reuse.
 Delayed-PV regressions stress both phases with two and three operand buffers.

@@ -33,10 +33,10 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
+from cutlass.cute.runtime import make_fake_tensor
 from tokenspeed_kernel.thirdparty.cute_dsl._qsa_sparse.common import (
-    _HEAD_DIM,
+    _SELECTED_WIDTH,
     _to_tvm_meta,
-    copy_query_vector,
     prepare_cta_all,
 )
 
@@ -45,15 +45,11 @@ _COMPILED_PREPARE = {}
 
 @cute.kernel
 def _prepare_query_groups_kernel(
-    query: cute.Tensor,
     selected: cute.Tensor,
-    packed: cute.Tensor,
     shared: cute.Tensor,
     kv_heads: cutlass.Constexpr[int],
-    query_head_tile: cutlass.Constexpr[int],
     query_group: cutlass.Constexpr[int],
     enable_pdl: cutlass.Constexpr[bool],
-    pack_query: cutlass.Constexpr[bool],
 ):
     group, kv_head, _ = cute.arch.block_idx()
     tid, _, _ = cute.arch.thread_idx()
@@ -68,9 +64,7 @@ def _prepare_query_groups_kernel(
     if cutlass.const_expr(enable_pdl):
         cute.arch.griddepcontrol_wait()
     if cutlass.const_expr(kv_heads == 2):
-        comparison_threads = (
-            512 if cutlass.const_expr(not pack_query and query_group == 8) else 128
-        )
+        comparison_threads = 512 if cutlass.const_expr(query_group == 8) else 128
         query_partitions = comparison_threads // 128
         query_partition = tid // 128 if cutlass.const_expr(query_partitions > 1) else 0
         column = tid % 128 if cutlass.const_expr(query_partitions > 1) else tid
@@ -138,124 +132,59 @@ def _prepare_query_groups_kernel(
             shared_prefix = prepare_cta_all(not different, comparison_threads)
     if kv_head == 0 and tid == 0:
         shared[group] = cutlass.Int32(1) if shared_prefix else cutlass.Int32(0)
-    if cutlass.const_expr(pack_query):
-        if shared_prefix:
-            heads = query.shape[1]
-            heads_per_kv = heads // kv_heads
-            elements_per_query = heads_per_kv * _HEAD_DIM
-            padded_elements = query_head_tile * _HEAD_DIM
-            packed_base = (
-                packed.iterator
-                + cutlass.Int64(group) * packed.shape[1] * _HEAD_DIM
-                + kv_head * padded_elements * query_group
-            )
-            for chunk in cutlass.range_constexpr(
-                padded_elements * query_group // (128 * 8)
-            ):
-                element = chunk * 128 * 8 + tid * 8
-                local_query = element // padded_elements
-                local_element = element % padded_elements
-                if local_element < elements_per_query:
-                    source = (
-                        query.iterator
-                        + (cutlass.Int64(group) * query_group + local_query)
-                        * heads
-                        * _HEAD_DIM
-                        + kv_head * elements_per_query
-                        + local_element
-                    )
-                    copy_query_vector(source, packed_base + element)
-                else:
-                    for item in cutlass.range_constexpr(8):
-                        packed_base[element + item] = cutlass.BFloat16(0)
     if cutlass.const_expr(enable_pdl):
         cute.arch.griddepcontrol_launch_dependents()
 
 
 @cute.jit
 def _prepare_query_groups_launch(
-    query: cute.Tensor,
     selected: cute.Tensor,
-    packed: cute.Tensor,
     shared: cute.Tensor,
     kv_heads: cutlass.Constexpr[int],
-    query_head_tile: cutlass.Constexpr[int],
     query_group: cutlass.Constexpr[int],
     enable_pdl: cutlass.Constexpr[bool],
-    pack_query: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
-    if cutlass.const_expr(kv_heads == 2):
-        _prepare_query_groups_kernel(
-            query,
-            selected,
-            packed,
-            shared,
-            kv_heads,
-            query_head_tile,
-            query_group,
-            enable_pdl,
-            pack_query,
-        ).launch(
-            grid=(query.shape[0] // query_group, kv_heads if pack_query else 1, 1),
-            block=(
-                512 if cutlass.const_expr(not pack_query and query_group == 8) else 128,
-                1,
-                1,
-            ),
-            stream=stream,
-            use_pdl=enable_pdl,
-        )
-    else:
-        _prepare_query_groups_kernel(
-            query,
-            selected,
-            packed,
-            shared,
-            kv_heads,
-            query_head_tile,
-            query_group,
-            enable_pdl,
-            pack_query,
-        ).launch(
-            grid=(query.shape[0] // query_group, kv_heads, 1),
-            block=(128, 1, 1),
-            stream=stream,
-            use_pdl=enable_pdl,
-        )
+    _prepare_query_groups_kernel(
+        selected,
+        shared,
+        kv_heads,
+        query_group,
+        enable_pdl,
+    ).launch(
+        grid=(selected.shape[0] // query_group, 1 if kv_heads == 2 else kv_heads, 1),
+        block=(
+            512 if cutlass.const_expr(kv_heads == 2 and query_group == 8) else 128,
+            1,
+            1,
+        ),
+        stream=stream,
+        use_pdl=enable_pdl,
+    )
 
 
 def _prepare_query_groups(
-    query,
     selected,
-    packed,
     shared,
     kv_heads,
-    query_head_tile,
     query_group,
     enable_pdl,
-    pack_query,
 ):
     key = (
-        query.device.index,
-        query.shape[1],
+        selected.device.index,
         kv_heads,
-        query_head_tile,
         query_group,
         enable_pdl,
-        pack_query,
     )
     compiled = _COMPILED_PREPARE.get(key)
     if compiled is None:
         descriptors = [
-            _to_tvm_meta(query, 16).mark_compact_shape_dynamic(
-                mode=0, stride_order=(0, 1, 2), divisibility=query_group
-            ),
-            _to_tvm_meta(selected, 16).mark_compact_shape_dynamic(
-                mode=0, stride_order=(0, 1), divisibility=query_group
-            ),
-            _to_tvm_meta(packed, 16).mark_compact_shape_dynamic(
-                mode=0, stride_order=(0, 1, 2)
+            # Row counts and both strides stay dynamic across workspace views.
+            make_fake_tensor(
+                cutlass.Int32,
+                (cute.sym_int64(divisibility=query_group), _SELECTED_WIDTH),
+                stride=(cute.sym_int64(), cute.sym_int64()),
+                assumed_align=4,
             ),
             _to_tvm_meta(shared, 4).mark_compact_shape_dynamic(
                 mode=0, stride_order=(0,)
@@ -265,12 +194,10 @@ def _prepare_query_groups(
             _prepare_query_groups_launch,
             *descriptors,
             kv_heads,
-            query_head_tile,
             query_group,
             enable_pdl,
-            pack_query,
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi --opt-level 3",
         )
         _COMPILED_PREPARE[key] = compiled
-    compiled(query, selected, packed, shared)
+    compiled(selected, shared)

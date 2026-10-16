@@ -308,23 +308,6 @@ def _to_tvm_meta(tensor: torch.Tensor, assumed_align: int) -> cute.Tensor:
 
 
 @dsl_user_op
-def copy_query_vector(source, destination, *, loc=None, ip=None):
-    _llvm.inline_asm(
-        None,
-        [
-            source.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
-            destination.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
-        ],
-        "{ .reg .b32 a,b,c,d; ld.global.v4.u32 {a,b,c,d}, [$0]; "
-        "st.global.v4.u32 [$1], {a,b,c,d}; }",
-        "l,l",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
 def prepare_cta_all(value, thread_count: cutlass.Constexpr[int], *, loc=None, ip=None):
     # The explicit launch-sized full team reaches each reduction; its uniform
     # first result controls whether that same team reaches the second one.
