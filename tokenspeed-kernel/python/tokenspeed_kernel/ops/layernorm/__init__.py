@@ -23,9 +23,6 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.layernorm._triton.gated_rmsnorm import (  # noqa: F401
-    triton_gated_rmsnorm,
-)
 from tokenspeed_kernel.ops.layernorm.triton import (
     add_rmsnorm,
 )
@@ -234,7 +231,7 @@ def gated_rmsnorm(
     fp8_scale: torch.Tensor | None,
     weights_independent: bool,
 ) -> torch.Tensor:
-    """Gated RMSNorm over groups of the last dimension, through kernel selection.
+    """Apply gated RMSNorm over groups of the last dimension through kernel selection.
 
     Args:
         x: GPU input shaped ``[..., width]``.
