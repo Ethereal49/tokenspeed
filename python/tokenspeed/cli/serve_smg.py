@@ -29,6 +29,12 @@ this engine dials in at ``tcp://{--data-parallel-address}:
 {--data-parallel-rpc-port}`` (default ``tcp://127.0.0.1:30500``). Headless
 mode implies ``--zmq-msgpack`` + ``--skip-tokenizer-init`` (see
 ``launch_scheduler_headless``).
+
+Model-family defaults (``_args_with_default_model_parsers``) pick the
+reasoning and tool-call parsers from the model. Muse Spark Open also gets the
+gateway's Symphony parser (``--parser symphony``) and the engine's xgrammar
+backend (``--grammar-backend xgrammar``), so forced tool calls and JSON answers
+work out of the box; an explicit flag always wins.
 """
 
 from __future__ import annotations
@@ -77,6 +83,8 @@ KIMI_K3_REASONING_PARSER = "kimi_k3"
 KIMI_K3_TOOL_CALL_PARSER = "kimi_k3"
 MUSE_SPARK_REASONING_PARSER = "muse"
 MUSE_SPARK_TOOL_CALL_PARSER = "muse"
+MUSE_SPARK_GATEWAY_PARSER = "symphony"
+MUSE_SPARK_GRAMMAR_BACKEND = "xgrammar"
 DEFAULT_SMG_LOG_LEVEL = "warn"
 GRPC_MAX_MESSAGE_BYTES_ENV = "TOKENSPEED_GRPC_MAX_MESSAGE_BYTES"
 DEFAULT_GRPC_MAX_MESSAGE_BYTES = "536870912"
@@ -465,6 +473,13 @@ def _args_with_default_model_parsers(
     Reasoning parser defaults must be visible to both processes: smg extracts
     reasoning_content after generation, while the engine uses the same parser
     name to defer json_schema grammars past the reasoning channel.
+
+    Muse Spark Open needs two more defaults. smg reads its ``muse`` parser
+    table only under the Symphony parser, so the gateway gets ``--parser
+    symphony``. Symphony constrains forced tool calls and JSON answers with
+    xgrammar structural tags, which the engine's default grammar backend
+    (``none``) rejects, so the engine gets ``--grammar-backend xgrammar``. As
+    with the parser names, an explicit operator flag wins.
     """
     model_id = _get_from_args(gateway_args, "--model") or _get_from_args(
         engine_args, "--model"
@@ -481,6 +496,10 @@ def _args_with_default_model_parsers(
             gateway_result.extend(["--reasoning-parser", MUSE_SPARK_REASONING_PARSER])
         if "--tool-call-parser" not in gateway_result:
             gateway_result.extend(["--tool-call-parser", MUSE_SPARK_TOOL_CALL_PARSER])
+        if "--parser" not in gateway_result:
+            gateway_result.extend(["--parser", MUSE_SPARK_GATEWAY_PARSER])
+        if "--grammar-backend" not in engine_result:
+            engine_result.extend(["--grammar-backend", MUSE_SPARK_GRAMMAR_BACKEND])
 
     elif _is_deepseek_v41_model(model_id):
         if (
