@@ -230,6 +230,14 @@ def _gemm_format_signature(
             b=tensor_format("mxfp8", B.dtype, scale=b_scale),
         )
     if quant == "fp8":
+        if A_scales is None and A.dtype != _fp8_dtype and B_scales is not None:
+            # Online per-token quantization (see mm): the kernel receives FP8
+            # activations with FP32 per-token scales, or quantizes them itself.
+            scale = ScaleFormat(storage_dtype=torch.float32, granularity="channel")
+            return format_signature(
+                a=tensor_format("scaled-fp8", _fp8_dtype, scale=scale),
+                b=tensor_format("scaled-fp8", B.dtype, scale=scale),
+            )
         scale = ScaleFormat(
             storage_dtype=_scale_storage_dtype(A_scales, B_scales),
             granularity=_infer_scale_type(A_scales, B_scales) or "unknown",
@@ -293,14 +301,19 @@ def _online_quantize_mxfp8(
     scale_encoding: str,
     *,
     enable_pdl: bool,
+    kernel_name: str | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    gfx1250_gluon = kernel_name in {
+        "gluon_mm_mxfp8_ue8m0_gfx1250",
+        "gluon_mm_mxfp8_ue8m0_largem_gfx1250",
+    }
     return quantize_fp8(
         A,
         granularity="token_group",
         group_size=block_size[1],
         scale_encoding=scale_encoding,
-        enable_pdl=enable_pdl,
-        solution="triton",
+        enable_pdl=False if gfx1250_gluon else enable_pdl,
+        solution=None if gfx1250_gluon else "triton",
     )
 
 
@@ -353,7 +366,9 @@ def mm(
     Args:
         A: Activation matrix ``[M, K]``.
         B: Weight matrix.
-        A_scales: Activation scales.
+        A_scales: Activation scales. With ``quant="fp8"``, None for BF16/FP16
+            ``A`` quantizes it per token here before the call (FP8 E4M3, one
+            FP32 scale per row, by ``quantize_fp8(granularity="token")``).
         B_scales: Weight scales (layout depends on quant type).
         bias: Optional bias vector of shape ``[N]`` added to the
             output.  When the selected kernel supports a fused bias
@@ -515,7 +530,17 @@ def mm(
             block_size,
             "ue8m0" if B_scales.dtype == torch.uint8 else "float32",
             enable_pdl=enable_pdl,
+            kernel_name=kernel.name,
         )
+
+    # Online per-token FP8 quantization of 16-bit activations.
+    if (
+        quant == "fp8"
+        and A_scales is None
+        and A.dtype != _fp8_dtype
+        and B_scales is not None
+    ):
+        A, A_scales = quantize_fp8(A, granularity="token", enable_pdl=enable_pdl)
 
     kernel_args = (A, B, A_scales, B_scales, out_dtype)
     kernel_kwargs: dict[str, object] = {
@@ -665,6 +690,7 @@ def bmm(
             block_size,
             "ue8m0" if B_scales.dtype == torch.uint8 else "float32",
             enable_pdl=enable_pdl,
+            kernel_name=kernel.name,
         )
 
     kernel_args = (A, B, A_scales, B_scales, out_dtype)
@@ -1287,6 +1313,7 @@ def grouped_bf16_projection(
             "n": weight.shape[1],
             "k": weight.shape[2],
             "a_inner_stride_one": x.stride(-1) == 1,
+            "b_contiguous": weight.is_contiguous(),
             "b_inner_stride_one": weight.stride(-1) == 1,
             "is_cuda": x.is_cuda,
         },
@@ -1325,15 +1352,19 @@ def dsv4_linear_fp32(
         raise ValueError("hidden_states and weight must be floating-point tensors")
 
     enable_pdl = pdl_enabled()
+    k = int(weight.shape[1])
     traits = {
+        "n": int(weight.shape[0]),
+        "k": k,
         "has_tokens": hidden_states.numel() > 0,
+        "hidden_inner_stride_one": hidden_states.stride(-1) == 1,
         "hidden_rank": hidden_states.ndim,
+        "weight_contiguous": weight.is_contiguous(),
     }
     signature = format_signature(
         hidden_states=dense_tensor_format(hidden_states.dtype),
         weight=dense_tensor_format(weight.dtype),
     )
-    k = int(weight.shape[1])
     try:
         kernel = select_kernel(
             "gemm",
@@ -3394,11 +3425,13 @@ def kimi3_router_projection(
 # isort: off
 import tokenspeed_kernel.numerics.reference.gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.cuda  # noqa: E402,F401
+import tokenspeed_kernel.ops.gemm.deepgemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.native  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: E402,F401
+import tokenspeed_kernel.ops.gemm.triton_fp8_channel  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: E402,F401
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm  # noqa: E402
 from tokenspeed_kernel.ops.gemm.cute_dsl import (  # noqa: E402
