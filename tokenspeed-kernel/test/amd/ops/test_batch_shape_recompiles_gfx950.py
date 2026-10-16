@@ -251,7 +251,7 @@ def test_iris_allreduce_sizes():
     buf = torch.empty(1 << 22, device=DEVICE, dtype=torch.bfloat16)
     flags = torch.zeros(1024, device=DEVICE, dtype=torch.int32)
     heaps = [1 << 40] * 8
-    arch = comm.iris_arch_config("gfx950")
+    arch = comm.pull_all_reduce_arch_config()
     common = dict(RANK=0, WORLD_SIZE=8, SUBGROUP_SIZE=arch.subgroup_size)
     common.update(WORDS_PER_LANE=2, ELEMENT_DTYPE=gl.bfloat16, ELEMENTS_PER_WORD=4)
     common.update(
@@ -379,9 +379,6 @@ def test_kda_fused_decode_batch_size():
             beta_logits=rows[:, 4 * width + head_dim :],
             A_log=torch.zeros(heads, device=DEVICE),
             dt_bias=torch.zeros(width, device=DEVICE),
-            output_gate=rows[:, 3 * width : 4 * width],
-            norm_weight=torch.ones(head_dim, device=DEVICE).bfloat16(),
-            norm_eps=1e-6,
             state_pool=state_pool,
             read_indices=torch.arange(batch, device=DEVICE, dtype=torch.int32),
             write_indices=torch.arange(

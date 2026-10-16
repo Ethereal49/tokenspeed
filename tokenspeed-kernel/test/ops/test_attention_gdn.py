@@ -25,6 +25,7 @@ from tokenspeed_kernel.ops.attention.gdn import (
     GDN_TREE_VERIFY_CHUNKED_MIN_NODES,
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
+    _qkv_rows_strided,
     gdn_chunk_prefill,
     gdn_decode_mtp,
     gdn_decode_step,
@@ -32,6 +33,29 @@ from tokenspeed_kernel.ops.attention.gdn import (
 )
 from tokenspeed_kernel.platform import current_platform
 from utils import assert_no_triton_compile
+
+
+@pytest.mark.parametrize("batch", [1, 4])
+def test_strided_qkv_trait_spares_packed_rows(batch: int):
+    """Sections of one dense q|k|v row (the dense decode path's split) keep
+    kernels without strided reads eligible; views into a wider projection
+    row do not, from batch 2 on."""
+    heads, value_heads, dim = 2, 4, 8
+    widths = [heads * dim, heads * dim, value_heads * dim]
+
+    def split(rows: torch.Tensor):
+        q, k, v = rows[:, : sum(widths)].split(widths, dim=-1)
+        return (
+            q.view(batch, 1, heads, dim),
+            k.view(batch, 1, heads, dim),
+            v.view(batch, 1, value_heads, dim),
+        )
+
+    packed = split(torch.empty(batch, sum(widths)))
+    projection = split(torch.empty(batch, sum(widths) + value_heads * dim))
+    assert not _qkv_rows_strided(*packed)
+    assert _qkv_rows_strided(*projection) == (batch > 1)
+    assert not _qkv_rows_strided(*(t.contiguous() for t in projection))
 
 
 def test_pack_gdn_projection_copies_the_row_strided_views(device: str):
@@ -581,7 +605,7 @@ def _make_decode_inputs(
     return q, k, v, a, b, A_log, dt_bias, pool
 
 
-@pytest.mark.parametrize("solution", ["triton", "flashinfer"])
+@pytest.mark.parametrize("solution", ["triton", "flashinfer", "gluon"])
 @pytest.mark.parametrize(
     ("state_dtype", "parameter_dtype", "parameter_requires_grad"),
     [
@@ -650,7 +674,7 @@ def test_gdn_decode_step_matches_torch_reference(
     torch.testing.assert_close(pool_copy[untouched], pool[untouched])
 
 
-@pytest.mark.parametrize("solution", ["triton", "flashinfer"])
+@pytest.mark.parametrize("solution", ["triton", "flashinfer", "gluon"])
 def test_gdn_decode_step_output_state_indices_remap(
     device: str, solution: str, require
 ):
@@ -702,7 +726,7 @@ def test_gdn_decode_step_output_state_indices_remap(
         )
 
 
-@pytest.mark.parametrize("solution", ["triton", "flashinfer"])
+@pytest.mark.parametrize("solution", ["triton", "flashinfer", "gluon"])
 def test_gdn_decode_step_padding_index_is_isolated(device: str, solution: str, require):
     # -1 (CUDA-graph padding) rows must not corrupt any other batch entry's
     # read or write, regardless of how each backend treats the padding row
@@ -764,7 +788,7 @@ def test_gdn_decode_step_padding_index_is_isolated(device: str, solution: str, r
     torch.testing.assert_close(pool_copy[untouched], pool[untouched])
 
 
-@pytest.mark.parametrize("solution", ["triton", "flashinfer"])
+@pytest.mark.parametrize("solution", ["triton", "flashinfer", "gluon"])
 @pytest.mark.parametrize(
     ("state_dtype", "parameter_dtype", "parameter_requires_grad"),
     [
@@ -840,7 +864,7 @@ def test_gdn_decode_mtp_intermediate_states_buffer_matches_reference(
         )
 
 
-@pytest.mark.parametrize("solution", ["triton", "flashinfer"])
+@pytest.mark.parametrize("solution", ["triton", "flashinfer", "gluon"])
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 def test_gdn_decode_mtp_output_state_indices_scatter_matches_reference(
     device: str,
@@ -997,11 +1021,69 @@ def test_gdn_decode_mtp_tree_parents_match_per_path_reference(
 
 
 @pytest.mark.parametrize(
+    ("solution", "tree"),
+    [("triton", False), ("triton", True), ("gluon", False)],
+)
+def test_gdn_decode_mtp_output_state_matches_in_place(
+    device: str, solution: str, tree: bool, require
+):
+    """Per-token rows written to a separate ``output_state`` pool equal the
+    in-place rows, and the read pool is left untouched (verify reads the
+    committed state in place and stages positions in a scratch)."""
+    require("attention", "gdn_decode_mtp", solution, torch.bfloat16, "q")
+
+    T = 4
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device,
+        dtype=torch.bfloat16,
+        T=T,
+        pool_size=32,
+        state_dtype=torch.float32,
+    )
+    read_idx = torch.tensor([1, -1, 5, 7], device=device, dtype=torch.int32)
+    output_idx = torch.arange(8, 8 + 4 * T, device=device, dtype=torch.int32).view(4, T)
+    ancestors = (
+        _tree_ancestors(
+            [[-1, 0, 0, 2], [-1, 0, 1, 2], [-1, -1, 1, 1], [-1, 0, 1, 2]], device
+        )
+        if tree
+        else None
+    )
+    common = dict(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        initial_state_indices=read_idx,
+        output_state_indices=output_idx,
+        tree_ancestors=ancestors,
+        disable_state_update=False,
+        use_qk_l2norm=True,
+        solution=solution,
+    )
+    in_place = pool.clone()
+    expected = gdn_decode_mtp(q, k, v, initial_state=in_place, **common)
+    read_pool = pool.clone()
+    scratch = torch.zeros_like(pool)
+    actual = gdn_decode_mtp(
+        q, k, v, initial_state=read_pool, output_state=scratch, **common
+    )
+
+    live = read_idx >= 0
+    torch.testing.assert_close(actual[live], expected[live], rtol=0, atol=0)
+    rows = output_idx.flatten().long()
+    torch.testing.assert_close(scratch[rows], in_place[rows], rtol=0, atol=0)
+    assert torch.equal(read_pool, pool)
+
+
+@pytest.mark.parametrize(
     ("solution", "state_dtype"),
     [
         ("triton", torch.bfloat16),
         ("triton", torch.float32),
         ("flashinfer", torch.float32),
+        ("gluon", torch.bfloat16),
+        ("gluon", torch.float32),
     ],
 )
 def test_gdn_decode_mtp_padding_indices_skip_state_writes(
@@ -1079,7 +1161,7 @@ def test_gdn_decode_mtp_padding_indices_skip_state_writes(
     torch.testing.assert_close(pool_copy[untouched], pool[untouched])
 
 
-@pytest.mark.parametrize("solution", ["triton", "flashinfer"])
+@pytest.mark.parametrize("solution", ["triton", "flashinfer", "gluon"])
 def test_gdn_decode_mtp_disable_state_update_false_writes_back(
     device: str, solution: str, require
 ):
@@ -1292,13 +1374,22 @@ def test_flashinfer_mtp_preserves_fp16_output_dtype(device: str, require) -> Non
     torch.testing.assert_close(actual, expected)
 
 
-@pytest.mark.parametrize("steps", [1, 3])
+@pytest.mark.parametrize("solution", ["triton", "gluon"])
+@pytest.mark.parametrize(
+    ("op", "steps"),
+    [("gdn_decode_step", 1), ("gdn_decode_mtp", 1), ("gdn_decode_mtp", 3)],
+)
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
-def test_triton_gdn_packed_decode_inputs(
-    device: str, steps: int, state_dtype: torch.dtype, require
+def test_gdn_packed_decode_inputs(
+    device: str,
+    solution: str,
+    op: str,
+    steps: int,
+    state_dtype: torch.dtype,
+    require,
 ):
     """Packed QKV and strided scalar gates must match the independent oracle."""
-    require("attention", "gdn_decode_mtp", "triton", torch.bfloat16, "q")
+    require("attention", op, solution, torch.bfloat16, "q")
     batch, heads, value_heads, dim = 4, 4, 12, 128
     q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
         device=device,
@@ -1328,7 +1419,7 @@ def test_triton_gdn_packed_decode_inputs(
     packed = torch.cat([x.flatten(2) for x in (q, k, v)], dim=-1)
     q, k, v = packed.split([heads * dim, heads * dim, value_heads * dim], dim=-1)
     gates = torch.stack((a, b), dim=-1)
-    actual = gdn_decode_mtp(
+    inputs = dict(
         q=q.view(batch, steps, heads, dim),
         k=k.view(batch, steps, heads, dim),
         v=v.view(batch, steps, value_heads, dim),
@@ -1340,13 +1431,19 @@ def test_triton_gdn_packed_decode_inputs(
         initial_state_indices=reads,
         scale=dim**-0.5,
         use_qk_l2norm=True,
-        disable_state_update=False,
-        intermediate_states_buffer=None,
         output_state_indices=None,
-        solution="triton",
+        solution=solution,
         override=None,
-        tree_ancestors=None,
     )
+    if op == "gdn_decode_step":
+        actual = gdn_decode_step(**inputs)
+    else:
+        actual = gdn_decode_mtp(
+            **inputs,
+            disable_state_update=False,
+            intermediate_states_buffer=None,
+            tree_ancestors=None,
+        )
     torch.testing.assert_close(
         actual.float(), expected.to(actual.dtype).float(), rtol=2e-2, atol=2e-2
     )
