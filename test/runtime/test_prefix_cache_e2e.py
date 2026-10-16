@@ -283,7 +283,8 @@ class TestTokenLevelPrefixHits:
     logits depend on the shape of the forward that computed them (a 1-row
     extend and a 276-row prefill round differently), so the reference must
     run the same forwards as the warm path. With ``chunked_prefill_size =
-    |X| - 1`` the reference ``X`` is prefilled as ``[0, |X|-1)`` then the
+    |X| - 1`` aligned to both cases' prefix grains, the reference ``X`` is
+    prefilled as ``[0, |X|-1)`` then the
     1-row chunk ``[|X|-1, |X|)``; the warm path is ``X[:-1]`` prefilled whole
     (the same ``[0, |X|-1)`` forward, run first so nothing it could hit is
     published yet) followed by a repeat of ``X`` that resumes at its
@@ -291,8 +292,8 @@ class TestTokenLevelPrefixHits:
     state and KV rows. The reference bypasses the cache so it computes the
     same forwards itself; the warm repeat must then reproduce its continuation
     token for token, for KV-only and recurrent-state models alike. ``X + Y``
-    hits the reference's prompt end exactly; ``X[:-37]`` ends inside the last
-    page before any publication point and finds no state below it; a next
+    hits the reference's prompt end exactly; ``X[:-37]`` may reuse only a
+    checkpoint below its shorter prefix, never a later state; a next
     turn hits the reference's finish, which settled after its last forward
     landed and covers every token the reference sampled but the one it ended
     on.
@@ -303,7 +304,6 @@ class TestTokenLevelPrefixHits:
     def test_hits_at_natural_boundaries_reproduce_the_cold_continuation(self, subtests):
         for case in _ACTIVE_MODELS:
             with subtests.test(model=case.model_path):
-                hybrid = case.has_state_groups
                 prefix = _prompt_ids(
                     case,
                     "Please summarize, in order, the forty-two rules of the "
@@ -317,8 +317,10 @@ class TestTokenLevelPrefixHits:
                     "decided so. Reply with the summary only, one rule per "
                     "line, without any preamble or closing remarks.",
                 )
-                # The cuts below must leave at least one hash-complete page
-                # under the largest prefix granularity a case may use.
+                # Align the first chunk to both cases' prefix grains (64/128)
+                # so the reusable State checkpoint leaves the same 1-row tail.
+                prefix = prefix[: ((len(prefix) - 1) // 128) * 128 + 1]
+                # The deeper cut must still leave a hash-complete page.
                 assert (len(prefix)) > (128 + 37)
                 engine = _make_engine(
                     case,
@@ -353,16 +355,12 @@ class TestTokenLevelPrefixHits:
                     )
                     assert (cached) == (len(prefix))
 
-                    # X[:-37] ends inside the last page, before any publication
-                    # point: a hybrid finds no state below it; a KV-only model
-                    # may resume at its hash-complete pages when every group
-                    # holds them (a sliding-window group only where its
-                    # lookback was published).
+                    # X[:-37] ends before the prompt-end checkpoints. It may
+                    # reuse an earlier page or State checkpoint, but never
+                    # the state of a longer prefix.
                     deeper = prefix[:-37]
                     warm, cached = _greedy_ids(engine, deeper, 1, bypass_cache=False)
                     assert (cached) < (len(deeper))
-                    if hybrid:
-                        assert (cached) == (0)
                     assert (len(warm)) == (1)
 
                     # X again: resumes at |X| - 1 from the state and KV rows
