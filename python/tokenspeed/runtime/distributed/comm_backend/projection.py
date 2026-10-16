@@ -41,8 +41,8 @@ if TYPE_CHECKING:
 
 # Minimum physical subgroup maximum for automatic fusion, independent of bucket.
 # Other TP sizes keep ordinary dispatch; direct kernel calls remain available.
-_FUSED_TP_SIZES = (2, 4)
-_FUSED_MIN_ROWS = 64
+_FUSED_COL_TP_SIZES = (2, 4)
+_FUSED_COL_MIN_ROWS = 64
 # Output projection is competitive in the upper part of the 128-row bucket.
 # Smaller counts retain the ordinary path to avoid padding overhead.
 _FUSED_ROW_TP_SIZES = (2, 4)
@@ -341,20 +341,20 @@ class ProjectionBackend:
             # CUDA IPC requires a node-local group. Agree on topology before
             # any rank attempts collective native allocation.
             from tokenspeed_kernel.ops.communication.cute_dsl import (
-                fused_tp_projection_supported,
+                fused_tp_column_projection_supported,
                 fused_tp_row_projection_supported,
             )
 
             supported = (
                 fused_tp_row_projection_supported
                 if spec.kind == "row"
-                else fused_tp_projection_supported
+                else fused_tp_column_projection_supported
             )
             fused_tp_sizes = (
-                _FUSED_ROW_TP_SIZES if spec.kind == "row" else _FUSED_TP_SIZES
+                _FUSED_ROW_TP_SIZES if spec.kind == "row" else _FUSED_COL_TP_SIZES
             )
             min_fused_rows = (
-                _FUSED_ROW_MIN_ROWS if spec.kind == "row" else _FUSED_MIN_ROWS
+                _FUSED_ROW_MIN_ROWS if spec.kind == "row" else _FUSED_COL_MIN_ROWS
             )
             if batch_invariant:
                 fused_disabled_reason = "batch-invariant collectives are enabled"
@@ -398,7 +398,7 @@ class ProjectionBackend:
                 self._prepare_lamport(workspace, use_lamport_reduction)
                 if all(value[2] for value in hosts):
                     from tokenspeed_kernel.ops.communication.cute_dsl import (
-                        create_fused_tp_projection_state,
+                        create_fused_tp_column_projection_state,
                     )
 
                     if spec.kind == "row":
@@ -414,12 +414,14 @@ class ProjectionBackend:
                             spec.output_size,
                         )
                     else:
-                        workspace.fused_column = create_fused_tp_projection_state(
-                            pg_manager.get_device_process_group(spec.group),
-                            spec.device,
-                            spec.max_tokens,
-                            spec.input_size,
-                            spec.output_size,
+                        workspace.fused_column = (
+                            create_fused_tp_column_projection_state(
+                                pg_manager.get_device_process_group(spec.group),
+                                spec.device,
+                                spec.max_tokens,
+                                spec.input_size,
+                                spec.output_size,
+                            )
                         )
                 elif fused_disabled_reason is None:
                     fused_disabled_reason = "one or more peers cannot prepare fusion"
@@ -452,11 +454,11 @@ class ProjectionBackend:
         # Use the subgroup maximum so unequal or empty owners take the same
         # collective path. TP2 and TP4 share one cutoff across all row buckets.
         rows = max(owner_rows)
-        if len(owner_rows) not in _FUSED_TP_SIZES:
+        if len(owner_rows) not in _FUSED_COL_TP_SIZES:
             return False
         if (
             workspace.fused_column is None
-            or rows < _FUSED_MIN_ROWS
+            or rows < _FUSED_COL_MIN_ROWS
             or weight_scales is None
             or weight.dtype != torch.float8_e4m3fn
             or weight_scales.dtype != torch.float32

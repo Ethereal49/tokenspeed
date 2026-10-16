@@ -46,14 +46,14 @@ cute_dsl_fused_fp8_dp_column_linear = error_fn
 cute_dsl_fused_fp8_dp_row_linear = error_fn
 
 
-def create_fused_tp_projection_state(
+def create_fused_tp_column_projection_state(
     group: dist.ProcessGroup,
     device: torch.device,
     max_rows: int,
     input_size: int,
     output_size: int,
 ) -> "FusedTPProjectionState":
-    """Collectively allocate and compile a workspace before graph capture.
+    """Allocate and compile column-projection state before graph capture.
 
     Args:
         group: Two, four, or eight node-local peers, in output-shard order.
@@ -102,7 +102,7 @@ def create_fused_tp_row_projection_state(
     )
 
 
-def fused_tp_projection_supported(
+def fused_tp_column_projection_supported(
     group_size: int,
     input_size: int,
     output_size: int,
@@ -110,7 +110,7 @@ def fused_tp_projection_supported(
     dtype: torch.dtype,
     device: torch.device,
 ) -> bool:
-    """Return whether the static layout and device match the kernel constraints.
+    """Return whether the layout and device support fused column projection.
 
     Args:
         group_size: Number of ranks in a node-local projection group.

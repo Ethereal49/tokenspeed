@@ -40,7 +40,7 @@ register_cuda_ci(est_time=120, suite="runtime-2gpu")
 @torch.no_grad()
 def _worker(rank, world_size, rendezvous):
     from tokenspeed_kernel.ops.communication.cute_dsl import (
-        create_fused_tp_projection_state,
+        create_fused_tp_column_projection_state,
         cute_dsl_fused_fp8_dp_column_linear,
     )
     from tokenspeed_kernel.ops.quantization import quantize_fp8
@@ -117,7 +117,7 @@ def _worker(rank, world_size, rendezvous):
     state = workspace.fused_column
     if world_size == 8:
         # TP8 is available only through an explicitly prepared native state.
-        state = create_fused_tp_projection_state(
+        state = create_fused_tp_column_projection_state(
             dist.group.WORLD, device, 4097, 7168, candidate[0].output_size
         )
     else:
