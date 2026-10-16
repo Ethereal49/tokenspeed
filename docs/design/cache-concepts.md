@@ -1014,6 +1014,8 @@ Its responsibilities:
   admission is then a plain Host hit: no forward is ever skipped or retracted
   for L3, and no admission load-back can miss. For hybrid models, prefetch
   also carries available State checkpoints within the matched KV coverage.
+  Each checkpoint carries its required sliding-window blocks as well, so an
+  earlier checkpoint remains usable when the KV coverage extends farther.
   Missing intermediate checkpoints do not truncate the KV prefix; admission
   probes the landed Host entries again and resumes only at a boundary with
   every required State group, including after a partial landing.

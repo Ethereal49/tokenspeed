@@ -212,10 +212,14 @@ def test_l3_register_storage_keys_emits_a_prefetch_before_admission() -> None:
     assert scheduler.host_pool_pinned_blocks() == 0
 
 
-def test_l3_hybrid_prefetch_restores_state_before_admission() -> None:
+@pytest.mark.parametrize("with_swa,checkpoint_page", [(False, 3), (True, 1)])
+def test_l3_hybrid_prefetch_restores_state_before_admission(
+    with_swa: bool, checkpoint_page: int
+) -> None:
     cfg = _l3_config(
-        num_device_pages=32, num_host_pages=32, with_swa=False, min_prefetch_pages=1
+        num_device_pages=32, num_host_pages=32, with_swa=with_swa, min_prefetch_pages=1
     )
+    state_group = len(cfg.cache_groups)
     cfg.cache_groups = list(cfg.cache_groups) + [
         ts.CacheGroupConfig(
             group_id="state",
@@ -231,19 +235,19 @@ def test_l3_hybrid_prefetch_restores_state_before_admission() -> None:
     keys = [
         (group, content_hash, offset)
         for group, content_hash, offset in zip(groups, expanded, offsets)
-        if group == 0 or content_hash == hashes[-1]
+        if group != state_group or content_hash == hashes[checkpoint_page]
     ]
     scheduler.register_storage_keys(*map(list, zip(*keys)))
     scheduler.submit_requests([_spec("hybrid", tokens)])
     prefetch = _find_op(scheduler.next_execution_plan(), ts.Cache.PrefetchOp)
     assert prefetch is not None
-    assert set(prefetch.group_ids[0]) == {0, 1}, "KV and State must both reach Host"
+    assert set(prefetch.group_ids[0]) == set(range(state_group + 1))
     _ack_prefetch(scheduler, prefetch.op_ids[0], len(hashes))
     admit = scheduler.next_execution_plan()
-    assert list(admit.forward[0].extend_prefix_lens) == [8]
+    assert list(admit.forward[0].extend_prefix_lens) == [2 * (checkpoint_page + 1)]
     load = _find_op(admit, ts.Cache.LoadBackOp)
     assert load is not None
-    assert set(load.group_ids[0]) == {0, 1}
+    assert set(load.group_ids[0]) == set(range(state_group + 1))
     _ack_load_back(scheduler, load.op_ids[0])
     assert scheduler.host_pool_pinned_blocks() == 0
 

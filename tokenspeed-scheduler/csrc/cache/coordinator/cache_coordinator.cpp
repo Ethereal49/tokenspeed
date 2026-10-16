@@ -400,6 +400,23 @@ CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTierWithKeys(
             for (std::size_t page = first_page; page < end_page; ++page) {
                 const CacheKey& key = group_keys[i][page];
                 hits[page - first_page] = groups_[i].Index().Contains(pool, key) || storage_keys_.contains(key);
+                if (hits[page - first_page] == 0) {
+                    continue;
+                }
+                // An older checkpoint needs its own window, even when KV extends beyond it.
+                for (const std::size_t j : spanned_order) {
+                    if (groups_[j].Matcher().IsPrefixClosed()) {
+                        continue;
+                    }
+                    const std::int32_t floor_blocks = floor_tokens / geometry_[j].BlockGranularity();
+                    const BlockRange window = SlidingWindowBlocks(
+                        static_cast<std::int32_t>(j), static_cast<std::int32_t>(page + 1) * prefix_granularity_);
+                    for (std::int32_t block = std::max(window.first, floor_blocks); block < window.past_end; ++block) {
+                        const CacheKey& window_key = group_keys[j][static_cast<std::size_t>(block)];
+                        out.per_group[j].hits[static_cast<std::size_t>(block - floor_blocks)] =
+                            PrefixKeyIsHit(groups_[j].Index(), pool, window_key, &storage_keys_);
+                    }
+                }
             }
         }
     }
