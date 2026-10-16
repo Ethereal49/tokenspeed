@@ -70,11 +70,16 @@ def _decode_launch_metadata(grid, kernel, args):
     """
     m, n, k = args["M"], args["N"], args["K"]
     experts = min(m, args["N_EXPTS_TOT"])
-    w_row_bytes = k // 2 if args["W"].dtype == torch.uint8 else k
-    w_bytes = n * w_row_bytes + (
-        n * k // args["SCALE_BLOCK"] if args["WMxScale"] is not None else 0
-    )
-    x_bytes = m * k * args["X"].element_size()
+
+    def row_bytes(values, scales):
+        # uint8 operands pack two e2m1 values per byte; E8M0 scales add one
+        # byte per SCALE_BLOCK values.
+        packed = values.dtype == torch.uint8
+        data = k // 2 if packed else k * values.element_size()
+        return data + (k // args["SCALE_BLOCK"] if scales is not None else 0)
+
+    w_bytes = n * row_bytes(args["W"], args["WMxScale"])
+    x_bytes = m * row_bytes(args["X"], args["XMxScale"])
     y_bytes = m * (n // args["ACTIVATION_REDUCTION_N"]) * args["Y"].element_size()
     return {
         "name": f"{kernel.name} [M={m}, N={n}, K={k}]",
