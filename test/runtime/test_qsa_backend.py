@@ -79,6 +79,36 @@ def test_qsa_sparse_attends_the_prewritten_cache(monkeypatch, forward_name):
     sparse.assert_called_once_with(q, layer, pool, topk, ctx)
 
 
+@pytest.mark.parametrize("scaled", [False, True])
+def test_qsa_sparse_reads_an_fp8_cache_at_the_layer_scales(monkeypatch, scaled):
+    from tokenspeed_kernel.ops.attention.prologue import FP8TensorScales
+
+    import tokenspeed.runtime.layers.attention.backends.paged.qsa as qsa
+
+    backend = object.__new__(QSAAttnBackend)
+    backend.is_mxfp8 = False
+    backend._metadata_capacity_rows = 4
+    kernel = Mock(return_value=torch.zeros(2, 4))
+    monkeypatch.setattr(qsa, "qsa_sparse_attention", kernel)
+    monkeypatch.setattr(qsa, "current_valid_rows", lambda: None)
+    monkeypatch.setattr(qsa, "decode_query_lengths", lambda *args, **kwargs: 1)
+    rows = torch.zeros(8, 1, 4, dtype=torch.float8_e4m3fn)
+    pool = SimpleNamespace(get_kv_buffer=lambda layer_id: (rows, rows))
+    layer = SimpleNamespace(
+        layer_id=0,
+        tp_q_head_num=1,
+        head_dim=4,
+        scaling=0.5,
+        fp8_kv_scales=FP8TensorScales(0.25, 0.125) if scaled else None,
+    )
+    ctx = SimpleNamespace(draft_narrowing=None)
+    backend._sparse_attention(torch.zeros(2, 4), layer, pool, torch.zeros(2, 1), ctx)
+    kwargs = kernel.call_args.kwargs
+    assert (kwargs["k_scale"], kwargs["v_scale"]) == (
+        (0.25, 0.125) if scaled else (1.0, 1.0)
+    )
+
+
 @pytest.mark.parametrize("forward_name", ["forward_decode", "forward_extend"])
 def test_qsa_dense_falls_through_to_mha(monkeypatch, forward_name):
     backend = object.__new__(QSAAttnBackend)

@@ -250,9 +250,12 @@ An FP8 cache of a scaled layer holds `K / k_scale` and `V / v_scale` saturated
 to e4m3's range: the layer passes `FP8TensorScales` as the write target's
 `scales`, and the prologue solutions that declare the `kv_scaled` trait write
 them. Attention reads them through kernels that declare `kv_scaled`: trtllm-gen
-folds `k_scale` into the logit scale and `v_scale` into the output's. A cache of
-another dtype ignores the scales on both sides. Per-head scales, MLA caches and
-draft-tree attention over a scaled cache are refused.
+folds `k_scale` into the logit scale and `v_scale` into the output's, and QSA's
+sparse kernel scales its logits and output the same way. The cache-group router
+refuses a scaled layer to a leaf that does not read the scales
+(`reads_fp8_kv_scales`). A cache of another dtype ignores the scales on both
+sides. Per-head scales, MLA caches and draft-tree attention over a scaled cache
+are refused.
 
 An MLA layer reads its query in the activation dtype, except that an FP8
 latent cache gets an FP8 query, and FP8 expanded keys and values, whichever MLA

@@ -101,6 +101,8 @@ class TRTLLMMHAMetadata:
 class TRTLLMMHAAttnBackend(PagedAttentionBackend):
     """The ``trtllm`` MHA leaf: TRT-LLM fused kernels for SM100 (Blackwell)."""
 
+    reads_fp8_kv_scales = True
+
     default_kernel_page_size = TRTLLM_MHA_PAGE_SIZE
     # Both kernel call sites forward layer.sliding_window_size.
     supports_layer_sliding_window: bool = True

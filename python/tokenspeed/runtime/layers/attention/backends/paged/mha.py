@@ -106,6 +106,8 @@ class MHADecodeMetadata:
 class MHAAttnBackend(PagedAttentionBackend):
     """Standard MHA leaf routed through tokenspeed_kernel attention APIs."""
 
+    reads_fp8_kv_scales = True
+
     # Every kernel call site forwards layer.sliding_window_size.
     supports_layer_sliding_window: bool = True
 

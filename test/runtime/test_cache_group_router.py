@@ -509,7 +509,7 @@ def _geometry():
 
 
 def _layer(group_id, layer_id=0):
-    return SimpleNamespace(group_id=group_id, layer_id=layer_id)
+    return SimpleNamespace(group_id=group_id, layer_id=layer_id, fp8_kv_scales=None)
 
 
 class TestCacheGroupRouterTest:
@@ -536,6 +536,20 @@ class TestCacheGroupRouterTest:
             SWA: base,
             "linear_attention_0": torch.ones((bs, 2), dtype=torch.int32),
         }
+
+    def test_a_scaled_layer_needs_a_leaf_that_reads_its_kv_scales(self):
+        from tokenspeed_kernel.ops.attention.prologue import FP8TensorScales
+
+        router, leaves = self._router()
+        scaled = SimpleNamespace(
+            group_id=FULL, layer_id=3, fp8_kv_scales=FP8TensorScales(0.5, 0.25)
+        )
+        with pytest.raises(NotImplementedError, match="layer 3"):
+            router._attention_leaf(scaled)
+        leaves[FULL].reads_fp8_kv_scales = True
+        assert router._attention_leaf(scaled) is leaves[FULL]
+        unscaled = SimpleNamespace(group_id=SWA, layer_id=4, fp8_kv_scales=None)
+        assert router._attention_leaf(unscaled) is leaves[SWA]
 
     def test_window_support_is_forwarded_from_the_leaves(self):
         router, leaves = self._router()

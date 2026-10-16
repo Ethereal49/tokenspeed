@@ -87,6 +87,10 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
 
     # Static CUDA-graph capability of this leaf class (see support.py).
     cuda_graph_support: CudaGraphSupport = CudaGraphSupport()
+    # Whether the leaf reads an FP8 cache at a layer's per-tensor scales
+    # (``PagedAttention.fp8_kv_scales``); the router refuses a scaled layer
+    # to a leaf that does not.
+    reads_fp8_kv_scales: bool = False
     # Whether a block draft (DFLASH/DSpark) runs its whole non-causal block
     # in one decode forward (see block_decode_active / block_decode_expansion);
     # set from config by leaves that support it.

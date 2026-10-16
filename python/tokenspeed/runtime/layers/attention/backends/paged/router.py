@@ -340,6 +340,16 @@ class CacheGroupRouter(AttentionBackend):
                 f"{layer.group_id!r}; this router serves {self.group_ids}"
             ) from None
 
+    def _attention_leaf(self, layer: PagedAttention) -> PagedAttentionBackend:
+        """The leaf that attends ``layer``; it must read the layer's KV scales."""
+        leaf = self._leaf_for(layer)
+        if layer.fp8_kv_scales is not None and not leaf.reads_fp8_kv_scales:
+            raise NotImplementedError(
+                f"layer {layer.layer_id} carries per-tensor KV-cache scales, "
+                f"which {type(leaf).__name__} does not read"
+            )
+        return leaf
+
     def _sole_leaf(self, what: str) -> PagedAttentionBackend:
         if len(self.leaves) != 1:
             raise RuntimeError(
@@ -977,7 +987,7 @@ class CacheGroupRouter(AttentionBackend):
     ):
         # No ambient-ctx override: a MIXED round's halves pass sub-context modes this must honor.
         assert not save_kv_cache, _PREWRITTEN
-        leaf = self._leaf_for(layer)
+        leaf = self._attention_leaf(layer)
         if self._offload_adapter is not None and "topk_indices" in kwargs:
             kwargs["topk_indices"] = self._offload_adapter.read_indices(
                 layer, kwargs["topk_indices"]
@@ -1024,7 +1034,7 @@ class CacheGroupRouter(AttentionBackend):
         assert not save_kv_cache, _PREWRITTEN
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
-        leaf = self._leaf_for(layer)
+        leaf = self._attention_leaf(layer)
         if self._offload_adapter is not None and "topk_indices" in kwargs:
             kwargs["topk_indices"] = self._offload_adapter.read_indices(
                 layer, kwargs["topk_indices"]
@@ -1057,7 +1067,7 @@ class CacheGroupRouter(AttentionBackend):
         assert not save_kv_cache, _PREWRITTEN
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
-        leaf = self._leaf_for(layer)
+        leaf = self._attention_leaf(layer)
         out_cache_loc = self.forward_write_locations(layer, ForwardMode.EXTEND)
         return leaf.forward_extend(
             q,
