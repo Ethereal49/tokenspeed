@@ -84,9 +84,10 @@ SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX = float(1 << 20)
 # Spec-decode overshoot spans the physical KV extent must absorb past the
 # logical context_len. The overlap scheduler steps a finished request at most
 # ONE extra iteration (the depth-1 event loop commits the previous step every
-# round, so the Finish event reaches the C++ scheduler before the next plan),
-# and termination is checked CPU-side against max_new_tokens, so verify can
-# commit past context_len for exactly that window:
+# round, so the Finish event reaches the C++ scheduler before the next plan).
+# The device cuts a round at max_new_tokens and stops the request, but a
+# finish only the control plane decides (a stop string) leaves the rounds
+# uncut, so verify can still commit past context_len for exactly that window:
 #   1. the finishing step's own accept (up to spec_num_tokens past the limit),
 #   2. the single lingering step's accept,
 #   3. the lingering step laying out its next draft block after that accept.
@@ -850,7 +851,9 @@ class ServerArgs:
 
     def resolve_kernel_backends(self):
         _require_choice(
-            "--dense-gemm-backend", self.dense_gemm_backend, ("auto", "trtllm_cutedsl")
+            "--dense-gemm-backend",
+            self.dense_gemm_backend,
+            ("auto", "trtllm_cutedsl", "deepgemm"),
         )
         # The numerics switches (docs/design/numerics.md) are closed sets.
         for flag, value, choices in (
@@ -2874,10 +2877,11 @@ class ServerArgs:
             "--dense-gemm-backend",
             type=str,
             default=ServerArgs.dense_gemm_backend,
-            choices=["auto", "trtllm_cutedsl"],
+            choices=["auto", "trtllm_cutedsl", "deepgemm"],
             help="Backend for standard 128x128 block-FP8 dense linears. "
             "trtllm_cutedsl requires Blackwell and preserves checkpoint FP8 "
             "weights and FP32 scales without requantization. "
+            "deepgemm requires Hopper and preserves FP32 scales. "
             "Other quantization formats and routed experts are unchanged.",
         )
         parser.add_argument(
