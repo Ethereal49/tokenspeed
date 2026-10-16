@@ -831,6 +831,7 @@ class NemotronHModel(nn.Module):
 
 class NemotronHForCausalLM(BaseCausalLM):
     model_cls = NemotronHModel
+    loads_kv_cache_scales = True
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         params = dict(self.named_parameters())
@@ -844,7 +845,8 @@ class NemotronHForCausalLM(BaseCausalLM):
                     name = new + name[len(old) :]
                     break
             if name.endswith((".k_scale", ".v_scale")):
-                # The loader already required unit KV scales; the cache uses no scale.
+                block = self.model.layers[int(name.split(".")[2])]
+                block.mixer.attn.load_kv_cache_scale(name, loaded)
                 continue
             if ".mixer.in_proj." in name:
                 block = self.model.layers[int(name.split(".")[2])]
