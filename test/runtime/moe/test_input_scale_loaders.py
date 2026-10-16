@@ -31,16 +31,16 @@ def test_scalar_per_expert_scales_accumulate_the_global_max() -> None:
     param = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
     for scale in (0.5, 0.9, 0.7, 0.8):
         load_per_expert_input_scale(param, torch.tensor(scale), "w2", None)
-    assert param.data.tolist() == [0.9, 0.9, 0.9, 0.9]
+    assert torch.equal(param.data, torch.tensor([0.9, 0.9, 0.9, 0.9]))
 
 
 def test_fused_per_expert_scales_copy_per_expert() -> None:
     param = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
     load_per_expert_input_scale(param, torch.tensor([0.1, 0.4, 0.2, 0.3]), "w2", None)
-    assert param.data.tolist() == [0.1, 0.4, 0.2, 0.3]
+    assert torch.equal(param.data, torch.tensor([0.1, 0.4, 0.2, 0.3]))
 
 
 def test_local_expert_scale_writes_only_that_expert() -> None:
     param = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
     load_per_expert_input_scale(param, torch.tensor(0.6), "w2", 2)
-    assert param.data.tolist() == [0.0, 0.0, 0.6, 0.0]
+    assert torch.equal(param.data, torch.tensor([0.0, 0.0, 0.6, 0.0]))
