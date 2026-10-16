@@ -43,10 +43,11 @@ if TYPE_CHECKING:
 # Other TP sizes keep ordinary dispatch; direct kernel calls remain available.
 _FUSED_TP_SIZES = (2, 4)
 _FUSED_MIN_ROWS = 64
-# Output projection wins at 128 rows on TP2/TP4. At 64 rows it is only
-# comparable to the ordinary path, which remains the automatic choice.
+# Output projection is competitive in the upper part of the 128-row bucket.
+# Smaller counts retain the ordinary path to avoid padding overhead.
 _FUSED_ROW_TP_SIZES = (2, 4)
-_FUSED_ROW_ROWS = 128
+_FUSED_ROW_MIN_ROWS = 96
+_FUSED_ROW_MAX_ROWS = 128
 
 logger = logging.getLogger(__name__)
 
@@ -352,7 +353,9 @@ class ProjectionBackend:
             fused_tp_sizes = (
                 _FUSED_ROW_TP_SIZES if spec.kind == "row" else _FUSED_TP_SIZES
             )
-            min_fused_rows = _FUSED_ROW_ROWS if spec.kind == "row" else _FUSED_MIN_ROWS
+            min_fused_rows = (
+                _FUSED_ROW_MIN_ROWS if spec.kind == "row" else _FUSED_MIN_ROWS
+            )
             if batch_invariant:
                 fused_disabled_reason = "batch-invariant collectives are enabled"
             elif len(spec.group) not in fused_tp_sizes:
@@ -406,7 +409,7 @@ class ProjectionBackend:
                         workspace.fused_row = create_fused_tp_row_projection_state(
                             pg_manager.get_device_process_group(spec.group),
                             spec.device,
-                            min(spec.max_tokens, 128),
+                            min(spec.max_tokens, _FUSED_ROW_MAX_ROWS),
                             spec.input_size,
                             spec.output_size,
                         )
@@ -493,7 +496,7 @@ class ProjectionBackend:
             return False
         if (
             workspace.fused_row is None
-            or rows != _FUSED_ROW_ROWS
+            or not _FUSED_ROW_MIN_ROWS <= rows <= _FUSED_ROW_MAX_ROWS
             or weight_scales is None
             or weight.dtype != torch.float8_e4m3fn
             or weight_scales.dtype != torch.float32

@@ -210,8 +210,10 @@ class FusedTPProjectionState:
                 (rows, input_size), dtype=torch.bfloat16, device=device
             )
             out = torch.empty((rows, output_size), dtype=torch.bfloat16, device=device)
+            # At 32 rows per rank, TP4 needs more GEMM tiles to occupy the GPU.
+            tile_m = 64 if row_parallel and self.world_size == 4 and rows == 32 else 128
             kernel = FusedTPProjectionKernel(
-                cutlass.Float32, False, (128, 128), (1, 1), row_parallel=row_parallel
+                cutlass.Float32, False, (tile_m, 128), (1, 1), row_parallel=row_parallel
             )
             args = self._arguments(inputs, weight, scales, rows, out)
             self.compiled[rows] = cute.compile(

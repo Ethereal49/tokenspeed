@@ -45,6 +45,8 @@ count does not divide the grid acquire all input owners. Quantization
 uses 64-bit BF16 loads and hardware warp-max reduction. Scale storage is
 released after register loads; the final partial-accumulator slot is released
 after its TMEM read completes and before the remaining FP32 arithmetic.
+TP4 row projection uses 64-row MMA tiles in the 32-row bucket to double the
+number of GEMM tiles. Other cases retain 128-row MMA tiles.
 The accumulator loop uses four statically unrolled 32-column TMEM transfers;
 the epilogue retains 64-column transfers and releases TMEM after its last read.
 Two scale stages and two output stages preserve all six A/B stages within
@@ -76,8 +78,8 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 class FusedTPProjectionKernel:
     """Fuse owner quantization, column-sharded block-FP8 GEMM and output exchange.
 
-    Use 128x128 tiles, one-CTA clusters and a fully resident grid on node-local
-    GB300 peers. Persistent scheduling and warp specialization overlap TMA,
+    Use 64x128 or 128x128 tiles and one-CTA clusters on node-local GB300 peers.
+    A fully resident grid and warp specialization overlap TMA,
     tensor-core MMA, FP32 block scaling, and the output epilogue.
     """
 
@@ -113,9 +115,14 @@ class FusedTPProjectionKernel:
         :type cluster_shape_mn: Tuple[int, int]
         """
 
-        if mma_tiler_mn != (128, 128) or cluster_shape_mn != (1, 1) or use_2cta_instrs:
+        supported_tiles = ((64, 128), (128, 128)) if row_parallel else ((128, 128),)
+        if (
+            mma_tiler_mn not in supported_tiles
+            or cluster_shape_mn != (1, 1)
+            or use_2cta_instrs
+        ):
             raise ValueError(
-                "Fused TP projection requires 128x128 tiles and one-CTA clusters"
+                "Fused TP projection requires a supported 128-column tile and one-CTA clusters"
             )
         self.row_parallel = row_parallel
         self.local_flag_scope = "gpu" if row_parallel else "sys"
@@ -254,7 +261,7 @@ class FusedTPProjectionKernel:
             self.c_dtype,
         )
 
-        self.epi_tile = (128, 64)
+        self.epi_tile = (self.mma_tiler[0], 64)
 
         # Setup A/B/C/Scale stage count in shared memory and ACC stage count in tensor memory
         (
@@ -457,9 +464,9 @@ class FusedTPProjectionKernel:
 
         remote_atoms = ()
         remote_tensors = ()
-        # Keep the efficient 128-row TMEM transfer, then split shared memory
+        # Keep the whole MMA tile for the TMEM transfer, then split shared memory
         # at owner boundaries for remote stores.
-        remote_epi_tile = (min(peers[1].shape[0], 128), self.epi_tile[1])
+        remote_epi_tile = (min(peers[1].shape[0], self.mma_tiler[0]), self.epi_tile[1])
         remote_smem_layout = cute.composition(epi_smem_layout, remote_epi_tile)
         for peer in cutlass.range_constexpr(len(peer_ready)):
             remote = peers[peer + 2]
@@ -1521,7 +1528,7 @@ class FusedTPProjectionKernel:
                 tCgC,
                 sSFA_view_as_C,
                 sSFB_view_as_C,
-                (128, 32),
+                (self.mma_tiler[0], 32),
             )
 
             #
@@ -1772,7 +1779,7 @@ class FusedTPProjectionKernel:
             )
 
             remote_partitions = ()
-            remote_epi_tile = (min(peers[1].shape[0], 128), epi_tile[1])
+            remote_epi_tile = (min(peers[1].shape[0], self.mma_tiler[0]), epi_tile[1])
             for peer in cutlass.range_constexpr(len(remote_atoms)):
                 remote_global = cute.local_tile(
                     remote_tensors[peer],
@@ -1909,10 +1916,11 @@ class FusedTPProjectionKernel:
                     #
                     if warp_idx == self.epilog_warp_id[0]:
                         owner_rows = peers[1].shape[0]
-                        owners_per_tile = max(1, 128 // owner_rows)
+                        owners_per_tile = max(1, self.mma_tiler[0] // owner_rows)
                         for owner_slice in cutlass.range_constexpr(owners_per_tile):
                             owner = (
-                                mma_tile_coord_mnl[0] * 128 // owner_rows + owner_slice
+                                mma_tile_coord_mnl[0] * self.mma_tiler[0] // owner_rows
+                                + owner_slice
                             )
                             for peer in cutlass.range_constexpr(len(remote_atoms)):
                                 if owner == (rank + peer) % len(remote_atoms):
@@ -1922,7 +1930,7 @@ class FusedTPProjectionKernel:
                                             0,
                                             subtile_idx,
                                             mma_tile_coord_mnl[0]
-                                            % max(1, owner_rows // 128),
+                                            % max(1, owner_rows // self.mma_tiler[0]),
                                             mma_tile_coord_mnl[1],
                                             mma_tile_coord_mnl[2],
                                         )
@@ -2396,12 +2404,14 @@ class FusedTPProjectionKernel:
         width = output.shape[1]
         valid_rows = output.shape[0]
         world = len(peer_ready)
-        m_tiles = cute.ceil_div(world * rows, 128)
+        m_tiles = cute.ceil_div(world * rows, self.mma_tiler[0])
         for column_tile in cutlass.range(block, width // 128, blocks):
-            for row_tile in cutlass.range_constexpr(max(1, rows // 128)):
-                if row_tile * 128 < valid_rows:
+            for row_tile in cutlass.range_constexpr(max(1, rows // self.mma_tiler[0])):
+                if row_tile * self.mma_tiler[0] < valid_rows:
                     producer_block = (
-                        rank * rows // 128 + row_tile + m_tiles * column_tile
+                        rank * rows // self.mma_tiler[0]
+                        + row_tile
+                        + m_tiles * column_tile
                     ) % blocks
                     # Poll all contributors in one warp instruction, rather
                     # than serializing one NVLink round trip per producer.
@@ -2504,7 +2514,7 @@ class FusedTPProjectionKernel:
         tmem_store_atom = None
         if cutlass.const_expr(self.mma_tiler[0] == 64):
             tmem_load_atom = cute.make_copy_atom(
-                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)),
+                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(4)),
                 self.acc_dtype,
             )
         else:
@@ -2514,7 +2524,7 @@ class FusedTPProjectionKernel:
             )
         if cutlass.const_expr(self.mma_tiler[0] == 64):
             tmem_store_atom = cute.make_copy_atom(
-                tcgen05.copy.St16x256bOp(tcgen05.copy.Repetition(8)),
+                tcgen05.copy.St16x256bOp(tcgen05.copy.Repetition(4)),
                 self.acc_dtype,
             )
         else:
@@ -2827,6 +2837,9 @@ class FusedTPProjectionKernel:
             - (mbar_helpers_bytes + c_bytes + scale_bytes)
         ) // ab_bytes_per_stage
 
+        if mma_tiler_mnk[0] == 64:
+            # Keep six operand stages for the 32-row TP4 bucket.
+            num_ab_stage = min(num_ab_stage, 6)
         # Refine epilogue stages:
         # Calculate remaining smem after allocating for A/B stages and reserved bytes
         # Add remaining unused smem to epilogue
@@ -2835,6 +2848,9 @@ class FusedTPProjectionKernel:
             - occupancy * ab_bytes_per_stage * num_ab_stage
             - occupancy * (mbar_helpers_bytes + c_bytes + scale_bytes)
         ) // (occupancy * c_bytes_per_stage)
+        if mma_tiler_mnk[0] == 64:
+            # Two 64-column stores cover the tile.
+            num_c_stage = 2
         return num_acc_stage, num_ab_stage, num_c_stage, num_scale_stage, num_tile_stage
 
     @staticmethod

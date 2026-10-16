@@ -131,9 +131,14 @@ def _worker(rank, world_size, rendezvous):
             collective_global_num_tokens=list(counts),
         )
 
-    patterns = [(n,) * world_size for n in (0, 1, 32, 63, 64, 65, 127, 128, 129, 256)]
+    patterns = [
+        (n,) * world_size
+        for n in (0, 1, 31, 32, 33, 63, 64, 65, 95, 96, 97, 127, 128, 129, 256)
+    ]
     patterns += [
         tuple((128, 65, 1, 0)[:world_size]),
+        tuple((96, 65, 1, 0)[:world_size]),
+        tuple((32, 17, 1, 0)[:world_size]),
         tuple((0, 64, 32, 1)[:world_size]),
     ]
     for counts in patterns:
@@ -142,7 +147,7 @@ def _worker(rank, world_size, rendezvous):
         expected = baseline(x, ctx=ctx)[0]
         actual = candidate(x, ctx=ctx)[0]
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        if 32 <= max(counts) <= 128:
+        if 0 < max(counts) <= 128:
             torch.testing.assert_close(fused(x, ctx), expected, rtol=0, atol=0)
     # Replay across the 32-bit boundary to exercise persistent 64-bit epochs.
     state = candidate.projection_workspace.fused_row
@@ -155,8 +160,12 @@ def _worker(rank, world_size, rendezvous):
         (64,) * world_size,
         (64,) * world_size,
         (32,) * world_size,
+        (32,) * world_size,
         (65,) * world_size,
+        (96,) * world_size,
         tuple((128, 65, 1, 0)[:world_size]),
+        tuple((96, 65, 1, 0)[:world_size]),
+        tuple((32, 17, 1, 0)[:world_size]),
         tuple((0, 64, 32, 1)[:world_size]),
     ]
     xs = [

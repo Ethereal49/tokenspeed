@@ -257,10 +257,14 @@ the owner waits for every contributing producer, sums the partials in FP32, and
 rounds the final output to BF16. TP2 and TP4 share the implementation. Row projection joins block arrivals
 within each GPU, then publishes system-scope epochs to peers. Input and partial
 output readiness are acquired concurrently, one lane per contributing peer.
+The TP4 row projection uses 64-row GEMM tiles in its prepared 32-row bucket
+to increase parallelism; other cases keep 128-row tiles. The resident grid and
+epoch protocol remain common across buckets, including graph replay.
 Automatic
-selection covers TP2 and TP4 with a subgroup maximum of 128 rows for the
-12288-to-7168 KDA projection on node-local GB300 groups. At 64 rows the ordinary
-path remains preferable or comparable and retains automatic selection.
+selection covers TP2 and TP4 with a subgroup maximum of 96–128 rows for the
+12288-to-7168 KDA projection on node-local GB300 groups. These counts share the
+existing 128-row bucket; no extra kernel specialization is needed. Smaller
+counts retain the ordinary path to avoid the padding overhead.
 Other row counts, batch-invariant collectives, and unsupported configurations use the ordinary
 path. Prepared row-fusion capacity is capped at 128, independently of the larger
 ordinary workspace capacity. Both fused projections require an isolated,
