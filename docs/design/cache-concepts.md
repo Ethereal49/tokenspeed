@@ -1012,7 +1012,12 @@ Its responsibilities:
   later `batch_exists` hit may register them again; there is no blacklist),
   and returns the request to `Submitted` at its original queue position. Its
   admission is then a plain Host hit: no forward is ever skipped or retracted
-  for L3, and no admission load-back can miss. The D role probes the Device
+  for L3, and no admission load-back can miss. For hybrid models, prefetch
+  also carries available State checkpoints within the matched KV coverage.
+  Missing intermediate checkpoints do not truncate the KV prefix; admission
+  probes the landed Host entries again and resumes only at a boundary with
+  every required State group, including after a partial landing.
+  The D role probes the Device
   alone and never prefetches. Existence and prefetch are skipped when L3 is
   unset: Host-only and `--disable-kvstore` admission must not hash prefixes
   or copy `group_keys` for a storage index that does not exist. CI covers this

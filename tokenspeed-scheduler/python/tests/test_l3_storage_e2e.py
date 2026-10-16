@@ -212,6 +212,42 @@ def test_l3_register_storage_keys_emits_a_prefetch_before_admission() -> None:
     assert scheduler.host_pool_pinned_blocks() == 0
 
 
+def test_l3_hybrid_prefetch_restores_state_before_admission() -> None:
+    cfg = _l3_config(
+        num_device_pages=32, num_host_pages=32, with_swa=False, min_prefetch_pages=1
+    )
+    cfg.cache_groups = list(cfg.cache_groups) + [
+        ts.CacheGroupConfig(
+            group_id="state",
+            block_granularity=0,
+            total_pages=cfg.num_device_pages,
+            attn_kind=ts.AttnKind.State,
+        )
+    ]
+    scheduler = ts.Scheduler(cfg)
+    tokens = list(range(1, 10))
+    hashes = scheduler.prefix_hashes_for_tokens(tokens)
+    groups, expanded, offsets = scheduler.expand_prefix_keys(hashes)
+    keys = [
+        (group, content_hash, offset)
+        for group, content_hash, offset in zip(groups, expanded, offsets)
+        if group == 0 or content_hash == hashes[-1]
+    ]
+    scheduler.register_storage_keys(*map(list, zip(*keys)))
+    scheduler.submit_requests([_spec("hybrid", tokens)])
+    prefetch = _find_op(scheduler.next_execution_plan(), ts.Cache.PrefetchOp)
+    assert prefetch is not None
+    assert set(prefetch.group_ids[0]) == {0, 1}, "KV and State must both reach Host"
+    _ack_prefetch(scheduler, prefetch.op_ids[0], len(hashes))
+    admit = scheduler.next_execution_plan()
+    assert list(admit.forward[0].extend_prefix_lens) == [8]
+    load = _find_op(admit, ts.Cache.LoadBackOp)
+    assert load is not None
+    assert set(load.group_ids[0]) == {0, 1}
+    _ack_load_back(scheduler, load.op_ids[0])
+    assert scheduler.host_pool_pinned_blocks() == 0
+
+
 def test_l3_partial_landing_admits_on_the_landed_prefix() -> None:
     scheduler = ts.Scheduler(
         _l3_config(

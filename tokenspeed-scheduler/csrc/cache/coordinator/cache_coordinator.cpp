@@ -341,8 +341,8 @@ const BlockPool& CacheCoordinator::tierPool() const {
 // per_group blocks are relative to the floor, num_common_tokens is the
 // absolute converged page boundary in TOKENS. num_prefix_pages bounds the walk
 // in prefix pages; each group key vector is expanded to that group's
-// block_granularity. State groups take no part here: their boundaries are
-// candidates of probeTier's candidate phase.
+// block_granularity. State groups do not bound the walk; the storage probe
+// carries their available checkpoints for probeTier's candidate phase.
 template <CacheTier Tier>
 CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTierWithKeys(
     std::span<const std::vector<CacheKey>> group_keys, std::span<const std::size_t> match_order,
@@ -385,6 +385,22 @@ CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTierWithKeys(
         const std::int32_t covered_pages = (common_tokens - floor_tokens) / geometry_[i].BlockGranularity();
         if (static_cast<std::int32_t>(probe.hits.size()) > covered_pages) {
             probe.hits.resize(static_cast<std::size_t>(covered_pages));
+        }
+    }
+    if (with_storage_keys) {
+        const auto first_page = static_cast<std::size_t>(floor_tokens / prefix_granularity_);
+        const auto end_page = static_cast<std::size_t>(common_tokens / prefix_granularity_);
+        for (const std::size_t i : match_order) {
+            if (!GroupIsState(i)) {
+                continue;
+            }
+            auto& hits = out.per_group[i].hits;
+            hits.assign(end_page - first_page, 0);
+            // Sparse checkpoints must travel with KV without truncating it at a missing checkpoint.
+            for (std::size_t page = first_page; page < end_page; ++page) {
+                const CacheKey& key = group_keys[i][page];
+                hits[page - first_page] = groups_[i].Index().Contains(pool, key) || storage_keys_.contains(key);
+            }
         }
     }
     out.num_common_tokens = common_tokens;
