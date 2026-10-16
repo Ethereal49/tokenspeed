@@ -1172,6 +1172,14 @@ KV groups (`recipes/mamba2.py`).
 KV pages pad by their share of the conv planes, about 1.5% for Nemotron-3 Super
 and 1-2% for Qwen3.5.
 
+Qwen4-Exp also reuses the attention planes for PLE and QSA groups. A parent
+belongs to one cache group at a time, so these groups do not need separate
+planes reserved in every attention or recurrent-state parent. Compressed QSA
+keeps its exact page stride; PLE and recent QSA state consume the explicit
+strides chosen by the common packer.
+Groups whose fields do not fit the attention planes, or whose exact strides
+require inconsistent packing ratios, retain separate planes.
+
 **No round-trip reconciliation.** The pipeline is arranged so that pairs which
 would otherwise need cross-checking cannot differ:
 
