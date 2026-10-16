@@ -149,6 +149,42 @@ def _worker(rank, world_size, rendezvous):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         if 0 < max(counts) <= 128:
             torch.testing.assert_close(fused(x, ctx), expected, rtol=0, atol=0)
+    # Neighboring quantization groups have different maxima at different lanes.
+    # This catches accidental scale sharing between the eight-lane groups.
+    counts = (128,) * world_size
+    x = torch.zeros((128, 12288), device=device, dtype=torch.bfloat16)
+    row_ids = torch.arange(128, device=device)[:, None]
+    group_ids = torch.arange(96, device=device)[None, :]
+    columns = group_ids * 128 + (row_ids + 17 * group_ids + rank) % 128
+    x.scatter_(
+        1, columns, torch.exp2((group_ids % 17 - 8).float()).expand(128, -1).to(x.dtype)
+    )
+    ctx = context(counts)
+    expected = baseline(x, ctx=ctx)[0]
+    torch.testing.assert_close(candidate(x, ctx=ctx)[0], expected, rtol=0, atol=0)
+    torch.testing.assert_close(fused(x, ctx), expected, rtol=0, atol=0)
+    # Reuse the prepared kernel with different weight and scale allocations.
+    # Prefetch must use each call's descriptors rather than a previous layer's.
+    alternate_weight = (-candidate.weight.to(torch.bfloat16)).to(candidate.weight.dtype)
+    alternate_scales = candidate.weight_scale_inv * 2
+    baseline.weight.copy_(alternate_weight)
+    baseline.weight_scale_inv.copy_(alternate_scales)
+    for rows in (96, 128):
+        counts = (rows,) * world_size
+        x = torch.randn((rows, 12288), device=device, dtype=torch.bfloat16)
+        ctx = context(counts)
+        expected = baseline(x, ctx=ctx)[0]
+        actual = cute_dsl_fused_fp8_dp_row_linear(
+            candidate.projection_workspace.fused_row,
+            x,
+            alternate_weight,
+            alternate_scales,
+            counts,
+            torch.empty_like(expected),
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    baseline.weight.copy_(candidate.weight)
+    baseline.weight_scale_inv.copy_(candidate.weight_scale_inv)
     # Replay across the 32-bit boundary to exercise persistent 64-bit epochs.
     state = candidate.projection_workspace.fused_row
     for flags in (state.ready, state.ack, state.input_flags):
@@ -163,6 +199,8 @@ def _worker(rank, world_size, rendezvous):
         (32,) * world_size,
         (65,) * world_size,
         (96,) * world_size,
+        (128,) * world_size,
+        (32,) * world_size,
         tuple((128, 65, 1, 0)[:world_size]),
         tuple((96, 65, 1, 0)[:world_size]),
         tuple((32, 17, 1, 0)[:world_size]),

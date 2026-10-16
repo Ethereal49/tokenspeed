@@ -205,6 +205,16 @@ class FusedTPProjectionState:
         torch.cuda.synchronize(device)
         dist.barrier(group=group)
         self.compiled = {}
+        # This TP2 projection has 112 GEMM tiles in the 128-row bucket.
+        # Keep the grid fixed across buckets so every live epoch slot advances.
+        active_clusters = (
+            112
+            if row_parallel
+            and self.world_size == 2
+            and input_size == 12288
+            and output_size == 7168
+            else 152
+        )
         for rows in self.row_views:
             inputs = torch.zeros(
                 (rows, input_size), dtype=torch.bfloat16, device=device
@@ -217,7 +227,12 @@ class FusedTPProjectionState:
             )
             args = self._arguments(inputs, weight, scales, rows, out)
             self.compiled[rows] = cute.compile(
-                kernel, *args[:5], 152, *args[5:], lambda v: v, options="--opt-level=2"
+                kernel,
+                *args[:5],
+                active_clusters,
+                *args[5:],
+                lambda v: v,
+                options="--opt-level=2",
             )
             # Warm every supported bucket before capture; they share device epochs.
             self.compiled[rows](*args)
