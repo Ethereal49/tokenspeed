@@ -88,7 +88,8 @@ def pull_all_reduce_arch_config(
 
     Architectures without an entry keep gfx950's code generation.
     """
-    arch = arch or current_platform().arch_version
+    if arch is None:
+        arch = current_platform().arch_version
     return _PULL_ALL_REDUCE_ARCH_CONFIGS.get(
         arch, _PULL_ALL_REDUCE_ARCH_CONFIGS[_GFX950]
     )
