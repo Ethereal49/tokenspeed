@@ -205,6 +205,19 @@ class V41SWAQueryPlan:
     requests: tuple[V41PrefillRequestPlan, ...]
 
 
+@dataclass
+class V41IndexGeometry:
+    # positions, request_indices and source_table are never read back: they
+    # pin the tensors whose id()s key the per-invocation geometry cache, so a
+    # freed tensor's id cannot be reused for a false hit while the entry lives.
+    positions: torch.Tensor
+    request_indices: torch.Tensor
+    source_table: torch.Tensor
+    table: torch.Tensor
+    lengths: torch.Tensor
+    kernel_metadata: object | None
+
+
 class DeepseekV41AttentionBackend(AttentionBackend):
     # Decode uses fixed-capacity rows and refresh-time history validation. The
     # CED decoder runs on a per-request tail of the prefill rows, so the model
@@ -262,6 +275,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             tuple[int, int], tuple[torch.Tensor, torch.Tensor | None, object]
         ] = {}
         self._prepared_selections: dict[tuple, tuple] = {}
+        self._index_geometry: dict[tuple, V41IndexGeometry] = {}
+        self._in_model_forward = False
 
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
         super().validate_cache_pool(cache_pool)
@@ -295,6 +310,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._decode_schedule_keepalive.clear()
         self._decode_schedules.clear()
         self._prepared_selections.clear()
+        self._index_geometry.clear()
 
     def init_cuda_graph_state(
         self,
@@ -400,6 +416,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             raise ValueError("V4.1 num_tokens must equal batch size times verify width")
         del for_graph_replay, kwargs
         self._prepared_selections.clear()
+        self._index_geometry.clear()
         self._decode_schedules.clear()
         if not forward_mode.is_decode_or_idle():
             raise ValueError("V4.1 refresh requires decode or idle mode")
@@ -560,6 +577,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._check_tables(block_tables, bs)
         self._swa_plans.clear()
         self._prepared_selections.clear()
+        self._index_geometry.clear()
         self._decode_schedules.clear()
         if not 0 <= num_extends <= bs:
             raise ValueError("V4.1 invalid extend/decode batch sizes")
@@ -1133,9 +1151,10 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         Index Q is post-RoPE BF16 [T,Hindex,128] with already-scaled weights,
         or IndexQueryInput containing pre-RoPE BF16 values, paired with
         unscaled BF16 weights. Preprocessing applies its weight_scale once.
-        Supply both only at an index source, otherwise None. A sharded indexer
-        must supply its head-reduction process group; replicated indexer heads
-        supply None. Candidates survive Reindex updates.
+        Sources may omit both when indexer_needs_scores is false; Reuse layers
+        always supply None. A sharded indexer must supply its head-reduction
+        process group; replicated indexer heads supply None. Candidates survive
+        Reindex updates.
         Decode graph Full sources use the refresh's full query window; consumers
         may reorder/subset it. A subset Reindex and its Reuse consumers share the
         same window tensors. Other source windows retain eager coverage validation.
@@ -1186,7 +1205,13 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 ),
                 lens,
             )
-        if index_q is None or index_weights is None:
+        history_bound = self._index_history_bound(
+            positions, request_indices, forward_mode
+        )
+        selection_kind = self._index_selection_kind(layer_id, history_bound)
+        if (index_q is None) != (index_weights is None):
+            raise ValueError("V4.1 index_q and index_weights must be supplied together")
+        if index_q is None and selection_kind != "all":
             raise ValueError("V4.1 index sources require index_q and index_weights")
         candidates = (
             record.candidates if record is not None and record.owner == owner else None
@@ -1205,37 +1230,35 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         )
         produce_candidates = layer_id == self.spec.candidate_source
         metadata = self.query_metadata(forward_mode)
-        table = metadata.block_tables[self._owner_group(owner)]
+        source_table = metadata.block_tables[self._owner_group(owner)]
+        table = source_table
         ratio = self.spec.compress_ratios[owner]
+        if history_bound is not None:
+            table = table[:, : max(1, (history_bound // ratio + 63) // 64)]
         window = (
             self._window(positions, request_indices, forward_mode)
             if forward_mode.is_extend()
             else None
         )
         spans = window[1] if window is not None else ()
-        if window is not None:
-            visible_bound = max(
-                ((span.prefix + span.count) // ratio for span in spans),
-                default=0,
-            )
-            table = table[:, : max(1, (visible_bound + 63) // 64)]
         index_cache = self.cache_pool.index_k(owner)
         # Full-history residency bounds logical pages. Trim replicated table
         # scratch; the kernel separately bounds work by device-visible lengths.
         table = table[:, : max(0, index_cache.shape[0] - 1)]
         candidate_capacity = min(self.spec.candidate_topk, table.shape[1] * 8)
         n = positions.numel()
-        rows = torch.full(
-            (n, self.spec.index_topk), -1, dtype=torch.int32, device=self.device
+        # The windows below partition all n query rows, and index_topk fully
+        # writes each window's IDs and lengths, including empty/padded history.
+        rows = torch.empty(
+            (n, self.spec.index_topk), dtype=torch.int32, device=self.device
         )
-        lens = torch.zeros(n, dtype=torch.int32, device=self.device)
-        blocks = torch.full(
+        lens = torch.empty(n, dtype=torch.int32, device=self.device)
+        blocks = torch.empty(
             (n, candidate_capacity if produce_candidates else 0),
-            -1,
             dtype=torch.int32,
             device=self.device,
         )
-        block_lens = torch.zeros(n, dtype=torch.int32, device=self.device)
+        block_lens = torch.empty(n, dtype=torch.int32, device=self.device)
         # Query tiling bounds both score scratch and replicated table rows. Do
         # not index_select the table for the entire prefill (T * context pages).
         canonical_prefill = window is not None
@@ -1253,22 +1276,23 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             ]
         )
         for start, stop, span in windows:
-            if span is not None:
-                visible = (
-                    ((positions[start:stop] + 1) // ratio).clamp_min(0).to(torch.int32)
-                )
-                width = max(1, ((span.prefix + span.count) // ratio + 63) // 64)
-                row = table[span.request : span.request + 1, :width]
-                row = row.masked_fill(row <= 0, -1)
-                tile_table = row.expand(stop - start, -1)
-            else:
-                from tokenspeed_kernel.ops.attention.dsv41 import selection_table
-
-                tile_table, visible = selection_table(
-                    positions[start:stop], request_indices[start:stop], table, ratio
-                )
+            selection_kind = self._index_selection_kind(
+                layer_id,
+                span.prefix + span.count if span is not None else history_bound,
+            )
+            geometry = self._selection_geometry(
+                positions,
+                request_indices,
+                source_table,
+                table,
+                ratio,
+                start,
+                stop,
+                span,
+                forward_mode,
+            )
             cb = None
-            if reindex:
+            if reindex and selection_kind == "candidates":
                 if same_candidate_rows:
                     cb = candidates.block_ids[start:stop]
                 else:
@@ -1276,12 +1300,27 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     cb = candidates.block_ids[ci.clamp_min(0)].masked_fill(
                         ci[:, None] < 0, -1
                     )
+            outputs = (
+                rows[start:stop],
+                lens[start:stop],
+                blocks[start:stop],
+                block_lens[start:stop],
+            )
+            if selection_kind == "all":
+                dsv41.index_select_all(
+                    geometry.table,
+                    geometry.lengths,
+                    index_cache.shape[0],
+                    self.spec.candidate_block_size,
+                    outputs,
+                )
+                continue
             dsv41.index_topk(
                 index_q[start:stop],
                 index_weights[start:stop],
                 index_cache,
-                tile_table,
-                visible,
+                geometry.table,
+                geometry.lengths,
                 cb,
                 self.spec.index_topk,
                 candidate_capacity if produce_candidates else 0,
@@ -1289,13 +1328,9 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 query_tile,
                 256,
                 index_process_group,
-                (
-                    rows[start:stop],
-                    lens[start:stop],
-                    blocks[start:stop],
-                    block_lens[start:stop],
-                ),
+                outputs,
                 None,
+                geometry.kernel_metadata,
             )
         if produce_candidates:
             candidates = V41Candidates(positions, request_indices, blocks, block_lens)
@@ -1743,6 +1778,113 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         raise NotImplementedError(
             "V4.1 model layers call forward_v41 with explicit positions"
         )
+
+    def _index_history_bound(self, positions, requests, mode) -> int | None:
+        if mode.is_decode_or_idle() or mode.is_mixed():
+            # Decode records one fixed indexer path, including eager execution.
+            # Live GPU lengths may short-circuit work inside kernels, never
+            # choose a different Python branch or a different captured graph.
+            return None
+        window = self._window(positions, requests, mode)
+        if window is not None:
+            return max((span.prefix + span.count for span in window[1]), default=0)
+        return (
+            self.query_metadata(mode).block_tables[V41_GLOBAL_R1_GROUP_ID].shape[1] * 64
+        )
+
+    def _index_selection_kind(self, layer_id: int, bound: int | None) -> str:
+        owner = self.spec.kv_owners[layer_id]
+        ratio = self.spec.compress_ratios[owner]
+        reindex = self.spec.index_sources[layer_id] != owner
+        if reindex and (
+            bound is None
+            or bound // ratio
+            > self.spec.candidate_topk * self.spec.candidate_block_size
+        ):
+            return "candidates"
+        if (
+            bound is not None
+            and bound // ratio <= self.spec.index_topk
+            and (
+                layer_id != self.spec.candidate_source
+                or bound // ratio
+                <= self.spec.candidate_topk * self.spec.candidate_block_size
+            )
+        ):
+            return "all"
+        return "full"
+
+    def indexer_needs_scores(self, layer_id, positions, requests, mode) -> bool:
+        """Whether this source needs Q/weight projections for its query window."""
+        return (
+            self._index_selection_kind(
+                layer_id, self._index_history_bound(positions, requests, mode)
+            )
+            != "all"
+        )
+
+    def begin_indexer_forward(self) -> None:
+        """Start fresh geometry shared across this forward's stages.
+
+        Successful calls pair with end_indexer_forward; failures stop the engine.
+        """
+        self._index_geometry.clear()
+        self._in_model_forward = True
+
+    def end_indexer_forward(self) -> None:
+        """Release shared scratch when the full model forward finishes."""
+        self._in_model_forward = False
+        self._index_geometry.clear()
+
+    def begin_indexer_stage(self) -> None:
+        """Clear scratch only when the stage runs outside a full model forward."""
+        if not self._in_model_forward:
+            self._index_geometry.clear()
+
+    def _selection_geometry(
+        self, positions, requests, source_table, table, ratio, start, stop, span, mode
+    ):
+        from tokenspeed_kernel.ops.attention import dsv41
+
+        key = (
+            mode,
+            id(positions),
+            id(requests),
+            id(source_table),
+            ratio,
+            table.shape[1],
+            start,
+            stop,
+            span,
+        )
+        geometry = self._index_geometry.get(key)
+        if geometry is None:
+            if span is not None:
+                visible = (
+                    ((positions[start:stop] + 1) // ratio).clamp_min(0).to(torch.int32)
+                )
+                width = max(1, ((span.prefix + span.count) // ratio + 63) // 64)
+                row = table[span.request : span.request + 1, :width]
+                row = row.masked_fill(row <= 0, -1)
+                tile_table = row.expand(stop - start, -1)
+            else:
+                tile_table, visible = dsv41.selection_table(
+                    positions[start:stop], requests[start:stop], table, ratio
+                )
+            # Arbitrary prefill windows may cover a whole prompt. Retaining
+            # every replicated table would defeat query tiling's memory bound.
+            cacheable = mode.is_decode() or span is not None
+            geometry = V41IndexGeometry(
+                positions,
+                requests,
+                source_table,
+                tile_table,
+                visible,
+                dsv41.new_index_metadata(tile_table, visible) if cacheable else None,
+            )
+            if cacheable:
+                self._index_geometry[key] = geometry
+        return geometry
 
 
 register_backend("deepseek_v41", {AttentionArch.MLA}, DeepseekV41AttentionBackend)
