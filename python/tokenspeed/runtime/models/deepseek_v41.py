@@ -153,8 +153,8 @@ from tokenspeed.runtime.multimodal.embedder import (
 )
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
+    MultimodalForwardContext,
     MultimodalInputs,
-    is_mm_pad_value_for,
     substitute_mm_pad_,
 )
 from tokenspeed.runtime.utils import add_prefix
@@ -1028,9 +1028,12 @@ class DeepseekV41Attention(nn.Module):
                         rows.query.request_indices,
                     )
                 if self.indexer is not None:
-                    index_q, index_weights = self.indexer(
-                        hidden_states, index_q_input, positions, self.rotary_emb
-                    )
+                    if backend.indexer_needs_scores(
+                        self.layer_id, positions, requests, mode
+                    ):
+                        index_q, index_weights = self.indexer(
+                            hidden_states, index_q_input, positions, self.rotary_emb
+                        )
                     if mode.is_decode():
                         prepared = backend.prepare_global_selection(
                             self.layer_id,
@@ -1569,6 +1572,8 @@ class DeepseekV41Model(nn.Module):
                 self.embed_tokens.weight.new_empty((0, self.config.hidden_size)),
                 None,
             )
+        backend = ctx.attn_backend
+        backend.begin_indexer_forward()
         state = self.encoder_forward(
             input_ids,
             positions,
@@ -1581,7 +1586,9 @@ class DeepseekV41Model(nn.Module):
         )
         state = self.narrowing_forward(state, ctx)
         hidden, captured = self.decoder_forward(state, ctx)
-        return self.finish_forward(hidden, captured, ctx)
+        output = self.finish_forward(hidden, captured, ctx)
+        backend.end_indexer_forward()
+        return output
 
     def _run_layer(
         self,
@@ -1620,6 +1627,7 @@ class DeepseekV41Model(nn.Module):
         image_mask: torch.Tensor | None,
     ) -> V41RowState:
         """Embed and run the layers below the candidate source, one row per token."""
+        ctx.attn_backend.begin_indexer_stage()
         if pp_inbound is not None:
             raise NotImplementedError("V4.1 baseline does not accept pipeline state")
         if input_ids.ndim != 1 or positions.shape != input_ids.shape:
@@ -1669,6 +1677,7 @@ class DeepseekV41Model(nn.Module):
         forward's real rows (an encoder graph output): only the real rows are
         used. A window-only stack has no candidate source and passes through.
         """
+        ctx.attn_backend.begin_indexer_stage()
         start = self.ced_decoder_start
         if start >= len(self.layers):
             return state
@@ -1738,6 +1747,7 @@ class DeepseekV41Model(nn.Module):
                 hidden for layer_id in self.dspark_capture_layers if layer_id > start
             )
             return hidden, captured
+        ctx.attn_backend.begin_indexer_stage()
         layers = self.layers[start + 1 :]
         if layers:
             with report_collective_sizing(ctx, state.rows, None):
@@ -1820,6 +1830,34 @@ class DeepseekV41Model(nn.Module):
                 for _ in range(taps)
             ],
         )
+
+
+def _image_mask_from_spans(
+    input_ids: torch.Tensor, mm_context: MultimodalForwardContext
+) -> torch.Tensor:
+    """Mark image spans; InputBuffers may already have clamped hashed IDs.
+
+    Walks the spans exactly as ``MultimodalEmbedder._plan`` places embeddings,
+    so routing and embedding placement agree; change the two together.
+    """
+    mask = torch.zeros_like(input_ids, dtype=torch.bool)
+    base = 0
+    for mm_input, prefix, length in zip(
+        mm_context.mm_inputs,
+        mm_context.extend_prefix_lens,
+        mm_context.extend_seq_lens,
+    ):
+        if mm_input is not None and length > 0:
+            for item in mm_input.mm_items:
+                if item is None or item.modality != Modality.IMAGE or not item.offsets:
+                    continue
+                for start, end in item.offsets:
+                    start = max(start, prefix)
+                    stop = min(end + 1, prefix + length)
+                    if start < stop:
+                        mask[base + start - prefix : base + stop - prefix] = True
+        base += max(length, 0)
+    return mask
 
 
 class DeepseekV41ForCausalLM(BaseCausalLM):
@@ -1970,8 +2008,8 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             and mm_context.has_extend_inputs()
             and not ctx.forward_mode.is_decode_or_idle()
         ):
-            # Capture the image mask before restoring hashed placeholder IDs.
-            result["image_mask"] = is_mm_pad_value_for(input_ids, Modality.IMAGE)
+            if result["image_mask"] is None:
+                result["image_mask"] = _image_mask_from_spans(input_ids, mm_context)
             substitute_mm_pad_(input_ids, {Modality.IMAGE: self.config.image_token_id})
             embeds, _ = self.vision_embedder.apply(
                 input_ids=input_ids,
